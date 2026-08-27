@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Identity;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
+using ClosedXML.Excel;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -157,7 +158,7 @@ app.MapGet("/", () => Results.Ok(new
 {
     name = "Pallet Control API",
     status = "running",
-    version = "5.6.0"
+    version = "5.7.3"
 }));
 
 // Public health endpoint. This performs a real SQLite connection, real table read,
@@ -282,7 +283,9 @@ app.MapPost("/api/auth/login", async (LoginRequest req, AppDbContext db) =>
         user.DisplayName,
         user.Role,
         user.TerminalId,
-        user.Terminal?.Code ?? ""));
+        user.Terminal?.Code ?? "",
+        user.ShowDriverStatisticsTab,
+        user.ShowDailyCheckTab));
 });
 
 app.MapGet("/api/me", async (ClaimsPrincipal principal, AppDbContext db) =>
@@ -296,7 +299,9 @@ app.MapGet("/api/me", async (ClaimsPrincipal principal, AppDbContext db) =>
         user.DisplayName,
         user.Role,
         user.TerminalId,
-        terminalCode = user.Terminal?.Code ?? ""
+        terminalCode = user.Terminal?.Code ?? "",
+        user.ShowDriverStatisticsTab,
+        user.ShowDailyCheckTab
     });
 }).RequireAuthorization();
 
@@ -304,12 +309,14 @@ app.MapGet("/api/me/settings", async (ClaimsPrincipal principal, AppDbContext db
 {
     var user = await db.Users.FindAsync(UserId(principal));
     if (user is null) return Results.NotFound();
+    var settings = await db.Settings.AsNoTracking().SingleAsync();
 
     return Results.Ok(new
     {
         user.ShowMilestoneNotifications,
         user.ShowLeaderboardNotifications,
-        user.ShowBalanceNotifications
+        user.ShowBalanceNotifications,
+        settings.AllowUsersAddDrivers
     });
 }).RequireAuthorization();
 
@@ -326,11 +333,13 @@ app.MapPut("/api/me/settings", async (
     user.ShowBalanceNotifications = req.ShowBalanceNotifications;
     await db.SaveChangesAsync();
 
+    var settings = await db.Settings.AsNoTracking().SingleAsync();
     return Results.Ok(new
     {
         user.ShowMilestoneNotifications,
         user.ShowLeaderboardNotifications,
-        user.ShowBalanceNotifications
+        user.ShowBalanceNotifications,
+        settings.AllowUsersAddDrivers
     });
 }).RequireAuthorization();
 
@@ -835,9 +844,11 @@ app.MapGet("/api/statistics/options", async (ClaimsPrincipal principal, AppDbCon
         .Include(x => x.Transporter)
         .AsQueryable();
 
+    // Statistics keep inactive/removed driver names available so historical receipts
+    // can still be filtered after an Admin removes a name from future registration.
     var driverQuery = db.Drivers
         .AsNoTracking()
-        .Where(x => x.Active && x.TerminalId == terminalId)
+        .Where(x => x.TerminalId == terminalId)
         .AsQueryable();
 
     var transporterIdsForTerminal = await vehicleQuery
@@ -868,7 +879,7 @@ app.MapGet("/api/statistics/options", async (ClaimsPrincipal principal, AppDbCon
 
     var drivers = await driverQuery
         .OrderBy(x => x.Name)
-        .Select(x => new { x.Id, x.Name })
+        .Select(x => new { x.Id, name = x.Active ? x.Name : x.Name + " (removed)", rawName = x.Name, x.Active })
         .ToListAsync();
 
     var palletTypes = await db.PalletTypes.AsNoTracking()
@@ -1004,12 +1015,191 @@ app.MapGet("/api/statistics", async (
     });
 }).RequireAuthorization();
 
-app.MapGet("/api/compliance", async (
+app.MapGet("/api/statistics/drivers", async (
     DateOnly? from,
     DateOnly? to,
+    int? palletTypeId,
+    string? transporterIds,
+    string? vehicleIds,
+    string? driverIds,
+    string? sortBy,
     ClaimsPrincipal principal,
     AppDbContext db) =>
 {
+    var currentUserId = UserId(principal);
+    var currentUser = await db.Users.AsNoTracking().SingleAsync(x => x.Id == currentUserId);
+    if (!currentUser.ShowDriverStatisticsTab) return Results.Forbid();
+
+    from ??= new DateOnly(DateTime.Today.Year, DateTime.Today.Month, 1);
+    to ??= DateOnly.FromDateTime(DateTime.Today);
+
+    if (to.Value < from.Value)
+        return Results.BadRequest(new { message = "To date cannot be before From date." });
+
+    var terminalId = TerminalId(principal);
+    var selectedTransporterIds = ParseIds(transporterIds);
+    var selectedVehicleIds = ParseIds(vehicleIds);
+    var selectedDriverIds = ParseIds(driverIds);
+    var settings = await db.Settings.AsNoTracking().SingleAsync();
+    var deductionPerUnmatchedIn = Math.Max(0, settings.DriverUnmatchedInDeduction);
+
+    var receiptQuery = db.Receipts
+        .AsNoTracking()
+        .Include(r => r.Vehicle).ThenInclude(v => v!.Transporter)
+        .Include(r => r.Driver)
+        .Include(r => r.Items).ThenInclude(i => i.PalletType)
+        .Where(r =>
+            r.Status == ReceiptStatus.Active &&
+            r.TerminalId == terminalId &&
+            r.BusinessDate >= from.Value &&
+            r.BusinessDate <= to.Value &&
+            r.DriverSnapshot != "");
+
+    if (selectedTransporterIds.Count > 0)
+        receiptQuery = receiptQuery.Where(r => r.Vehicle != null && r.Vehicle.TransporterId != null &&
+                                             selectedTransporterIds.Contains(r.Vehicle.TransporterId.Value));
+    if (selectedVehicleIds.Count > 0)
+        receiptQuery = receiptQuery.Where(r => r.VehicleId != null && selectedVehicleIds.Contains(r.VehicleId.Value));
+    if (selectedDriverIds.Count > 0)
+        receiptQuery = receiptQuery.Where(r => r.DriverId != null && selectedDriverIds.Contains(r.DriverId.Value));
+
+    var receipts = await receiptQuery.ToListAsync();
+
+    // Group by stable DriverId when it still exists. For drivers that were physically deleted
+    // by an older PalletControl version, fall back to the receipt's immutable DriverSnapshot.
+    // New deletes are soft deletes, so their DriverId remains intact.
+    var driverGroups = receipts
+        .GroupBy(r => r.DriverId != null
+            ? $"id:{r.DriverId.Value}"
+            : $"snapshot:{r.DriverSnapshot.Trim().ToUpperInvariant()}")
+        .OrderBy(g => g.First().DriverSnapshot)
+        .ToList();
+
+    var rows = new List<DriverStatisticsRow>();
+    foreach (var group in driverGroups)
+    {
+        var driverReceipts = group.ToList();
+        var first = driverReceipts.First();
+        var driverId = first.DriverId ?? 0;
+        var driverName = first.Driver?.Name ?? first.DriverSnapshot;
+        var quantityItems = driverReceipts
+            .SelectMany(r => r.Items
+                .Where(i => !palletTypeId.HasValue || i.PalletTypeId == palletTypeId.Value)
+                .Select(i => new { r.Direction, i.Quantity }))
+            .ToList();
+
+        var inQty = quantityItems.Where(x => x.Direction.Equals("IN", StringComparison.OrdinalIgnoreCase)).Sum(x => x.Quantity);
+        var outQty = quantityItems.Where(x => x.Direction.Equals("OUT", StringComparison.OrdinalIgnoreCase)).Sum(x => x.Quantity);
+
+        // Matching is deliberately done per driver + business date, regardless of vehicle.
+        // Every ACTIVE IN receipt needs one ACTIVE OUT receipt for that driver on the same day.
+        // Example: 4 IN and 1 OUT across any vehicles on the same day = 3 unmatched IN receipts.
+        // Cancelled receipts never participate in this calculation.
+        var unmatchedIn = driverReceipts
+            .GroupBy(r => r.BusinessDate)
+            .Sum(g => Math.Max(
+                0,
+                g.Count(r => r.Direction.Equals("IN", StringComparison.OrdinalIgnoreCase)) -
+                g.Count(r => r.Direction.Equals("OUT", StringComparison.OrdinalIgnoreCase))));
+
+        var inReceiptCount = driverReceipts.Count(r => r.Direction.Equals("IN", StringComparison.OrdinalIgnoreCase));
+        var outReceiptCount = driverReceipts.Count(r => r.Direction.Equals("OUT", StringComparison.OrdinalIgnoreCase));
+        var rawBalance = inQty - outQty;
+        var deduction = unmatchedIn * deductionPerUnmatchedIn;
+
+        rows.Add(new DriverStatisticsRow
+        {
+            DriverId = driverId,
+            Driver = driverName,
+            Vehicles = string.Join(", ", driverReceipts.Select(r => r.VehicleSnapshot).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().OrderBy(x => x)),
+            InReceipts = inReceiptCount,
+            OutReceipts = outReceiptCount,
+            UnmatchedInReceipts = unmatchedIn,
+            InQty = inQty,
+            OutQty = outQty,
+            RawBalance = rawBalance,
+            Deduction = deduction,
+            AdjustedBalance = rawBalance - deduction,
+            Movement = inQty + outQty
+        });
+    }
+
+    var adjustmentDetails = receipts
+        .GroupBy(r => new
+        {
+            DriverKey = r.DriverId != null ? $"id:{r.DriverId.Value}" : $"snapshot:{r.DriverSnapshot.Trim().ToUpperInvariant()}",
+            DriverId = r.DriverId ?? 0,
+            r.BusinessDate
+        })
+        .Select(g =>
+        {
+            var inReceipts = g.Count(r => r.Direction.Equals("IN", StringComparison.OrdinalIgnoreCase));
+            var outReceipts = g.Count(r => r.Direction.Equals("OUT", StringComparison.OrdinalIgnoreCase));
+            var unmatchedIn = Math.Max(0, inReceipts - outReceipts);
+            var first = g.First();
+            return new DriverAdjustmentDetail
+            {
+                DriverId = g.Key.DriverId,
+                Driver = first.Driver?.Name ?? first.DriverSnapshot,
+                Vehicle = string.Join(", ", g.Select(r => r.VehicleSnapshot)
+                    .Where(x => !string.IsNullOrWhiteSpace(x))
+                    .Distinct()
+                    .OrderBy(x => x)),
+                Date = g.Key.BusinessDate,
+                InReceipts = inReceipts,
+                OutReceipts = outReceipts,
+                UnmatchedInReceipts = unmatchedIn,
+                Deduction = unmatchedIn * deductionPerUnmatchedIn
+            };
+        })
+        .Where(x => x.UnmatchedInReceipts > 0)
+        .OrderByDescending(x => x.Date)
+        .ThenBy(x => x.Driver)
+        .ThenBy(x => x.Vehicle)
+        .ToList();
+
+    var sorted = (sortBy ?? "movementDesc") switch
+    {
+        "inDesc" => rows.OrderByDescending(x => x.InQty).ThenBy(x => x.Driver),
+        "outDesc" => rows.OrderByDescending(x => x.OutQty).ThenBy(x => x.Driver),
+        "rawBalanceDesc" => rows.OrderByDescending(x => x.RawBalance).ThenBy(x => x.Driver),
+        "adjustedBalanceDesc" => rows.OrderByDescending(x => x.AdjustedBalance).ThenBy(x => x.Driver),
+        "unmatchedDesc" => rows.OrderByDescending(x => x.UnmatchedInReceipts).ThenBy(x => x.Driver),
+        "driverAsc" => rows.OrderBy(x => x.Driver),
+        _ => rows.OrderByDescending(x => x.Movement).ThenBy(x => x.Driver)
+    };
+
+    var sortedRows = sorted.ToList();
+    return Results.Ok(new
+    {
+        from,
+        to,
+        palletTypeId,
+        deductionPerUnmatchedIn,
+        totalIn = sortedRows.Sum(x => x.InQty),
+        totalOut = sortedRows.Sum(x => x.OutQty),
+        totalRawBalance = sortedRows.Sum(x => x.RawBalance),
+        totalUnmatchedInReceipts = sortedRows.Sum(x => x.UnmatchedInReceipts),
+        totalDeduction = sortedRows.Sum(x => x.Deduction),
+        totalAdjustedBalance = sortedRows.Sum(x => x.AdjustedBalance),
+        rows = sortedRows,
+        adjustmentDetails
+    });
+}).RequireAuthorization();
+
+app.MapGet("/api/compliance", async (
+    DateOnly? from,
+    DateOnly? to,
+    string? transporterIds,
+    string? vehicleIds,
+    string? driverIds,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var currentUserId = UserId(principal);
+    var currentUser = await db.Users.AsNoTracking().SingleAsync(x => x.Id == currentUserId);
+    if (!currentUser.ShowDailyCheckTab) return Results.Forbid();
+
     var today = DateOnly.FromDateTime(DateTime.Today);
     from ??= new DateOnly(today.Year, today.Month, 1);
     to ??= today;
@@ -1036,11 +1226,21 @@ app.MapGet("/api/compliance", async (
     }
 
     var terminalId = TerminalId(principal);
+    var selectedTransporterIds = ParseIds(transporterIds);
+    var selectedVehicleIds = ParseIds(vehicleIds);
+    var selectedDriverIds = ParseIds(driverIds);
 
-    var vehicles = await db.Vehicles
+    var vehicleQuery = db.Vehicles
         .AsNoTracking()
         .Include(x => x.Transporter)
-        .Where(x => x.Active && x.TerminalId == terminalId)
+        .Where(x => x.Active && x.TerminalId == terminalId);
+
+    if (selectedTransporterIds.Count > 0)
+        vehicleQuery = vehicleQuery.Where(x => x.TransporterId != null && selectedTransporterIds.Contains(x.TransporterId.Value));
+    if (selectedVehicleIds.Count > 0)
+        vehicleQuery = vehicleQuery.Where(x => selectedVehicleIds.Contains(x.Id));
+
+    var vehicles = await vehicleQuery
         .OrderBy(x => x.VehicleId)
         .ToListAsync();
 
@@ -1052,22 +1252,32 @@ app.MapGet("/api/compliance", async (
 
     var holidayDates = holidays.Select(x => x.Date).ToHashSet();
 
+    var selectedVehicleIdSet = vehicles.Select(x => x.Id).ToHashSet();
+
     var receipts = await db.Receipts
         .AsNoTracking()
         .Where(x =>
             x.Status == ReceiptStatus.Active &&
             x.TerminalId == terminalId &&
             x.VehicleId != null &&
+            selectedVehicleIdSet.Contains(x.VehicleId.Value) &&
             x.BusinessDate >= from.Value &&
             x.BusinessDate <= effectiveTo)
-        .Select(x => new { x.VehicleId, x.BusinessDate, x.Direction })
+        .Select(x => new { x.VehicleId, x.BusinessDate, x.Direction, x.DriverId, x.DriverSnapshot })
         .ToListAsync();
 
     var receiptLookup = receipts
         .GroupBy(x => new { VehicleId = x.VehicleId!.Value, x.BusinessDate })
         .ToDictionary(
             g => (g.Key.VehicleId, g.Key.BusinessDate),
-            g => g.Select(x => x.Direction.ToUpperInvariant()).ToHashSet(StringComparer.OrdinalIgnoreCase));
+            g => new
+            {
+                Directions = g.Select(x => x.Direction.ToUpperInvariant()).ToHashSet(StringComparer.OrdinalIgnoreCase),
+                InDriverIds = g.Where(x => x.Direction.Equals("IN", StringComparison.OrdinalIgnoreCase) && x.DriverId != null).Select(x => x.DriverId!.Value).Distinct().OrderBy(x => x).ToList(),
+                OutDriverIds = g.Where(x => x.Direction.Equals("OUT", StringComparison.OrdinalIgnoreCase) && x.DriverId != null).Select(x => x.DriverId!.Value).Distinct().OrderBy(x => x).ToList(),
+                InDrivers = g.Where(x => x.Direction.Equals("IN", StringComparison.OrdinalIgnoreCase)).Select(x => x.DriverSnapshot).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().OrderBy(x => x).ToList(),
+                OutDrivers = g.Where(x => x.Direction.Equals("OUT", StringComparison.OrdinalIgnoreCase)).Select(x => x.DriverSnapshot).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().OrderBy(x => x).ToList()
+            });
 
     var rows = new List<VehicleComplianceRow>();
 
@@ -1084,9 +1294,9 @@ app.MapGet("/api/compliance", async (
             if (!operatingDays.Contains(isoDay))
                 continue;
 
-            receiptLookup.TryGetValue((vehicle.Id, date), out var directions);
-            var hasIn = directions?.Contains("IN") == true;
-            var hasOut = directions?.Contains("OUT") == true;
+            receiptLookup.TryGetValue((vehicle.Id, date), out var receiptInfo);
+            var hasIn = receiptInfo?.Directions.Contains("IN") == true;
+            var hasOut = receiptInfo?.Directions.Contains("OUT") == true;
             var complete = hasIn && hasOut;
             var isToday = date == today;
 
@@ -1096,6 +1306,10 @@ app.MapGet("/api/compliance", async (
                 VehicleId = vehicle.Id,
                 Vehicle = vehicle.VehicleId,
                 Transporter = vehicle.Transporter?.Name ?? "Not assigned",
+                InDriverIds = receiptInfo?.InDriverIds ?? [],
+                OutDriverIds = receiptInfo?.OutDriverIds ?? [],
+                InDrivers = receiptInfo?.InDrivers ?? [],
+                OutDrivers = receiptInfo?.OutDrivers ?? [],
                 HasIn = hasIn,
                 HasOut = hasOut,
                 Complete = complete,
@@ -1109,6 +1323,14 @@ app.MapGet("/api/compliance", async (
                             : "MISSING_BOTH"
             });
         }
+    }
+
+    if (selectedDriverIds.Count > 0)
+    {
+        var driverSet = selectedDriverIds.ToHashSet();
+        rows = rows
+            .Where(x => x.InDriverIds.Any(driverSet.Contains) || x.OutDriverIds.Any(driverSet.Contains))
+            .ToList();
     }
 
     var sortedRows = rows
@@ -1257,6 +1479,14 @@ app.MapPost("/api/warnings/{id:int}/acknowledge", async (
 app.MapGet("/api/export", async (
     DateOnly from,
     DateOnly to,
+    string? type,
+    string? format,
+    int? palletTypeId,
+    string? transporterIds,
+    string? vehicleIds,
+    string? driverIds,
+    string? direction,
+    string? status,
     ClaimsPrincipal principal,
     AppDbContext db) =>
 {
@@ -1265,43 +1495,376 @@ app.MapGet("/api/export", async (
 
     var terminalId = TerminalId(principal);
     var terminalCode = principal.FindFirstValue("terminalCode") ?? "TERM";
+    var exportType = (type ?? "receipts").Trim().ToLowerInvariant();
+    var exportFormat = (format ?? "csv").Trim().ToLowerInvariant();
+    var selectedTransporterIds = ParseIds(transporterIds);
+    var selectedVehicleIds = ParseIds(vehicleIds);
+    var selectedDriverIds = ParseIds(driverIds);
+    var directionFilter = (direction ?? "all").Trim().ToUpperInvariant();
+    var statusFilter = (status ?? "active").Trim().ToUpperInvariant();
 
-    var q = db.Receipts
+    if (exportFormat is not ("csv" or "xlsx"))
+        return Results.BadRequest(new { message = "Format must be csv or xlsx." });
+    if (exportType == "complete" && exportFormat != "xlsx")
+        return Results.BadRequest(new { message = "Complete report is available as Excel (.xlsx)." });
+
+    var receiptQuery = db.Receipts
         .AsNoTracking()
         .Include(x => x.Terminal)
         .Include(x => x.SubmittedByUser)
+        .Include(x => x.Vehicle).ThenInclude(x => x!.Transporter)
+        .Include(x => x.Driver)
         .Include(x => x.Items).ThenInclude(x => x.PalletType)
-        .Where(x => x.BusinessDate >= from && x.BusinessDate <= to);
+        .Where(x => x.TerminalId == terminalId && x.BusinessDate >= from && x.BusinessDate <= to);
 
-    q = q.Where(x => x.TerminalId == terminalId);
+    if (statusFilter == "ACTIVE") receiptQuery = receiptQuery.Where(x => x.Status == ReceiptStatus.Active);
+    else if (statusFilter == "CANCELLED") receiptQuery = receiptQuery.Where(x => x.Status == ReceiptStatus.Cancelled);
 
-    var rows = await q.OrderBy(x => x.BusinessDate).ThenBy(x => x.SubmittedAtUtc).ToListAsync();
-    var sb = new StringBuilder();
-    sb.AppendLine("Receipt ID,Terminal,Transporter,Vehicle,Date,Driver,Direction,Pallet Type,Quantity,Submitted At UTC,Submitted By,Status");
+    if (directionFilter is "IN" or "OUT")
+        receiptQuery = receiptQuery.Where(x => x.Direction == directionFilter);
+    if (selectedTransporterIds.Count > 0)
+        receiptQuery = receiptQuery.Where(x => x.Vehicle != null && x.Vehicle.TransporterId != null && selectedTransporterIds.Contains(x.Vehicle.TransporterId.Value));
+    if (selectedVehicleIds.Count > 0)
+        receiptQuery = receiptQuery.Where(x => x.VehicleId != null && selectedVehicleIds.Contains(x.VehicleId.Value));
+    if (selectedDriverIds.Count > 0)
+        receiptQuery = receiptQuery.Where(x => x.DriverId != null && selectedDriverIds.Contains(x.DriverId.Value));
 
-    foreach (var r in rows)
-    foreach (var i in r.Items)
+    var receipts = await receiptQuery
+        .OrderBy(x => x.BusinessDate)
+        .ThenBy(x => x.SubmittedAtUtc)
+        .ToListAsync();
+
+    // Driver statistics/adjustment exports always use ACTIVE receipts and both directions,
+    // regardless of the receipt-detail Status/Direction filters. A cancelled OUT must never
+    // satisfy an IN/OUT pair, and a cancelled IN must never create a deduction.
+    var driverStatsQuery = db.Receipts
+        .AsNoTracking()
+        .Include(x => x.Vehicle).ThenInclude(x => x!.Transporter)
+        .Include(x => x.Driver)
+        .Include(x => x.Items).ThenInclude(x => x.PalletType)
+        .Where(x => x.Status == ReceiptStatus.Active &&
+                    x.TerminalId == terminalId &&
+                    x.BusinessDate >= from && x.BusinessDate <= to &&
+                    x.DriverSnapshot != "");
+
+    if (selectedTransporterIds.Count > 0)
+        driverStatsQuery = driverStatsQuery.Where(x => x.Vehicle != null && x.Vehicle.TransporterId != null && selectedTransporterIds.Contains(x.Vehicle.TransporterId.Value));
+    if (selectedVehicleIds.Count > 0)
+        driverStatsQuery = driverStatsQuery.Where(x => x.VehicleId != null && selectedVehicleIds.Contains(x.VehicleId.Value));
+    if (selectedDriverIds.Count > 0)
+        driverStatsQuery = driverStatsQuery.Where(x => x.DriverId != null && selectedDriverIds.Contains(x.DriverId.Value));
+
+    var activeDriverReceipts = await driverStatsQuery
+        .OrderBy(x => x.BusinessDate)
+        .ThenBy(x => x.SubmittedAtUtc)
+        .ToListAsync();
+
+    var cancellationUserIds = receipts.Where(x => x.CancelledByUserId != null).Select(x => x.CancelledByUserId!.Value).Distinct().ToList();
+    var cancellationUsers = cancellationUserIds.Count == 0
+        ? new Dictionary<int, string>()
+        : await db.Users.AsNoTracking().Where(x => cancellationUserIds.Contains(x.Id)).ToDictionaryAsync(x => x.Id, x => x.Username);
+
+    var settings = await db.Settings.AsNoTracking().SingleAsync();
+    var deductionPerUnmatchedIn = Math.Max(0, settings.DriverUnmatchedInDeduction);
+
+    var detailTable = new ExportTable(
+        "Receipt details",
+        ["Receipt ID", "Terminal", "Transporter", "Vehicle", "Date", "Driver", "Direction", "Pallet Type", "Quantity", "Submitted At Local", "Submitted At UTC", "Submitted By", "Status", "Cancelled At Local", "Cancelled By", "Cancel Reason"],
+        []);
+
+    foreach (var r in receipts)
     {
-        sb.AppendLine(string.Join(",",
-            Csv(r.ReceiptNumber),
-            Csv(r.Terminal?.Code ?? ""),
-            Csv(r.TransporterSnapshot),
-            Csv(r.VehicleSnapshot),
-            Csv(r.BusinessDate.ToString("yyyy-MM-dd")),
-            Csv(r.DriverSnapshot),
-            Csv(r.Direction),
-            Csv(i.PalletType?.Name ?? ""),
-            i.Quantity.ToString(CultureInfo.InvariantCulture),
-            Csv(r.SubmittedAtUtc.ToString("yyyy-MM-dd HH:mm:ss")),
-            Csv(r.SubmittedByUser?.Username ?? ""),
-            Csv(r.Status)));
+        foreach (var i in r.Items.Where(i => !palletTypeId.HasValue || i.PalletTypeId == palletTypeId.Value))
+        {
+            detailTable.Rows.Add([
+                r.ReceiptNumber,
+                r.Terminal?.Code ?? terminalCode,
+                r.TransporterSnapshot,
+                r.VehicleSnapshot,
+                r.BusinessDate.ToString("yyyy-MM-dd"),
+                r.DriverSnapshot,
+                r.Direction,
+                i.PalletType?.Name ?? "",
+                i.Quantity,
+                r.SubmittedAtUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss"),
+                r.SubmittedAtUtc.ToString("yyyy-MM-dd HH:mm:ss"),
+                r.SubmittedByUser?.Username ?? "",
+                r.Status,
+                r.CancelledAtUtc?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") ?? "",
+                r.CancelledByUserId is int cancelledBy && cancellationUsers.TryGetValue(cancelledBy, out var cancelledName) ? cancelledName : "",
+                r.CancelReason ?? ""
+            ]);
+        }
     }
 
-    await Audit(db, principal, "EXPORT", $"Exported terminal {terminalCode} from {from:yyyy-MM-dd} to {to:yyyy-MM-dd}");
-    return Results.File(
-        Encoding.UTF8.GetBytes(sb.ToString()),
-        "text/csv",
-        $"PalletExport_{terminalCode}_{from:yyyy-MM-dd}_{to:yyyy-MM-dd}.csv");
+    var receiptItemRows = receipts
+        .SelectMany(r => r.Items
+            .Where(i => !palletTypeId.HasValue || i.PalletTypeId == palletTypeId.Value)
+            .Select(i => new
+            {
+                Receipt = r,
+                PalletType = i.PalletType?.Name ?? "Unknown",
+                i.Quantity
+            }))
+        .ToList();
+
+    var vehicleTable = new ExportTable(
+        "Vehicle summary",
+        ["Transporter", "Vehicle", "Pallet Type", "IN", "OUT", "Balance", "Movement", "IN Receipts", "OUT Receipts"],
+        []);
+
+    foreach (var g in receiptItemRows.GroupBy(x => new { x.Receipt.TransporterSnapshot, x.Receipt.VehicleSnapshot, x.PalletType })
+                 .OrderBy(x => x.Key.TransporterSnapshot).ThenBy(x => x.Key.VehicleSnapshot).ThenBy(x => x.Key.PalletType))
+    {
+        var inQty = g.Where(x => x.Receipt.Direction == "IN").Sum(x => x.Quantity);
+        var outQty = g.Where(x => x.Receipt.Direction == "OUT").Sum(x => x.Quantity);
+        vehicleTable.Rows.Add([
+            g.Key.TransporterSnapshot,
+            g.Key.VehicleSnapshot,
+            g.Key.PalletType,
+            inQty,
+            outQty,
+            inQty - outQty,
+            inQty + outQty,
+            g.Where(x => x.Receipt.Direction == "IN").Select(x => x.Receipt.Id).Distinct().Count(),
+            g.Where(x => x.Receipt.Direction == "OUT").Select(x => x.Receipt.Id).Distinct().Count()
+        ]);
+    }
+
+    var driverTable = new ExportTable(
+        "Driver summary",
+        ["Driver", "Vehicles", "IN Receipts", "OUT Receipts", "Unmatched IN Receipts", "IN Pallets", "OUT Pallets", "Raw Balance", "Deduction Per Unmatched IN", "Deduction", "Adjusted Balance", "Movement"],
+        []);
+
+    foreach (var g in activeDriverReceipts
+                 .GroupBy(x => x.DriverId != null
+                     ? $"id:{x.DriverId.Value}"
+                     : $"snapshot:{x.DriverSnapshot.Trim().ToUpperInvariant()}")
+                 .OrderBy(x => x.First().DriverSnapshot))
+    {
+        var driverReceipts = g.ToList();
+        var driverName = driverReceipts.First().Driver?.Name ?? driverReceipts.First().DriverSnapshot;
+        var items = driverReceipts
+            .SelectMany(r => r.Items.Where(i => !palletTypeId.HasValue || i.PalletTypeId == palletTypeId.Value)
+                .Select(i => new { r.Direction, i.Quantity }))
+            .ToList();
+        var inQty = items.Where(x => x.Direction == "IN").Sum(x => x.Quantity);
+        var outQty = items.Where(x => x.Direction == "OUT").Sum(x => x.Quantity);
+        var unmatchedIn = driverReceipts
+            .GroupBy(r => r.BusinessDate)
+            .Sum(day => Math.Max(0,
+                day.Count(r => r.Direction == "IN") -
+                day.Count(r => r.Direction == "OUT")));
+        var deduction = unmatchedIn * deductionPerUnmatchedIn;
+        var rawBalance = inQty - outQty;
+
+        driverTable.Rows.Add([
+            driverName,
+            string.Join(", ", driverReceipts.Select(r => r.VehicleSnapshot).Distinct().OrderBy(x => x)),
+            driverReceipts.Count(r => r.Direction == "IN"),
+            driverReceipts.Count(r => r.Direction == "OUT"),
+            unmatchedIn,
+            inQty,
+            outQty,
+            rawBalance,
+            deductionPerUnmatchedIn,
+            deduction,
+            rawBalance - deduction,
+            inQty + outQty
+        ]);
+    }
+
+    var driverAdjustmentTable = new ExportTable(
+        "Driver adjustments",
+        ["Date", "Driver", "Vehicles", "IN Receipts", "OUT Receipts", "Unmatched IN Receipts", "Deduction Per Unmatched IN", "Deduction"],
+        activeDriverReceipts
+            .GroupBy(x => new
+            {
+                DriverKey = x.DriverId != null ? $"id:{x.DriverId.Value}" : $"snapshot:{x.DriverSnapshot.Trim().ToUpperInvariant()}",
+                x.BusinessDate
+            })
+            .Select(g =>
+            {
+                var inReceipts = g.Count(x => x.Direction == "IN");
+                var outReceipts = g.Count(x => x.Direction == "OUT");
+                var unmatched = Math.Max(0, inReceipts - outReceipts);
+                var first = g.First();
+                return new
+                {
+                    g.Key.BusinessDate,
+                    Driver = first.Driver?.Name ?? first.DriverSnapshot,
+                    Vehicles = string.Join(", ", g.Select(x => x.VehicleSnapshot)
+                        .Where(x => !string.IsNullOrWhiteSpace(x))
+                        .Distinct()
+                        .OrderBy(x => x)),
+                    InReceipts = inReceipts,
+                    OutReceipts = outReceipts,
+                    Unmatched = unmatched,
+                    Deduction = unmatched * deductionPerUnmatchedIn
+                };
+            })
+            .Where(x => x.Unmatched > 0)
+            .OrderByDescending(x => x.BusinessDate)
+            .ThenBy(x => x.Driver)
+            .Select(x => new List<object?>
+            {
+                x.BusinessDate.ToString("yyyy-MM-dd"), x.Driver, x.Vehicles,
+                x.InReceipts, x.OutReceipts, x.Unmatched, deductionPerUnmatchedIn, x.Deduction
+            })
+            .ToList());
+
+    var transporterTable = new ExportTable(
+        "Transporter summary",
+        ["Transporter", "Vehicles", "Receipts", "IN Receipts", "OUT Receipts", "IN Pallets", "OUT Pallets", "Balance", "Movement"],
+        []);
+
+    foreach (var g in receipts.GroupBy(x => x.TransporterSnapshot).OrderBy(x => x.Key))
+    {
+        var transporterReceipts = g.ToList();
+        var items = transporterReceipts
+            .SelectMany(r => r.Items.Where(i => !palletTypeId.HasValue || i.PalletTypeId == palletTypeId.Value)
+                .Select(i => new { r.Direction, i.Quantity }))
+            .ToList();
+        var inQty = items.Where(x => x.Direction == "IN").Sum(x => x.Quantity);
+        var outQty = items.Where(x => x.Direction == "OUT").Sum(x => x.Quantity);
+        transporterTable.Rows.Add([
+            g.Key,
+            transporterReceipts.Select(x => x.VehicleSnapshot).Distinct().Count(),
+            transporterReceipts.Count,
+            transporterReceipts.Count(x => x.Direction == "IN"),
+            transporterReceipts.Count(x => x.Direction == "OUT"),
+            inQty,
+            outQty,
+            inQty - outQty,
+            inQty + outQty
+        ]);
+    }
+
+    // Daily compliance export is based on all ACTIVE receipts, independent of the receipt status/direction filters above.
+    var today = DateOnly.FromDateTime(DateTime.Today);
+    var effectiveTo = to > today ? today : to;
+    var complianceRows = new List<VehicleComplianceRow>();
+
+    if (effectiveTo >= from)
+    {
+        var vehicleQuery = db.Vehicles.AsNoTracking().Include(x => x.Transporter).Where(x => x.Active && x.TerminalId == terminalId);
+        if (selectedTransporterIds.Count > 0)
+            vehicleQuery = vehicleQuery.Where(x => x.TransporterId != null && selectedTransporterIds.Contains(x.TransporterId.Value));
+        if (selectedVehicleIds.Count > 0)
+            vehicleQuery = vehicleQuery.Where(x => selectedVehicleIds.Contains(x.Id));
+        var vehicles = await vehicleQuery.OrderBy(x => x.VehicleId).ToListAsync();
+        var vehicleSet = vehicles.Select(x => x.Id).ToHashSet();
+
+        var holidays = await db.Holidays.AsNoTracking().Where(x => x.Date >= from && x.Date <= effectiveTo).ToListAsync();
+        var holidayDates = holidays.Select(x => x.Date).ToHashSet();
+        var complianceReceipts = await db.Receipts.AsNoTracking()
+            .Where(x => x.Status == ReceiptStatus.Active && x.TerminalId == terminalId && x.VehicleId != null && vehicleSet.Contains(x.VehicleId.Value) && x.BusinessDate >= from && x.BusinessDate <= effectiveTo)
+            .Select(x => new { x.VehicleId, x.BusinessDate, x.Direction, x.DriverId, x.DriverSnapshot })
+            .ToListAsync();
+        var lookup = complianceReceipts.GroupBy(x => new { VehicleId = x.VehicleId!.Value, x.BusinessDate }).ToDictionary(
+            g => (g.Key.VehicleId, g.Key.BusinessDate),
+            g => new
+            {
+                Directions = g.Select(x => x.Direction.ToUpperInvariant()).ToHashSet(StringComparer.OrdinalIgnoreCase),
+                InDriverIds = g.Where(x => x.Direction == "IN" && x.DriverId != null).Select(x => x.DriverId!.Value).Distinct().ToList(),
+                OutDriverIds = g.Where(x => x.Direction == "OUT" && x.DriverId != null).Select(x => x.DriverId!.Value).Distinct().ToList(),
+                InDrivers = g.Where(x => x.Direction == "IN").Select(x => x.DriverSnapshot).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().OrderBy(x => x).ToList(),
+                OutDrivers = g.Where(x => x.Direction == "OUT").Select(x => x.DriverSnapshot).Where(x => !string.IsNullOrWhiteSpace(x)).Distinct().OrderBy(x => x).ToList()
+            });
+
+        for (var date = from; date <= effectiveTo; date = date.AddDays(1))
+        {
+            if (holidayDates.Contains(date)) continue;
+            var isoDay = IsoDayOfWeek(date);
+            foreach (var vehicle in vehicles)
+            {
+                if (!ParseOperatingDays(vehicle.OperatingDays).Contains(isoDay)) continue;
+                lookup.TryGetValue((vehicle.Id, date), out var info);
+                var hasIn = info?.Directions.Contains("IN") == true;
+                var hasOut = info?.Directions.Contains("OUT") == true;
+                var complete = hasIn && hasOut;
+                complianceRows.Add(new VehicleComplianceRow
+                {
+                    Date = date,
+                    VehicleId = vehicle.Id,
+                    Vehicle = vehicle.VehicleId,
+                    Transporter = vehicle.Transporter?.Name ?? "Not assigned",
+                    InDriverIds = info?.InDriverIds ?? [],
+                    OutDriverIds = info?.OutDriverIds ?? [],
+                    InDrivers = info?.InDrivers ?? [],
+                    OutDrivers = info?.OutDrivers ?? [],
+                    HasIn = hasIn,
+                    HasOut = hasOut,
+                    Complete = complete,
+                    IsToday = date == today,
+                    Status = complete ? "COMPLETE" : hasIn ? "MISSING_OUT" : hasOut ? "MISSING_IN" : "MISSING_BOTH"
+                });
+            }
+        }
+
+        if (selectedDriverIds.Count > 0)
+        {
+            var driverSet = selectedDriverIds.ToHashSet();
+            complianceRows = complianceRows.Where(x => x.InDriverIds.Any(driverSet.Contains) || x.OutDriverIds.Any(driverSet.Contains)).ToList();
+        }
+    }
+
+    var dailyTable = new ExportTable(
+        "Daily check",
+        ["Date", "Vehicle", "Transporter", "IN", "IN Driver(s)", "OUT", "OUT Driver(s)", "Status"],
+        complianceRows.OrderByDescending(x => x.Date).ThenBy(x => x.Vehicle).Select(x => new List<object?>
+        {
+            x.Date.ToString("yyyy-MM-dd"), x.Vehicle, x.Transporter,
+            x.HasIn ? "YES" : "MISSING", string.Join(", ", x.InDrivers),
+            x.HasOut ? "YES" : "MISSING", string.Join(", ", x.OutDrivers),
+            x.Complete ? "Complete" : x.IsToday ? "Pending today" : x.Status == "MISSING_IN" ? "Missing IN" : x.Status == "MISSING_OUT" ? "Missing OUT" : "Missing IN + OUT"
+        }).ToList());
+
+    var missingTable = new ExportTable(
+        "Missing receipts",
+        ["Date", "Vehicle", "Transporter", "Missing", "IN Driver(s)", "OUT Driver(s)"],
+        complianceRows.Where(x => !x.IsToday && !x.Complete).OrderByDescending(x => x.Date).ThenBy(x => x.Vehicle).Select(x => new List<object?>
+        {
+            x.Date.ToString("yyyy-MM-dd"), x.Vehicle, x.Transporter,
+            !x.HasIn && !x.HasOut ? "IN + OUT" : !x.HasIn ? "IN" : "OUT",
+            string.Join(", ", x.InDrivers), string.Join(", ", x.OutDrivers)
+        }).ToList());
+
+    ExportTable selectedTable = exportType switch
+    {
+        "vehicles" => vehicleTable,
+        "drivers" => driverTable,
+        "transporters" => transporterTable,
+        "daily" => dailyTable,
+        "missing" => missingTable,
+        _ => detailTable
+    };
+
+    var tables = exportType == "complete"
+        ? new List<ExportTable> { detailTable, vehicleTable, driverTable, driverAdjustmentTable, transporterTable, dailyTable, missingTable }
+        : exportType == "drivers" && exportFormat == "xlsx"
+            ? new List<ExportTable> { driverTable, driverAdjustmentTable }
+            : new List<ExportTable> { selectedTable };
+
+    byte[] bytes;
+    string contentType;
+    string extension;
+    if (exportFormat == "xlsx")
+    {
+        bytes = ExportWorkbook(tables);
+        contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+        extension = "xlsx";
+    }
+    else
+    {
+        bytes = Encoding.UTF8.GetPreamble().Concat(Encoding.UTF8.GetBytes(ExportCsv(selectedTable))).ToArray();
+        contentType = "text/csv; charset=utf-8";
+        extension = "csv";
+    }
+
+    await Audit(db, principal, "EXPORT", $"Exported {exportType}/{exportFormat} for terminal {terminalCode} from {from:yyyy-MM-dd} to {to:yyyy-MM-dd}");
+    var safeType = exportType == "complete" ? "CompleteReport" : selectedTable.Name.Replace(" ", "");
+    return Results.File(bytes, contentType, $"PalletControl_{terminalCode}_{safeType}_{from:yyyy-MM-dd}_{to:yyyy-MM-dd}.{extension}");
 }).RequireAuthorization(AdminOrSuperuser());
 
 // Database status is Admin-only because it contains server filesystem paths.
@@ -1389,7 +1952,9 @@ app.MapGet("/api/admin/all", async (AppDbContext db) =>
                 terminal = x.Terminal!.Code,
                 x.ShowMilestoneNotifications,
                 x.ShowLeaderboardNotifications,
-                x.ShowBalanceNotifications
+                x.ShowBalanceNotifications,
+                x.ShowDriverStatisticsTab,
+                x.ShowDailyCheckTab
             }).ToListAsync(),
         settings
     });
@@ -1665,8 +2230,18 @@ app.MapPost("/api/admin/drivers", async (
     if (string.IsNullOrWhiteSpace(name))
         return Results.BadRequest(new { message = "Driver name is required." });
 
-    if (await db.Drivers.AnyAsync(x => x.TerminalId == req.TerminalId && x.Name.ToLower() == name.ToLower()))
-        return Results.BadRequest(new { message = "Driver already exists for this terminal." });
+    var existingDriver = await db.Drivers
+        .FirstOrDefaultAsync(x => x.TerminalId == req.TerminalId && x.Name.ToLower() == name.ToLower());
+    if (existingDriver is not null)
+    {
+        if (existingDriver.Active)
+            return Results.BadRequest(new { message = "Driver already exists for this terminal." });
+
+        existingDriver.Active = true;
+        await db.SaveChangesAsync();
+        await Audit(db, principal, "DRIVER_RESTORE", $"Restored driver {existingDriver.Name} to future selection");
+        return Results.Ok(existingDriver);
+    }
 
     var row = new Driver { Name = name, TerminalId = req.TerminalId, Active = true };
     db.Drivers.Add(row);
@@ -1683,10 +2258,26 @@ app.MapDelete("/api/admin/drivers/{id:int}", async (
     var row = await db.Drivers.FindAsync(id);
     if (row is null) return Results.NotFound();
 
-    var name = row.Name;
-    db.Drivers.Remove(row);
+    // Driver names are soft-deleted. This removes the name from future registration
+    // while preserving DriverId links and all historical statistics.
+    row.Active = false;
     await db.SaveChangesAsync();
-    await Audit(db, principal, "DRIVER_DELETE", $"Deleted driver {name}");
+    await Audit(db, principal, "DRIVER_DEACTIVATE", $"Removed driver {row.Name} from future selection; history preserved");
+    return Results.Ok();
+}).RequireAuthorization(AdminOnly());
+
+app.MapPut("/api/admin/drivers/{id:int}/active", async (
+    int id,
+    AdminActiveRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var row = await db.Drivers.FindAsync(id);
+    if (row is null) return Results.NotFound();
+    row.Active = req.Active;
+    await db.SaveChangesAsync();
+    await Audit(db, principal, req.Active ? "DRIVER_RESTORE" : "DRIVER_DEACTIVATE",
+        $"Set driver {row.Name} active={req.Active}");
     return Results.Ok();
 }).RequireAuthorization(AdminOnly());
 
@@ -1771,6 +2362,23 @@ app.MapPut("/api/admin/users/{id:int}", async (
     return Results.Ok();
 }).RequireAuthorization(AdminOnly());
 
+app.MapPut("/api/admin/users/{id:int}/tab-access", async (
+    int id,
+    AdminTabAccessRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var row = await db.Users.FindAsync(id);
+    if (row is null) return Results.NotFound();
+
+    row.ShowDriverStatisticsTab = req.ShowDriverStatisticsTab;
+    row.ShowDailyCheckTab = req.ShowDailyCheckTab;
+    await db.SaveChangesAsync();
+    await Audit(db, principal, "USER_TAB_ACCESS",
+        $"Updated tab access for {row.Username}: driverStats={row.ShowDriverStatisticsTab}, dailyCheck={row.ShowDailyCheckTab}");
+    return Results.Ok();
+}).RequireAuthorization(AdminOnly());
+
 app.MapPost("/api/admin/users/{id:int}/password", async (
     int id,
     AdminPasswordRequest req,
@@ -1823,6 +2431,7 @@ app.MapPut("/api/admin/settings", async (
     s.MonthlyMilestoneStep = Math.Max(1, req.MonthlyMilestoneStep);
     s.LeaderboardNotificationsEnabled = req.LeaderboardNotificationsEnabled;
     s.BalanceNotificationsEnabled = req.BalanceNotificationsEnabled;
+    s.DriverUnmatchedInDeduction = Math.Clamp(req.DriverUnmatchedInDeduction ?? s.DriverUnmatchedInDeduction, 0, 5000);
 
     await db.SaveChangesAsync();
     await Audit(db, principal, "SETTINGS_UPDATE", "Updated warning and notification settings");
@@ -1903,6 +2512,45 @@ static void EnsureCompatibilitySchema(AppDbContext db)
             cmd.ExecuteNonQuery();
         }
 
+        var userColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA table_info('Users');";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+                userColumns.Add(reader.GetString(1));
+        }
+
+        if (!userColumns.Contains("ShowDriverStatisticsTab"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"Users\" ADD COLUMN \"ShowDriverStatisticsTab\" INTEGER NOT NULL DEFAULT 1;";
+            cmd.ExecuteNonQuery();
+        }
+
+        if (!userColumns.Contains("ShowDailyCheckTab"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"Users\" ADD COLUMN \"ShowDailyCheckTab\" INTEGER NOT NULL DEFAULT 1;";
+            cmd.ExecuteNonQuery();
+        }
+
+        var settingsColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA table_info('Settings');";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+                settingsColumns.Add(reader.GetString(1));
+        }
+
+        if (!settingsColumns.Contains("DriverUnmatchedInDeduction"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"Settings\" ADD COLUMN \"DriverUnmatchedInDeduction\" INTEGER NOT NULL DEFAULT 15;";
+            cmd.ExecuteNonQuery();
+        }
+
         using (var cmd = connection.CreateCommand())
         {
             cmd.CommandText = """
@@ -1923,6 +2571,70 @@ CREATE UNIQUE INDEX IF NOT EXISTS "IX_Holidays_Date" ON "Holidays" ("Date");
 }
 
 static string Csv(string value) => $"\"{value.Replace("\"", "\"\"")}\"";
+
+static string ExportCsv(ExportTable table)
+{
+    var sb = new StringBuilder();
+    sb.AppendLine(string.Join(",", table.Headers.Select(Csv)));
+    foreach (var row in table.Rows)
+    {
+        sb.AppendLine(string.Join(",", row.Select(value => Csv(ExportCellText(value)))));
+    }
+    return sb.ToString();
+}
+
+static string ExportCellText(object? value) => value switch
+{
+    null => "",
+    DateTime dt => dt.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture),
+    DateOnly date => date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+    IFormattable formattable => formattable.ToString(null, CultureInfo.InvariantCulture) ?? "",
+    _ => value.ToString() ?? ""
+};
+
+static byte[] ExportWorkbook(IEnumerable<ExportTable> tables)
+{
+    using var workbook = new XLWorkbook();
+    foreach (var table in tables)
+    {
+        var worksheet = workbook.Worksheets.Add(table.Name.Length > 31 ? table.Name[..31] : table.Name);
+        for (var c = 0; c < table.Headers.Count; c++)
+        {
+            worksheet.Cell(1, c + 1).Value = table.Headers[c];
+            worksheet.Cell(1, c + 1).Style.Font.Bold = true;
+        }
+
+        for (var r = 0; r < table.Rows.Count; r++)
+        {
+            for (var c = 0; c < table.Rows[r].Count; c++)
+            {
+                var value = table.Rows[r][c];
+                var cell = worksheet.Cell(r + 2, c + 1);
+                switch (value)
+                {
+                    case int i: cell.Value = i; break;
+                    case long l: cell.Value = l; break;
+                    case decimal d: cell.Value = d; break;
+                    case double d: cell.Value = d; break;
+                    case DateTime dt: cell.Value = dt; break;
+                    default: cell.Value = ExportCellText(value); break;
+                }
+            }
+        }
+
+        worksheet.SheetView.FreezeRows(1);
+        worksheet.RangeUsed()?.SetAutoFilter();
+        worksheet.Columns().AdjustToContents(1, Math.Max(1, Math.Min(table.Rows.Count + 1, 250)));
+        foreach (var column in worksheet.ColumnsUsed())
+        {
+            if (column.Width > 45) column.Width = 45;
+        }
+    }
+
+    using var stream = new MemoryStream();
+    workbook.SaveAs(stream);
+    return stream.ToArray();
+}
 
 static async Task Audit(
     AppDbContext db,
@@ -2514,6 +3226,8 @@ public sealed class DatabaseBackupHostedService : BackgroundService
 
 // ---------------- TYPES ----------------
 
+public sealed record ExportTable(string Name, List<string> Headers, List<List<object?>> Rows);
+
 public static class Roles
 {
     public const string Admin = "Admin";
@@ -2624,6 +3338,10 @@ public class AppUser
     public bool ShowMilestoneNotifications { get; set; } = true;
     public bool ShowLeaderboardNotifications { get; set; } = true;
     public bool ShowBalanceNotifications { get; set; } = true;
+
+    // Per-user navigation/data access controlled from Admin -> Tab access.
+    public bool ShowDriverStatisticsTab { get; set; } = true;
+    public bool ShowDailyCheckTab { get; set; } = true;
 
     [JsonIgnore] public Terminal? Terminal { get; set; }
 }
@@ -2796,6 +3514,9 @@ public class AppSettings
     public int MonthlyMilestoneStep { get; set; } = 100;
     public bool LeaderboardNotificationsEnabled { get; set; } = true;
     public bool BalanceNotificationsEnabled { get; set; } = true;
+
+    // Driver statistics adjustment: every unmatched IN receipt deducts this many pallets.
+    public int DriverUnmatchedInDeduction { get; set; } = 15;
 }
 
 public class VehicleComplianceRow
@@ -2804,6 +3525,10 @@ public class VehicleComplianceRow
     public int VehicleId { get; set; }
     public string Vehicle { get; set; } = "";
     public string Transporter { get; set; } = "";
+    public List<int> InDriverIds { get; set; } = [];
+    public List<int> OutDriverIds { get; set; } = [];
+    public List<string> InDrivers { get; set; } = [];
+    public List<string> OutDrivers { get; set; } = [];
     public bool HasIn { get; set; }
     public bool HasOut { get; set; }
     public bool Complete { get; set; }
@@ -2820,6 +3545,34 @@ public class StatisticsRow
     public int OutQty { get; set; }
     public int Balance { get; set; }
     public int Movement { get; set; }
+}
+
+public class DriverStatisticsRow
+{
+    public int DriverId { get; set; }
+    public string Driver { get; set; } = "";
+    public string Vehicles { get; set; } = "";
+    public int InReceipts { get; set; }
+    public int OutReceipts { get; set; }
+    public int UnmatchedInReceipts { get; set; }
+    public int InQty { get; set; }
+    public int OutQty { get; set; }
+    public int RawBalance { get; set; }
+    public int Deduction { get; set; }
+    public int AdjustedBalance { get; set; }
+    public int Movement { get; set; }
+}
+
+public class DriverAdjustmentDetail
+{
+    public int DriverId { get; set; }
+    public string Driver { get; set; } = "";
+    public string Vehicle { get; set; } = "";
+    public DateOnly Date { get; set; }
+    public int InReceipts { get; set; }
+    public int OutReceipts { get; set; }
+    public int UnmatchedInReceipts { get; set; }
+    public int Deduction { get; set; }
 }
 
 public class DriverLeaderboardRow
@@ -2841,7 +3594,7 @@ public record ReceiptValidation(string? Error, Vehicle? Vehicle, Driver? Driver,
 }
 
 public record LoginRequest(string Username, string Password);
-public record LoginResponse(string Token, string Username, string DisplayName, string Role, int TerminalId, string TerminalCode);
+public record LoginResponse(string Token, string Username, string DisplayName, string Role, int TerminalId, string TerminalCode, bool ShowDriverStatisticsTab, bool ShowDailyCheckTab);
 public record QuickDriverRequest(string Name);
 public record ReceiptItemRequest(int PalletTypeId, int Quantity);
 public record CreateReceiptRequest(string IdempotencyKey, int VehicleId, int DriverId, string Direction, List<ReceiptItemRequest> Items, bool ConfirmWarnings = false, DateOnly? BusinessDate = null);
@@ -2860,6 +3613,8 @@ public record AdminPalletTypeUpdate(bool Active, bool UserSelectable);
 public record AdminUserRequest(string Username, string DisplayName, string Password, string Role, int TerminalId);
 public record AdminUserUpdateRequest(string DisplayName, string Role, int TerminalId, bool Active);
 public record AdminPasswordRequest(string Password);
+public record AdminTabAccessRequest(bool ShowDriverStatisticsTab, bool ShowDailyCheckTab);
+public record AdminActiveRequest(bool Active);
 public record AdminSettingsRequest(
     bool AllowUsersAddDrivers,
     bool LargeInEnabled,
@@ -2882,6 +3637,7 @@ public record AdminSettingsRequest(
     bool MilestoneNotificationsEnabled,
     int MonthlyMilestoneStep,
     bool LeaderboardNotificationsEnabled,
-    bool BalanceNotificationsEnabled);
+    bool BalanceNotificationsEnabled,
+    int? DriverUnmatchedInDeduction);
 
 public partial class Program { }

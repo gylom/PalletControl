@@ -3,8 +3,10 @@ import { createRoot } from 'react-dom/client'
 import './styles.css'
 
 const API = '/api'
+const BUILD_VERSION = '5.7.4'
+const BUILD_CREDIT = 'Developed by Gytis Lukosevicius'
 
-console.info('PalletControl frontend v5.6.1 - daily vehicle receipt check moved to separate tab')
+console.info(`PalletControl frontend v${BUILD_VERSION} - settings driver management, password help and build footer enabled`)
 
 class ApiError extends Error {
   constructor(message, status, data) {
@@ -53,6 +55,13 @@ function periodDates(preset) {
   const today = dateInput(now)
   const mondayOffset = (now.getDay() + 6) % 7
 
+  if (preset === 'today') return { from: today, to: today }
+  if (preset === 'yesterday') {
+    const yesterday = new Date(now)
+    yesterday.setDate(now.getDate() - 1)
+    const value = dateInput(yesterday)
+    return { from: value, to: value }
+  }
   if (preset === 'thisWeek') {
     const start = new Date(now)
     start.setDate(now.getDate() - mondayOffset)
@@ -138,9 +147,14 @@ function App() {
     }
   }, [Boolean(me)])
 
-  if (!me) return <Login onLogin={setMe} />
+  return <>
+    {me ? <Shell me={me} logout={logout} /> : <Login onLogin={setMe} />}
+    <BuildFooter />
+  </>
+}
 
-  return <Shell me={me} logout={logout} />
+function BuildFooter() {
+  return <div className="buildFooter">PalletControl · Build {BUILD_VERSION} · {BUILD_CREDIT}</div>
 }
 
 function Login({ onLogin }) {
@@ -148,6 +162,7 @@ function Login({ onLogin }) {
   const [password, setPassword] = useState('admin123')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [forgotPassword, setForgotPassword] = useState(false)
 
   async function submit(e) {
     e.preventDefault()
@@ -164,6 +179,21 @@ function Login({ onLogin }) {
     } finally { setBusy(false) }
   }
 
+  if (forgotPassword) {
+    return <div className="loginWrap">
+      <div className="card login passwordHelp">
+        <div className="brand">🔐</div>
+        <h1>Password reset</h1>
+        <p className="muted">Passwords are reset by the PalletControl administrator.</p>
+        <div className="passwordHelpBox">
+          <span>For password reset, contact</span>
+          <a href="mailto:Gytis@transportservice.no?subject=PalletControl%20password%20reset">Gytis@transportservice.no</a>
+        </div>
+        <button type="button" className="primary big" onClick={() => { setForgotPassword(false); setError('') }}>Back to sign in</button>
+      </div>
+    </div>
+  }
+
   return <div className="loginWrap">
     <form className="card login" onSubmit={submit}>
       <div className="brand">📦</div>
@@ -171,6 +201,7 @@ function Login({ onLogin }) {
       <p className="muted">Sign in to your terminal</p>
       <label>Username<input value={username} onChange={e => setUsername(e.target.value)} /></label>
       <label>Password<input type="password" value={password} onChange={e => setPassword(e.target.value)} /></label>
+      <button type="button" className="forgotPasswordLink" onClick={() => { setForgotPassword(true); setError('') }}>Forgot password?</button>
       {error && <div className="error">{error}</div>}
       <button className="primary big" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
       <div className="demo">Demo: admin/admin123 · super/super123 · user/user123</div>
@@ -181,12 +212,16 @@ function Login({ onLogin }) {
 function Shell({ me, logout }) {
   const [tab, setTab] = useState('register')
   const elevated = me.role === 'Admin' || me.role === 'Superuser'
+  const showDriverStatisticsTab = me.showDriverStatisticsTab !== false
+  const showDailyCheckTab = me.showDailyCheckTab !== false
   const terminalKey = `${me.terminalId}-${me.terminalCode}`
 
   useEffect(() => {
     if (tab === 'admin' && me.role !== 'Admin') setTab('register')
     if ((tab === 'warnings' || tab === 'export') && !elevated) setTab('register')
-  }, [tab, me.role, elevated])
+    if (tab === 'driverStats' && !showDriverStatisticsTab) setTab('register')
+    if (tab === 'dailyCheck' && !showDailyCheckTab) setTab('register')
+  }, [tab, me.role, elevated, showDriverStatisticsTab, showDailyCheckTab])
 
   return <div>
     <header>
@@ -197,7 +232,8 @@ function Shell({ me, logout }) {
     <nav>
       <NavButton id="register" tab={tab} setTab={setTab}>Register</NavButton>
       <NavButton id="stats" tab={tab} setTab={setTab}>Statistics</NavButton>
-      <NavButton id="dailyCheck" tab={tab} setTab={setTab}>Daily Check</NavButton>
+      {showDriverStatisticsTab && <NavButton id="driverStats" tab={tab} setTab={setTab}>Statistics Driver</NavButton>}
+      {showDailyCheckTab && <NavButton id="dailyCheck" tab={tab} setTab={setTab}>Daily Check</NavButton>}
       <NavButton id="receipts" tab={tab} setTab={setTab}>Receipts</NavButton>
       {elevated && <NavButton id="warnings" tab={tab} setTab={setTab}>Warnings</NavButton>}
       {elevated && <NavButton id="export" tab={tab} setTab={setTab}>Export</NavButton>}
@@ -210,7 +246,8 @@ function Shell({ me, logout }) {
     <main>
       {tab === 'register' && <Register key={`register-${terminalKey}`} me={me} />}
       {tab === 'stats' && <Stats key={`stats-${terminalKey}`} me={me} />}
-      {tab === 'dailyCheck' && <DailyVehicleCheck key={`daily-check-${terminalKey}`} me={me} />}
+      {tab === 'driverStats' && showDriverStatisticsTab && <DriverStats key={`driver-stats-${terminalKey}`} me={me} />}
+      {tab === 'dailyCheck' && showDailyCheckTab && <DailyVehicleCheck key={`daily-check-${terminalKey}`} me={me} />}
       {tab === 'receipts' && <Receipts key={`receipts-${terminalKey}`} me={me} />}
       {tab === 'warnings' && elevated && <Warnings key={`warnings-${terminalKey}`} me={me} />}
       {tab === 'export' && elevated && <Export key={`export-${terminalKey}`} me={me} />}
@@ -297,7 +334,6 @@ function Register({ me }) {
   const [driverOptions, setDriverOptions] = useState([])
   const [direction, setDirection] = useState('')
   const [qty, setQty] = useState({})
-  const [newDriver, setNewDriver] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [success, setSuccess] = useState(null)
@@ -325,27 +361,6 @@ function Register({ me }) {
       setDriverOptions(await api(`/drivers/for-vehicle/${value}`))
     } catch (e) {
       setDriverOptions(data?.drivers || [])
-      setError(e.message)
-    }
-  }
-
-  async function addDriver() {
-    if (!newDriver.trim()) return
-    setError('')
-    try {
-      const added = await api('/drivers/quick-add', {
-        method: 'POST',
-        body: JSON.stringify({ name: newDriver })
-      })
-      setNewDriver('')
-      const setup = await load()
-      if (vehicle) {
-        setDriverOptions(await api(`/drivers/for-vehicle/${vehicle}`))
-      } else {
-        setDriverOptions(setup.drivers)
-      }
-      setDriver(String(added.id))
-    } catch (e) {
       setError(e.message)
     }
   }
@@ -548,13 +563,6 @@ function Register({ me }) {
             </select>
           </label>
 
-          {data.allowUsersAddDrivers && (
-              <div className="addrow registerAddRow">
-                <input placeholder="Add new driver" value={newDriver} onChange={e => setNewDriver(e.target.value)} />
-                <button type="button" onClick={addDriver}>Add</button>
-              </div>
-          )}
-
           <div className="direction">
             <button type="button" className={direction === 'IN' ? 'selected' : ''} onClick={() => setDirection('IN')}>PALLETS IN</button>
             <button type="button" className={direction === 'OUT' ? 'selected' : ''} onClick={() => setDirection('OUT')}>PALLETS OUT</button>
@@ -752,23 +760,35 @@ function Stats({ me }) {
   </section>
 }
 
-function DailyVehicleCheck({ me }) {
+function DriverStats({ me }) {
   const initial = periodDates('thisMonth')
+  const [options, setOptions] = useState({ transporters: [], vehicles: [], drivers: [], palletTypes: [] })
   const [preset, setPreset] = useState('thisMonth')
   const [from, setFrom] = useState(initial.from)
   const [to, setTo] = useState(initial.to)
-  const [compliance, setCompliance] = useState(null)
-  const [showCompleteCompliance, setShowCompleteCompliance] = useState(false)
+  const [palletTypeId, setPalletTypeId] = useState('')
+  const [transporterIds, setTransporterIds] = useState([])
+  const [vehicleIds, setVehicleIds] = useState([])
+  const [driverIds, setDriverIds] = useState([])
+  const [sortBy, setSortBy] = useState('movementDesc')
+  const [viewMode, setViewMode] = useState('all')
+  const [result, setResult] = useState(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
 
+  async function loadOptions() { setOptions(await api('/statistics/options')) }
+
   async function load(nextFrom = from, nextTo = to) {
-    const p = new URLSearchParams({ from: nextFrom, to: nextTo })
-    setCompliance(await api(`/compliance?${p}`))
+    const p = new URLSearchParams({ from: nextFrom, to: nextTo, sortBy })
+    if (palletTypeId) p.set('palletTypeId', palletTypeId)
+    if (transporterIds.length) p.set('transporterIds', transporterIds.join(','))
+    if (vehicleIds.length) p.set('vehicleIds', vehicleIds.join(','))
+    if (driverIds.length) p.set('driverIds', driverIds.join(','))
+    setResult(await api(`/statistics/drivers?${p}`))
   }
 
   useEffect(() => {
-    load().catch(e => setError(e.message))
+    Promise.all([loadOptions(), load()]).catch(e => setError(e.message))
   }, [])
 
   function changePreset(value) {
@@ -780,16 +800,12 @@ function DailyVehicleCheck({ me }) {
     }
   }
 
-  async function apply() {
+  async function apply(nextFrom = from, nextTo = to) {
     setError('')
     setBusy(true)
-    try {
-      await load()
-    } catch (e) {
-      setError(e.message)
-    } finally {
-      setBusy(false)
-    }
+    try { await load(nextFrom, nextTo) }
+    catch (e) { setError(e.message) }
+    finally { setBusy(false) }
   }
 
   async function applyQuickPeriod(value) {
@@ -797,15 +813,166 @@ function DailyVehicleCheck({ me }) {
     setPreset(value)
     setFrom(r.from)
     setTo(r.to)
+    await apply(r.from, r.to)
+  }
+
+  const visibleVehicles = useMemo(() => {
+    if (!transporterIds.length) return options.vehicles
+    const set = new Set(transporterIds.map(Number))
+    return options.vehicles.filter(v => v.transporterId && set.has(Number(v.transporterId)))
+  }, [options.vehicles, transporterIds])
+
+  return <section>
+    <div className="pageTitle">
+      <div>
+        <h1>Statistics Driver · {me.terminalCode}</h1>
+        <p>Full driver statistics for terminal {me.terminalCode}. Adjusted mode deducts the configured amount for every unmatched IN receipt. Cancelled receipts are ignored.</p>
+      </div>
+    </div>
+
+    {error && <div className="error">{error}</div>}
+
+    <div className="card statsFilterCard">
+      <div className="sectionHead">
+        <div className="segmented" style={{ flexWrap: 'wrap' }}>
+          {[
+            ['today', 'Today'], ['yesterday', 'Yesterday'], ['thisWeek', 'This week'], ['previousWeek', 'Last week'],
+            ['thisMonth', 'This month'], ['lastMonth', 'Last month'], ['thisYear', 'This year'], ['lastYear', 'Last year']
+          ].map(([value, label]) => <button key={value} className={preset === value ? 'active' : ''} onClick={() => applyQuickPeriod(value)} disabled={busy}>{label}</button>)}
+        </div>
+        <div className="segmented">
+          <button className={viewMode === 'all' ? 'active' : ''} onClick={() => setViewMode('all')}>All / raw</button>
+          <button className={viewMode === 'adjusted' ? 'active' : ''} onClick={() => setViewMode('adjusted')}>Adjusted</button>
+        </div>
+      </div>
+
+      <div className="filterGrid">
+        <label>Date period<select value={preset} onChange={e => changePreset(e.target.value)}>
+          <option value="today">Today</option><option value="yesterday">Yesterday</option>
+          <option value="thisWeek">This week</option><option value="previousWeek">Previous week</option>
+          <option value="thisMonth">This month</option><option value="lastMonth">Last month</option>
+          <option value="thisYear">This year</option><option value="lastYear">Last year</option><option value="custom">Custom dates</option>
+        </select></label>
+        <label>From<input type="date" value={from} onChange={e => { setPreset('custom'); setFrom(e.target.value) }} /></label>
+        <label>To<input type="date" value={to} onChange={e => { setPreset('custom'); setTo(e.target.value) }} /></label>
+        <label>Pallet type<select value={palletTypeId} onChange={e => setPalletTypeId(e.target.value)}><option value="">All pallet types</option>{options.palletTypes.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
+        <MultiSelect label="Transporter" options={options.transporters} selected={transporterIds} setSelected={ids => {
+          setTransporterIds(ids)
+          if (ids.length) {
+            const allowed = new Set(options.vehicles.filter(v => ids.map(Number).includes(Number(v.transporterId))).map(v => Number(v.id)))
+            setVehicleIds(old => old.filter(id => allowed.has(Number(id))))
+          }
+        }} labelKey="name" />
+        <MultiSelect label="Vehicle" options={visibleVehicles.map(v => ({ ...v, name: `${v.vehicleId} — ${v.transporter}` }))} selected={vehicleIds} setSelected={setVehicleIds} labelKey="name" />
+        <MultiSelect label="Driver name" options={options.drivers} selected={driverIds} setSelected={setDriverIds} labelKey="name" />
+        <label>Sort<select value={sortBy} onChange={e => setSortBy(e.target.value)}>
+          <option value="movementDesc">Highest movement</option><option value="inDesc">Highest IN</option><option value="outDesc">Highest OUT</option>
+          <option value="rawBalanceDesc">Highest raw balance</option><option value="adjustedBalanceDesc">Highest adjusted balance</option>
+          <option value="unmatchedDesc">Most unmatched IN</option><option value="driverAsc">Driver A-Z</option>
+        </select></label>
+      </div>
+      <button className="primary" onClick={() => apply()} disabled={busy}>{busy ? 'Loading…' : 'Apply filters'}</button>
+    </div>
+
+    {result && <>
+      <div className="card" style={{ marginTop: 16 }}>
+        <div className="sectionHead">
+          <div>
+            <h2>{viewMode === 'adjusted' ? 'Adjusted driver statistics' : 'All receipts / raw statistics'}</h2>
+            <p>{viewMode === 'adjusted'
+                ? `Every unmatched IN receipt deducts ${result.deductionPerUnmatchedIn} pallets. Matching is per driver + day, regardless of vehicle.`
+                : 'Raw mode shows the actual pallet quantities without any pairing deduction.'}</p>
+          </div>
+        </div>
+      </div>
+
+      <div className="statsCards">
+        <StatCard label="IN" value={result.totalIn} />
+        <StatCard label="OUT" value={result.totalOut} />
+        <StatCard label="RAW BALANCE" value={signed(result.totalRawBalance)} cls={result.totalRawBalance >= 0 ? 'positive' : 'negative'} />
+        {viewMode === 'adjusted' && <StatCard label="UNMATCHED IN" value={result.totalUnmatchedInReceipts} cls={result.totalUnmatchedInReceipts > 0 ? 'negative' : 'positive'} />}
+        {viewMode === 'adjusted' && <StatCard label="DEDUCTION" value={result.totalDeduction ? `-${result.totalDeduction}` : '0'} cls={result.totalDeduction > 0 ? 'negative' : ''} />}
+        {viewMode === 'adjusted' && <StatCard label="ADJUSTED BALANCE" value={signed(result.totalAdjustedBalance)} cls={result.totalAdjustedBalance >= 0 ? 'positive' : 'negative'} />}
+      </div>
+
+      <div className="tableWrap"><table><thead><tr>
+        <th>Driver</th><th>Vehicle(s)</th><th>IN receipts</th><th>OUT receipts</th>
+        {viewMode === 'adjusted' && <th>Unmatched IN</th>}
+        <th>IN pallets</th><th>OUT pallets</th><th>Raw balance</th>
+        {viewMode === 'adjusted' && <><th>Deduction</th><th>Adjusted balance</th></>}
+        <th>Movement</th>
+      </tr></thead><tbody>
+      {result.rows.map(r => <tr key={`${r.driverId}-${r.driver}`}>
+        <td><b>{r.driver}</b></td><td>{r.vehicles || '—'}</td><td>{r.inReceipts}</td><td>{r.outReceipts}</td>
+        {viewMode === 'adjusted' && <td className={r.unmatchedInReceipts > 0 ? 'negative' : ''}><b>{r.unmatchedInReceipts}</b></td>}
+        <td>{r.inQty}</td><td>{r.outQty}</td><td className={r.rawBalance >= 0 ? 'positive' : 'negative'}><b>{signed(r.rawBalance)}</b></td>
+        {viewMode === 'adjusted' && <><td className={r.deduction > 0 ? 'negative' : ''}>{r.deduction ? `-${r.deduction}` : '0'}</td><td className={r.adjustedBalance >= 0 ? 'positive' : 'negative'}><b>{signed(r.adjustedBalance)}</b></td></>}
+        <td>{r.movement}</td>
+      </tr>)}
+      </tbody></table></div>
+      {result.rows.length === 0 && <Empty text="No drivers match these filters." />}
+
+      {viewMode === 'adjusted' && result.adjustmentDetails?.length > 0 && <div className="card" style={{ marginTop: 16 }}>
+        <div className="sectionHead"><div><h2>Adjustment details</h2><p>These are the exact driver + day combinations where IN receipts were not fully matched by OUT receipts. OUT receipts can match IN receipts across different vehicles used by the same driver that day.</p></div></div>
+        <div className="tableWrap"><table><thead><tr><th>Date</th><th>Driver</th><th>Vehicles</th><th>IN receipts</th><th>OUT receipts</th><th>Unmatched IN</th><th>Deduction</th></tr></thead><tbody>
+        {result.adjustmentDetails.map((r, i) => <tr key={`${r.driverId}-${r.vehicle}-${r.date}-${i}`}>
+          <td>{formatDate(r.date)}</td><td><b>{r.driver}</b></td><td>{r.vehicle}</td><td>{r.inReceipts}</td><td>{r.outReceipts}</td><td className="negative"><b>{r.unmatchedInReceipts}</b></td><td className="negative"><b>-{r.deduction}</b></td>
+        </tr>)}
+        </tbody></table></div>
+      </div>}
+    </>}
+  </section>
+}
+
+function DailyVehicleCheck({ me }) {
+  const initial = periodDates('thisMonth')
+  const [options, setOptions] = useState({ transporters: [], vehicles: [], drivers: [], palletTypes: [] })
+  const [preset, setPreset] = useState('thisMonth')
+  const [from, setFrom] = useState(initial.from)
+  const [to, setTo] = useState(initial.to)
+  const [vehicleIds, setVehicleIds] = useState([])
+  const [driverIds, setDriverIds] = useState([])
+  const [compliance, setCompliance] = useState(null)
+  const [showCompleteCompliance, setShowCompleteCompliance] = useState(false)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  async function loadOptions() { setOptions(await api('/statistics/options')) }
+
+  async function load(nextFrom = from, nextTo = to) {
+    const p = new URLSearchParams({ from: nextFrom, to: nextTo })
+    if (vehicleIds.length) p.set('vehicleIds', vehicleIds.join(','))
+    if (driverIds.length) p.set('driverIds', driverIds.join(','))
+    setCompliance(await api(`/compliance?${p}`))
+  }
+
+  useEffect(() => {
+    Promise.all([loadOptions(), load()]).catch(e => setError(e.message))
+  }, [])
+
+  function changePreset(value) {
+    setPreset(value)
+    if (value !== 'custom') {
+      const r = periodDates(value)
+      setFrom(r.from)
+      setTo(r.to)
+    }
+  }
+
+  async function apply(nextFrom = from, nextTo = to) {
     setError('')
     setBusy(true)
-    try {
-      await load(r.from, r.to)
-    } catch (e) {
-      setError(e.message)
-    } finally {
-      setBusy(false)
-    }
+    try { await load(nextFrom, nextTo) }
+    catch (e) { setError(e.message) }
+    finally { setBusy(false) }
+  }
+
+  async function applyQuickPeriod(value) {
+    const r = periodDates(value)
+    setPreset(value)
+    setFrom(r.from)
+    setTo(r.to)
+    await apply(r.from, r.to)
   }
 
   return <section>
@@ -821,30 +988,26 @@ function DailyVehicleCheck({ me }) {
     <div className="card statsFilterCard">
       <div className="segmented" style={{ marginBottom: 14, flexWrap: 'wrap' }}>
         {[
-          ['thisWeek', 'This week'],
-          ['previousWeek', 'Last week'],
-          ['thisMonth', 'This month'],
-          ['lastMonth', 'Last month'],
-          ['thisYear', 'This year'],
-          ['lastYear', 'Last year']
+          ['today', 'Today'], ['yesterday', 'Yesterday'], ['thisWeek', 'This week'], ['previousWeek', 'Last week'],
+          ['thisMonth', 'This month'], ['lastMonth', 'Last month'], ['thisYear', 'This year'], ['lastYear', 'Last year']
         ].map(([value, label]) => <button key={value} className={preset === value ? 'active' : ''} onClick={() => applyQuickPeriod(value)} disabled={busy}>{label}</button>)}
       </div>
 
       <div className="filterGrid">
         <label>Date period<select value={preset} onChange={e => changePreset(e.target.value)}>
-          <option value="thisWeek">This week</option>
-          <option value="previousWeek">Previous week</option>
-          <option value="thisMonth">This month</option>
-          <option value="lastMonth">Last month</option>
-          <option value="thisYear">This year</option>
-          <option value="lastYear">Last year</option>
-          <option value="custom">Custom dates</option>
+          <option value="today">Today</option><option value="yesterday">Yesterday</option>
+          <option value="thisWeek">This week</option><option value="previousWeek">Previous week</option>
+          <option value="thisMonth">This month</option><option value="lastMonth">Last month</option>
+          <option value="thisYear">This year</option><option value="lastYear">Last year</option><option value="custom">Custom dates</option>
         </select></label>
         <label>From<input type="date" value={from} onChange={e => { setPreset('custom'); setFrom(e.target.value) }} /></label>
         <label>To<input type="date" value={to} onChange={e => { setPreset('custom'); setTo(e.target.value) }} /></label>
+        <MultiSelect label="Vehicle" options={options.vehicles.map(v => ({ ...v, name: `${v.vehicleId} — ${v.transporter}` }))} selected={vehicleIds} setSelected={setVehicleIds} labelKey="name" />
+        <MultiSelect label="Driver name" options={options.drivers} selected={driverIds} setSelected={setDriverIds} labelKey="name" />
       </div>
 
-      <button className="primary" onClick={apply} disabled={busy}>{busy ? 'Loading…' : 'Apply period'}</button>
+      {driverIds.length > 0 && <div className="muted small" style={{ marginBottom: 12 }}>Driver filtering shows scheduled vehicle-days where the selected driver submitted at least one IN or OUT receipt. A day with no receipts cannot be assigned to a driver.</div>}
+      <button className="primary" onClick={() => apply()} disabled={busy}>{busy ? 'Loading…' : 'Apply filters'}</button>
     </div>
 
     {compliance && <>
@@ -859,14 +1022,14 @@ function DailyVehicleCheck({ me }) {
         <div className="sectionHead">
           <div>
             <h2>Vehicle-day status</h2>
-            <p>Schedule controls when a receipt is expected; it never blocks a vehicle from submitting on another day.</p>
+            <p>Schedule controls when a receipt is expected; it never blocks a vehicle from submitting on another day. Cancelled receipts do not count as IN or OUT.</p>
           </div>
           <label className="miniCheck"><input type="checkbox" checked={showCompleteCompliance} onChange={e => setShowCompleteCompliance(e.target.checked)} /> Show completed</label>
         </div>
 
         {compliance.holidays?.length > 0 && <div className="muted small" style={{ marginBottom: 10 }}>Excluded holidays: {compliance.holidays.map(h => `${formatDate(h.date)} ${h.name}`).join(' · ')}</div>}
 
-        <div className="tableWrap"><table><thead><tr><th>Date</th><th>Vehicle</th><th>Transporter</th><th>IN receipt</th><th>OUT receipt</th><th>Status</th></tr></thead>
+        <div className="tableWrap"><table><thead><tr><th>Date</th><th>Vehicle</th><th>Transporter</th><th>IN receipt</th><th>IN driver(s)</th><th>OUT receipt</th><th>OUT driver(s)</th><th>Status</th></tr></thead>
           <tbody>{compliance.rows
               .filter(r => showCompleteCompliance || !r.complete)
               .map(r => <tr key={`${r.date}-${r.vehicleId}`}>
@@ -874,12 +1037,14 @@ function DailyVehicleCheck({ me }) {
                 <td><b>{r.vehicle}</b></td>
                 <td>{r.transporter}</td>
                 <td className={r.hasIn ? 'positive' : 'negative'}><b>{r.hasIn ? 'YES' : 'MISSING'}</b></td>
+                <td>{r.inDrivers?.length ? r.inDrivers.join(', ') : '—'}</td>
                 <td className={r.hasOut ? 'positive' : 'negative'}><b>{r.hasOut ? 'YES' : 'MISSING'}</b></td>
+                <td>{r.outDrivers?.length ? r.outDrivers.join(', ') : '—'}</td>
                 <td className={r.complete ? 'positive' : (r.isToday ? '' : 'negative')}><b>{r.complete ? 'Complete' : r.isToday ? 'Pending today' : r.status === 'MISSING_IN' ? 'Missing IN' : r.status === 'MISSING_OUT' ? 'Missing OUT' : 'Missing IN + OUT'}</b></td>
               </tr>)}
           </tbody></table></div>
 
-        {!showCompleteCompliance && compliance.rows.filter(r => !r.complete).length === 0 && <Empty text="All expected vehicle-days in this period have both an IN and an OUT receipt." />}
+        {!showCompleteCompliance && compliance.rows.filter(r => !r.complete).length === 0 && <Empty text="All expected vehicle-days in this filtered period have both an IN and an OUT receipt." />}
       </div>
     </>}
   </section>
@@ -1091,6 +1256,8 @@ function UserSettings({ me }) {
   const [s, setS] = useState(null)
   const [message, setMessage] = useState('')
   const [error, setError] = useState('')
+  const [newDriver, setNewDriver] = useState('')
+  const [addingDriver, setAddingDriver] = useState(false)
   useEffect(() => { api('/me/settings').then(setS).catch(e => setError(e.message)) }, [])
   if (!s) return <Loading />
 
@@ -1102,14 +1269,46 @@ function UserSettings({ me }) {
     } catch (e) { setError(e.message) }
   }
 
-  return <section><div className="pageTitle"><div><h1>My settings</h1><p>Personal notification preferences for {me.displayName}.</p></div></div>
+  async function addDriver() {
+    const name = newDriver.trim()
+    if (!name) return
+    setMessage(''); setError(''); setAddingDriver(true)
+    try {
+      const added = await api('/drivers/quick-add', {
+        method: 'POST',
+        body: JSON.stringify({ name })
+      })
+      setNewDriver('')
+      setMessage(`Driver ${added.name} is now available for terminal ${me.terminalCode}.`)
+    } catch (e) {
+      setError(e.status === 403 ? 'Adding driver names has been disabled by an administrator.' : e.message)
+    } finally {
+      setAddingDriver(false)
+    }
+  }
+
+  return <section><div className="pageTitle"><div><h1>My settings</h1><p>Personal settings and driver-name management for {me.displayName}.</p></div></div>
     {message && <div className="success">{message}</div>}{error && <div className="error">{error}</div>}
     <div className="card settingsCard">
+      <h2>Notifications</h2>
       <Toggle label="Monthly milestone notifications" text="Example: You have now brought in over 100 pallets this month." checked={s.showMilestoneNotifications} onChange={v => setS({ ...s, showMilestoneNotifications: v })} />
       <Toggle label="Leaderboard notifications" text="Show current monthly rank and who is ahead/behind after submission." checked={s.showLeaderboardNotifications} onChange={v => setS({ ...s, showLeaderboardNotifications: v })} />
       <Toggle label="Monthly balance notification" text="Show your selected driver's current IN, OUT and balance after submission." checked={s.showBalanceNotifications} onChange={v => setS({ ...s, showBalanceNotifications: v })} />
       <button className="primary" onClick={save}>Save my settings</button>
     </div>
+
+    <div className="card settingsDriverCard">
+      <div>
+        <h2>Add driver name</h2>
+        <p className="muted">Add a driver to terminal {me.terminalCode}. The name will become available on the Register page.</p>
+      </div>
+      {s.allowUsersAddDrivers ? <div className="settingsDriverForm">
+        <input placeholder="Driver name" value={newDriver} onChange={e => setNewDriver(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addDriver() } }} />
+        <button type="button" className="primary" disabled={addingDriver || !newDriver.trim()} onClick={addDriver}>{addingDriver ? 'Adding…' : 'Add driver'}</button>
+      </div> : <div className="settingsDisabledNotice">Adding new driver names is currently disabled by the administrator.</div>}
+      {me.role === 'Admin' && <p className="muted small settingsAdminHint">Administrator: this option can be enabled or disabled under Admin → Notifications & general.</p>}
+    </div>
+
     {me.role === 'Superuser' && <div className="card noteCard"><b>Superuser access</b><p>You can view/acknowledge warnings, manage cancellations and export data. Warning thresholds remain Admin-only.</p></div>}
   </section>
 }
@@ -1120,24 +1319,141 @@ function Toggle({ label, text, checked, onChange }) {
 
 function Export({ me }) {
   const initial = periodDates('thisMonth')
+  const [options, setOptions] = useState({ transporters: [], vehicles: [], drivers: [], palletTypes: [] })
+  const [preset, setPreset] = useState('thisMonth')
   const [from, setFrom] = useState(initial.from)
   const [to, setTo] = useState(initial.to)
+  const [type, setType] = useState('receipts')
+  const [format, setFormat] = useState('csv')
+  const [palletTypeId, setPalletTypeId] = useState('')
+  const [transporterIds, setTransporterIds] = useState([])
+  const [vehicleIds, setVehicleIds] = useState([])
+  const [driverIds, setDriverIds] = useState([])
+  const [direction, setDirection] = useState('all')
+  const [status, setStatus] = useState('active')
+  const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+
+  useEffect(() => {
+    api('/statistics/options').then(setOptions).catch(e => setError(e.message))
+  }, [])
+
+  function changePreset(value) {
+    setPreset(value)
+    if (value !== 'custom') {
+      const r = periodDates(value)
+      setFrom(r.from)
+      setTo(r.to)
+    }
+  }
+
+  function quickPeriod(value) {
+    const r = periodDates(value)
+    setPreset(value)
+    setFrom(r.from)
+    setTo(r.to)
+  }
+
+  function changeType(value) {
+    setType(value)
+    if (value === 'complete') setFormat('xlsx')
+  }
+
+  const visibleVehicles = useMemo(() => {
+    if (!transporterIds.length) return options.vehicles
+    const set = new Set(transporterIds.map(Number))
+    return options.vehicles.filter(v => v.transporterId && set.has(Number(v.transporterId)))
+  }, [options.vehicles, transporterIds])
 
   async function download() {
     setError('')
+    setBusy(true)
     try {
       const token = localStorage.getItem('token')
-      const res = await fetch(`${API}/export?from=${from}&to=${to}`, { headers: { Authorization: `Bearer ${token}` } })
-      if (!res.ok) throw new Error(`Export failed (${res.status})`)
+      const p = new URLSearchParams({ from, to, type, format, direction, status })
+      if (palletTypeId) p.set('palletTypeId', palletTypeId)
+      if (transporterIds.length) p.set('transporterIds', transporterIds.join(','))
+      if (vehicleIds.length) p.set('vehicleIds', vehicleIds.join(','))
+      if (driverIds.length) p.set('driverIds', driverIds.join(','))
+
+      const res = await fetch(`${API}/export?${p}`, { headers: { Authorization: `Bearer ${token}` } })
+      if (!res.ok) {
+        const text = await res.text()
+        let message = `Export failed (${res.status})`
+        try { message = JSON.parse(text)?.message || message } catch { /* keep fallback */ }
+        throw new Error(message)
+      }
+
       const blob = await res.blob()
       const url = URL.createObjectURL(blob)
-      const a = document.createElement('a'); a.href = url; a.download = `PalletExport_${me.terminalCode}_${from}_${to}.csv`; a.click(); URL.revokeObjectURL(url)
-    } catch (e) { setError(e.message) }
+      const disposition = res.headers.get('content-disposition') || ''
+      const match = disposition.match(/filename\*?=(?:UTF-8''|\")?([^\";]+)/i)
+      const fallbackType = type === 'complete' ? 'CompleteReport' : type
+      const filename = match ? decodeURIComponent(match[1].replace(/\"/g, '')) : `PalletControl_${me.terminalCode}_${fallbackType}_${from}_${to}.${format}`
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      a.click()
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBusy(false)
+    }
   }
 
-  return <section><div className="pageTitle"><div><h1>Export · {me.terminalCode}</h1><p>CSV export is restricted to terminal {me.terminalCode}.</p></div></div>{error && <div className="error">{error}</div>}
-    <div className="card exportCard"><label>From<input type="date" value={from} onChange={e => setFrom(e.target.value)} /></label><label>To<input type="date" value={to} onChange={e => setTo(e.target.value)} /></label><button className="primary" onClick={download}>Download CSV</button></div>
+  return <section>
+    <div className="pageTitle"><div><h1>Export · {me.terminalCode}</h1><p>Exports are restricted to terminal {me.terminalCode}. Choose a detailed CSV, a summary, a daily-check report, or a complete Excel workbook.</p></div></div>
+    {error && <div className="error">{error}</div>}
+
+    <div className="card statsFilterCard">
+      <div className="segmented" style={{ marginBottom: 14, flexWrap: 'wrap' }}>
+        {[
+          ['today', 'Today'], ['yesterday', 'Yesterday'], ['thisWeek', 'This week'], ['previousWeek', 'Last week'],
+          ['thisMonth', 'This month'], ['lastMonth', 'Last month'], ['thisYear', 'This year'], ['lastYear', 'Last year']
+        ].map(([value, label]) => <button key={value} className={preset === value ? 'active' : ''} onClick={() => quickPeriod(value)}>{label}</button>)}
+      </div>
+
+      <div className="filterGrid">
+        <label>Export type<select value={type} onChange={e => changeType(e.target.value)}>
+          <option value="receipts">Receipt details</option>
+          <option value="vehicles">Vehicle pallet summary</option>
+          <option value="drivers">Driver summary</option>
+          <option value="transporters">Transporter summary</option>
+          <option value="daily">Daily vehicle receipt check</option>
+          <option value="missing">Missing receipt report only</option>
+          <option value="complete">Complete Excel report — all sheets</option>
+        </select></label>
+        <label>Format<select value={format} onChange={e => setFormat(e.target.value)} disabled={type === 'complete'}>
+          <option value="csv">CSV</option><option value="xlsx">Excel (.xlsx)</option>
+        </select></label>
+        <label>Date period<select value={preset} onChange={e => changePreset(e.target.value)}>
+          <option value="today">Today</option><option value="yesterday">Yesterday</option>
+          <option value="thisWeek">This week</option><option value="previousWeek">Previous week</option>
+          <option value="thisMonth">This month</option><option value="lastMonth">Last month</option>
+          <option value="thisYear">This year</option><option value="lastYear">Last year</option><option value="custom">Custom dates</option>
+        </select></label>
+        <label>From<input type="date" value={from} onChange={e => { setPreset('custom'); setFrom(e.target.value) }} /></label>
+        <label>To<input type="date" value={to} onChange={e => { setPreset('custom'); setTo(e.target.value) }} /></label>
+        <label>Pallet type<select value={palletTypeId} onChange={e => setPalletTypeId(e.target.value)}><option value="">All pallet types</option>{options.palletTypes.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label>
+        <MultiSelect label="Transporter" options={options.transporters} selected={transporterIds} setSelected={ids => {
+          setTransporterIds(ids)
+          if (ids.length) {
+            const allowed = new Set(options.vehicles.filter(v => ids.map(Number).includes(Number(v.transporterId))).map(v => Number(v.id)))
+            setVehicleIds(old => old.filter(id => allowed.has(Number(id))))
+          }
+        }} labelKey="name" />
+        <MultiSelect label="Vehicle" options={visibleVehicles.map(v => ({ ...v, name: `${v.vehicleId} — ${v.transporter}` }))} selected={vehicleIds} setSelected={setVehicleIds} labelKey="name" />
+        <MultiSelect label="Driver name" options={options.drivers} selected={driverIds} setSelected={setDriverIds} labelKey="name" />
+        <label>Direction<select value={direction} onChange={e => setDirection(e.target.value)}><option value="all">All</option><option value="IN">IN only</option><option value="OUT">OUT only</option></select></label>
+        <label>Receipt status<select value={status} onChange={e => setStatus(e.target.value)}><option value="active">Active</option><option value="cancelled">Cancelled</option><option value="all">All</option></select></label>
+      </div>
+
+      <div className="muted small" style={{ marginBottom: 12 }}>
+        Driver summary includes raw balance, unmatched IN receipts, the configured deduction per unmatched IN, and adjusted balance. Daily/missing reports use active receipts and the vehicle work schedule/holiday rules.
+      </div>
+      <button className="primary" onClick={download} disabled={busy}>{busy ? 'Preparing export…' : `Download ${format === 'xlsx' ? 'Excel' : 'CSV'}`}</button>
+    </div>
   </section>
 }
 
@@ -1169,6 +1485,8 @@ function Admin() {
     { id: 'pallets', icon: '📦', title: 'Pallet types', description: 'Available pallet types and user visibility.' },
     { id: 'warnings', icon: '⚠️', title: 'Warning rules', description: 'Thresholds, duplicates and activity warnings.' },
     { id: 'notifications', icon: '🔔', title: 'Notifications & general', description: 'Submit messages and general user options.' },
+    { id: 'driverStats', icon: '📊', title: 'Driver statistics', description: 'Configure the unmatched IN receipt deduction used by adjusted driver statistics.' },
+    { id: 'tabAccess', icon: '🔐', title: 'Tab access', description: 'Choose which users can see Statistics Driver and Daily Check.' },
     { id: 'database', icon: '🗄️', title: 'Database & backup', description: 'See the real SQLite file and create a backup.' }
   ]
 
@@ -1182,6 +1500,8 @@ function Admin() {
       pallets: '/admin/pallet-types',
       warnings: '/admin/settings',
       notifications: '/admin/settings',
+      driverStats: '/admin/settings',
+      tabAccess: '/admin/users',
       database: '/admin/database/status'
     }[cat]
   }
@@ -1198,7 +1518,7 @@ function Admin() {
       // category response into the currently rendered category.
       if (requestSequence !== adminLoadSequence.current || activeCategoryRef.current !== cat) return
 
-      const next = (cat === 'warnings' || cat === 'notifications') ? { settings: result } : result
+      const next = (cat === 'warnings' || cat === 'notifications' || cat === 'driverStats') ? { settings: result } : result
       setData(next)
 
       if (cat === 'vehicles' && next.terminals?.[0] && !vehicleForm.terminalId) {
@@ -1337,9 +1657,15 @@ function Admin() {
         {data.holidays.length === 0 && <Empty text="No holidays/non-working days registered yet." />}
       </AdminSection>}
 
-      {category === 'drivers' && <AdminSection title="Driver names" subtitle="Delete removes a driver from future selection; historical receipts keep the driver snapshot.">
-        <div className="inlineForm"><input placeholder="Driver name" value={driverForm.name} onChange={e => setDriverForm({ ...driverForm, name: e.target.value })} /><select value={driverForm.terminalId} onChange={e => setDriverForm({ ...driverForm, terminalId: e.target.value })}>{data.terminals.map(t => <option key={t.id} value={t.id}>{t.code}</option>)}</select><button className="primary" onClick={() => action(async () => { await api('/admin/drivers', { method: 'POST', body: JSON.stringify({ name: driverForm.name, terminalId: Number(driverForm.terminalId) }) }); setDriverForm({ ...driverForm, name: '' }) }, 'Driver added.')}>Add driver</button></div>
-        <div className="adminRows">{data.drivers.map(d => <div className="adminRow" key={d.id}><b>{d.name}</b><span>{d.terminal}</span><button className="dangerGhost" onClick={() => del('drivers', d, d.name)}>Delete</button></div>)}</div>
+      {category === 'drivers' && <AdminSection title="Driver names" subtitle="Removing a driver only removes the name from future selection. Historical receipts and driver statistics are preserved.">
+        <div className="warningInline" style={{ marginBottom: 14 }}><b>Admin warning:</b> Do not remove a driver to correct statistics. The name will disappear from future registration, but all old receipts remain and continue to count in historical statistics. Removed names can be restored later.</div>
+        <div className="inlineForm"><input placeholder="Driver name" value={driverForm.name} onChange={e => setDriverForm({ ...driverForm, name: e.target.value })} /><select value={driverForm.terminalId} onChange={e => setDriverForm({ ...driverForm, terminalId: e.target.value })}>{data.terminals.map(t => <option key={t.id} value={t.id}>{t.code}</option>)}</select><button className="primary" onClick={() => action(async () => { await api('/admin/drivers', { method: 'POST', body: JSON.stringify({ name: driverForm.name, terminalId: Number(driverForm.terminalId) }) }); setDriverForm({ ...driverForm, name: '' }) }, 'Driver added/restored.')}>Add driver</button></div>
+        <div className="adminRows">{data.drivers.map(d => <div className="adminRow driverAdmin" key={d.id}><b>{d.name}</b><span>{d.terminal}</span><span className={d.active ? 'positive' : 'muted'}><b>{d.active ? 'Active' : 'Removed'}</b></span>{d.active
+            ? <button className="dangerGhost" onClick={() => {
+              if (!window.confirm(`Remove ${d.name} from future selection?\n\nHistorical receipts and statistics will NOT be deleted. The driver can be restored later.`)) return
+              action(() => api(`/admin/drivers/${d.id}`, { method: 'DELETE' }), `${d.name} removed from future selection.`)
+            }}>Remove</button>
+            : <button onClick={() => action(() => api(`/admin/drivers/${d.id}/active`, { method: 'PUT', body: JSON.stringify({ active: true }) }), `${d.name} restored.`)}>Restore</button>}</div>)}</div>
       </AdminSection>}
 
       {category === 'pallets' && <AdminSection title="Pallet types">
@@ -1355,6 +1681,10 @@ function Admin() {
       {category === 'warnings' && <AdminWarningSettings settings={data.settings} save={next => action(() => api('/admin/settings', { method: 'PUT', body: JSON.stringify(next) }), 'Warning rules saved.')} />}
 
       {category === 'notifications' && <AdminNotificationSettings settings={data.settings} save={next => action(() => api('/admin/settings', { method: 'PUT', body: JSON.stringify(next) }), 'Notification and general settings saved.')} />}
+
+      {category === 'driverStats' && <AdminDriverStatsSettings settings={data.settings} save={next => action(() => api('/admin/settings', { method: 'PUT', body: JSON.stringify(next) }), 'Driver statistics setting saved.')} />}
+
+      {category === 'tabAccess' && <AdminTabAccess users={data.users} save={(user, next) => action(() => api(`/admin/users/${user.id}/tab-access`, { method: 'PUT', body: JSON.stringify(next) }), `Tab access saved for ${user.username}.`)} />}
 
       {category === 'database' && <AdminSection title="Database & backup" subtitle="This shows the actual SQLite file used by the running API. Backups are consistent SQLite snapshots, not normal file copies.">
         <div className="detailGrid">
@@ -1445,7 +1775,7 @@ function AdminNotificationSettings({ settings, save }) {
 
   return <div className="card adminSection">
     <h2>Notifications & general</h2>
-    <p className="muted">Control the optional messages users see after submitting and general registration options.</p>
+    <p className="muted">Control optional submit messages and whether users may add new driver names from their Settings page.</p>
     <div className="settingsGroups adminSettingsTwoCol">
       <SettingsGroup title="Submit notifications shown to users">
         <Rule label="Monthly milestones" enabled={s.milestoneNotificationsEnabled} setEnabled={v => set('milestoneNotificationsEnabled', v)} value={s.monthlyMilestoneStep} setValue={v => set('monthlyMilestoneStep', v)} suffix="pallet step" />
@@ -1453,11 +1783,60 @@ function AdminNotificationSettings({ settings, save }) {
         <SimpleRule label="Current monthly balance message" enabled={s.balanceNotificationsEnabled} setEnabled={v => set('balanceNotificationsEnabled', v)} />
       </SettingsGroup>
 
-      <SettingsGroup title="General registration settings">
-        <SimpleRule label="Allow users to quick-add driver names" enabled={s.allowUsersAddDrivers} setEnabled={v => set('allowUsersAddDrivers', v)} />
+      <SettingsGroup title="Driver-name access">
+        <SimpleRule label="Allow users to add driver names from Settings" enabled={s.allowUsersAddDrivers} setEnabled={v => set('allowUsersAddDrivers', v)} />
       </SettingsGroup>
     </div>
     <button className="primary" onClick={() => save(s)}>Save notification & general settings</button>
+  </div>
+}
+
+function AdminTabAccess({ users, save }) {
+  return <div className="card adminSection">
+    <h2>Tab access</h2>
+    <p className="muted">Choose exactly which accounts can see and open the Statistics Driver and Daily Check tabs. Changes are enforced by the backend too, not only hidden from the menu. Logged-in users update automatically within about 15 seconds or when the browser regains focus.</p>
+    <div className="tableWrap"><table className="tabAccessTable"><thead><tr><th>User</th><th>Role</th><th>Terminal</th><th>Statistics Driver</th><th>Daily Check</th><th></th></tr></thead><tbody>
+    {users.map(user => <TabAccessRow key={user.id} user={user} save={save} />)}
+    </tbody></table></div>
+  </div>
+}
+
+function TabAccessRow({ user, save }) {
+  const [driverStats, setDriverStats] = useState(user.showDriverStatisticsTab !== false)
+  const [dailyCheck, setDailyCheck] = useState(user.showDailyCheckTab !== false)
+
+  useEffect(() => {
+    setDriverStats(user.showDriverStatisticsTab !== false)
+    setDailyCheck(user.showDailyCheckTab !== false)
+  }, [user.id, user.showDriverStatisticsTab, user.showDailyCheckTab])
+
+  return <tr>
+    <td><b>{user.username}</b><div className="muted small">{user.displayName}</div></td>
+    <td>{user.role}</td>
+    <td>{user.terminal}</td>
+    <td><label className="miniCheck"><input type="checkbox" checked={driverStats} onChange={e => setDriverStats(e.target.checked)} /> Show</label></td>
+    <td><label className="miniCheck"><input type="checkbox" checked={dailyCheck} onChange={e => setDailyCheck(e.target.checked)} /> Show</label></td>
+    <td><button onClick={() => save(user, { showDriverStatisticsTab: driverStats, showDailyCheckTab: dailyCheck })}>Save</button></td>
+  </tr>
+}
+
+function AdminDriverStatsSettings({ settings, save }) {
+  const [s, setS] = useState({ ...settings, driverUnmatchedInDeduction: Number(settings.driverUnmatchedInDeduction ?? 15) })
+
+  return <div className="card adminSection">
+    <h2>Driver statistics</h2>
+    <p className="muted">Adjusted driver statistics pair receipts per driver + day, regardless of vehicle. Every IN receipt without a matching OUT receipt deducts this number of pallets from the adjusted balance. Raw receipts and raw statistics are never changed.</p>
+    <div className="settingsGroups adminSettingsTwoCol">
+      <SettingsGroup title="Unmatched IN adjustment">
+        <div className="ruleRow">
+          <label><b>Deduction per unmatched IN receipt</b></label>
+          <input className="smallNumber" type="number" min="0" max="5000" value={s.driverUnmatchedInDeduction} onChange={e => setS(old => ({ ...old, driverUnmatchedInDeduction: Number(e.target.value) }))} />
+          <span>pallets</span>
+        </div>
+        <p className="muted small">Example with 15: 1 IN / 0 OUT = −15, 3 IN / 0 OUT = −45, 3 IN / 1 OUT = −30, 3 IN / 3 OUT = 0 deduction.</p>
+      </SettingsGroup>
+    </div>
+    <button className="primary" onClick={() => save(s)}>Save driver statistics setting</button>
   </div>
 }
 

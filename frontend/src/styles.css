@@ -1087,20 +1087,20 @@ This avoids the old issue where KRS/SRD took almost the entire width.
 
 
 .receiptSuccessSummary {
-  display:grid;
-  gap:6px;
-  padding:14px 0 4px;
-  font-size:15px;
+    display:grid;
+    gap:6px;
+    padding:14px 0 4px;
+    font-size:15px;
 }
 .receiptSuccessSummary > b { font-size:18px; }
 .submitPopupNotices { margin:16px 0 0; }
 .modalActions { display:flex; justify-content:flex-end; margin-top:18px; }
 
 @media (max-width: 760px) {
-  .warningToolbar { align-items:stretch; }
-  .warningSearch { min-width:100%; max-width:none; }
-  .receiptStatusFilters { width:100%; }
-  .limitButtons { margin-left:0; }
+    .warningToolbar { align-items:stretch; }
+    .warningSearch { min-width:100%; max-width:none; }
+    .receiptStatusFilters { width:100%; }
+    .limitButtons { margin-left:0; }
 }
 
 /* v5.3 receipt search - Admin/Superuser only */
@@ -1136,5 +1136,94 @@ This avoids the old issue where KRS/SRD took almost the entire width.
 
     .receiptSearch label {
         min-width: 100%;
+    }
+}
+
+/* =========================================================
+   v5.6.2 - Admin layout fixes
+   - Keep long usernames fully visible
+   - Keep long database/backup paths inside their card
+   ========================================================= */
+
+/* Give usernames enough room and allow them to wrap instead of being hidden
+   underneath the next grid column. */
+.userAdmin {
+    grid-template-columns:
+        minmax(220px, 1.25fr)
+        minmax(260px, 2.6fr)
+        120px
+        90px
+        100px
+        auto
+        auto;
+}
+
+.userAdmin > b {
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+
+/* Prevent any admin grid child from forcing the entire card wider than its
+   available space. */
+.adminSection,
+.adminRows,
+.adminRow,
+.detailGrid,
+.detailGrid > span {
+    min-width: 0;
+}
+
+/* Database paths are long strings with very few natural break points.
+   Use two columns on desktop and explicitly allow the path text to wrap. */
+.detailGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+}
+
+.detailGrid > span {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    overflow: hidden;
+}
+
+.detailGrid > span > b,
+.detailGrid > span {
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    white-space: normal;
+}
+
+/* At medium widths, keep user rows readable rather than forcing controls
+   into each other. */
+@media (max-width: 1100px) {
+    .userAdmin {
+        grid-template-columns:
+            minmax(190px, 1fr)
+            minmax(220px, 2fr)
+            115px
+            82px
+            95px
+            auto
+            auto;
+    }
+}
+
+@media (max-width: 900px) {
+    .userAdmin {
+        grid-template-columns: minmax(180px, 1fr) minmax(220px, 2fr) 110px 80px;
+    }
+
+    .detailGrid {
+        grid-template-columns: 1fr;
+    }
+}
+
+@media (max-width: 700px) {
+    .userAdmin,
+    .detailGrid {
+        grid-template-columns: 1fr;
     }
 }

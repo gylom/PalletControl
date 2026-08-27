@@ -4,6 +4,8 @@ import './styles.css'
 
 const API = '/api'
 
+console.info('PalletControl frontend v5.6.1 - daily vehicle receipt check moved to separate tab')
+
 class ApiError extends Error {
   constructor(message, status, data) {
     super(message)
@@ -96,13 +98,49 @@ function App() {
     try { return JSON.parse(localStorage.getItem('me')) } catch { return null }
   })
 
-  if (!me) return <Login onLogin={setMe} />
-
-  return <Shell me={me} logout={() => {
+  function logout() {
     localStorage.removeItem('token')
     localStorage.removeItem('me')
     setMe(null)
-  }} />
+  }
+
+  // Keep role and terminal synchronized with the database while the user is logged in.
+  // The backend also refreshes these values for authorization on every request, so this
+  // is mainly for keeping the visible terminal badge/navigation current.
+  useEffect(() => {
+    if (!me) return
+
+    let cancelled = false
+
+    async function refreshMe() {
+      try {
+        const current = await api('/me')
+        if (cancelled) return
+
+        setMe(previous => {
+          const merged = { ...previous, ...current }
+          localStorage.setItem('me', JSON.stringify(merged))
+          return merged
+        })
+      } catch (e) {
+        if (!cancelled && e.status === 401) logout()
+      }
+    }
+
+    refreshMe()
+    const timer = setInterval(refreshMe, 15000)
+    window.addEventListener('focus', refreshMe)
+
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+      window.removeEventListener('focus', refreshMe)
+    }
+  }, [Boolean(me)])
+
+  if (!me) return <Login onLogin={setMe} />
+
+  return <Shell me={me} logout={logout} />
 }
 
 function Login({ onLogin }) {
@@ -143,6 +181,12 @@ function Login({ onLogin }) {
 function Shell({ me, logout }) {
   const [tab, setTab] = useState('register')
   const elevated = me.role === 'Admin' || me.role === 'Superuser'
+  const terminalKey = `${me.terminalId}-${me.terminalCode}`
+
+  useEffect(() => {
+    if (tab === 'admin' && me.role !== 'Admin') setTab('register')
+    if ((tab === 'warnings' || tab === 'export') && !elevated) setTab('register')
+  }, [tab, me.role, elevated])
 
   return <div>
     <header>
@@ -153,6 +197,7 @@ function Shell({ me, logout }) {
     <nav>
       <NavButton id="register" tab={tab} setTab={setTab}>Register</NavButton>
       <NavButton id="stats" tab={tab} setTab={setTab}>Statistics</NavButton>
+      <NavButton id="dailyCheck" tab={tab} setTab={setTab}>Daily Check</NavButton>
       <NavButton id="receipts" tab={tab} setTab={setTab}>Receipts</NavButton>
       {elevated && <NavButton id="warnings" tab={tab} setTab={setTab}>Warnings</NavButton>}
       {elevated && <NavButton id="export" tab={tab} setTab={setTab}>Export</NavButton>}
@@ -163,11 +208,12 @@ function Shell({ me, logout }) {
     <div className="healthBarWrap"><HealthCheck /></div>
 
     <main>
-      {tab === 'register' && <Register me={me} />}
-      {tab === 'stats' && <Stats />}
-      {tab === 'receipts' && <Receipts me={me} />}
-      {tab === 'warnings' && elevated && <Warnings />}
-      {tab === 'export' && elevated && <Export />}
+      {tab === 'register' && <Register key={`register-${terminalKey}`} me={me} />}
+      {tab === 'stats' && <Stats key={`stats-${terminalKey}`} me={me} />}
+      {tab === 'dailyCheck' && <DailyVehicleCheck key={`daily-check-${terminalKey}`} me={me} />}
+      {tab === 'receipts' && <Receipts key={`receipts-${terminalKey}`} me={me} />}
+      {tab === 'warnings' && elevated && <Warnings key={`warnings-${terminalKey}`} me={me} />}
+      {tab === 'export' && elevated && <Export key={`export-${terminalKey}`} me={me} />}
       {tab === 'settings' && <UserSettings me={me} />}
       {tab === 'admin' && me.role === 'Admin' && <Admin />}
     </main>
@@ -179,7 +225,15 @@ function NavButton({ id, tab, setTab, children }) {
 }
 
 function HealthCheck() {
-  const [health, setHealth] = useState({ api: 'checking', database: 'checking', overall: 'checking', checked: null })
+  const [health, setHealth] = useState({
+    api: 'checking',
+    database: 'checking',
+    integrity: 'checking',
+    overall: 'checking',
+    checked: null,
+    latestBackupUtc: null,
+    backupCount: 0
+  })
 
   async function check() {
     try {
@@ -188,24 +242,44 @@ function HealthCheck() {
       setHealth({
         api: 'online',
         database: body?.database?.status === 'online' ? 'online' : 'offline',
+        integrity: body?.database?.quickCheck === 'ok' ? 'online' : 'offline',
         overall: res.ok && body?.status === 'healthy' ? 'healthy' : 'unhealthy',
-        checked: new Date()
+        checked: new Date(),
+        latestBackupUtc: body?.database?.latestBackupUtc || null,
+        backupCount: Number(body?.database?.backupCount || 0)
       })
     } catch {
-      setHealth({ api: 'offline', database: 'unknown', overall: 'unhealthy', checked: new Date() })
+      setHealth({
+        api: 'offline',
+        database: 'unknown',
+        integrity: 'unknown',
+        overall: 'unhealthy',
+        checked: new Date(),
+        latestBackupUtc: null,
+        backupCount: 0
+      })
     }
   }
 
   useEffect(() => {
     check()
-    const timer = setInterval(check, 15000)
+    const timer = setInterval(check, 60000)
     return () => clearInterval(timer)
   }, [])
 
-  return <div className={`healthCheck ${health.overall}`} title="Health Check refreshes every 15 seconds">
+  const backupText = health.latestBackupUtc
+      ? `Backup: ${formatTimestamp(health.latestBackupUtc)}`
+      : 'Backup: none yet'
+
+  return <div
+      className={`healthCheck ${health.overall}`}
+      title={`Real SQLite quick_check · ${backupText} · ${health.backupCount} backup(s)`}
+  >
     <b>Health Check</b>
     <HealthDot label="API" value={health.api} />
     <HealthDot label="Database" value={health.database} />
+    <HealthDot label="Integrity" value={health.integrity} />
+    <span className="healthTime">{backupText}</span>
     <span className="healthTime">{health.checked ? health.checked.toLocaleTimeString('nb-NO', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'checking…'}</span>
     <button className="tiny" onClick={check}>↻</button>
   </div>
@@ -221,7 +295,7 @@ function Register({ me }) {
   const [vehicle, setVehicle] = useState('')
   const [driver, setDriver] = useState('')
   const [driverOptions, setDriverOptions] = useState([])
-  const [direction, setDirection] = useState('IN')
+  const [direction, setDirection] = useState('')
   const [qty, setQty] = useState({})
   const [newDriver, setNewDriver] = useState('')
   const [busy, setBusy] = useState(false)
@@ -279,8 +353,16 @@ function Register({ me }) {
   function validate() {
     if (!vehicle) return 'Choose a vehicle.'
     if (!driver) return 'Choose a driver.'
+    if (!direction) return 'Choose PALLETS IN or PALLETS OUT.'
     if (elevated && !businessDate) return 'Choose a receipt date.'
-    if (!Object.values(qty).some(value => Number(value) > 0)) return 'Enter at least one pallet quantity.'
+
+    const enteredValues = Object.values(qty).filter(
+        value => value !== '' && value !== null && value !== undefined
+    )
+
+    if (enteredValues.length === 0) return 'Enter a pallet quantity. 0 is allowed.'
+    if (enteredValues.some(value => !Number.isFinite(Number(value)))) return 'Enter a valid pallet quantity.'
+    if (enteredValues.some(value => Number(value) < 0)) return 'Pallet quantity cannot be negative.'
     return ''
   }
 
@@ -294,24 +376,32 @@ function Register({ me }) {
     const selectedVehicle = data.vehicles.find(x => Number(x.id) === Number(vehicle))
     const selectedDriver = driverOptions.find(x => Number(x.id) === Number(driver)) || data.drivers.find(x => Number(x.id) === Number(driver))
     const items = data.palletTypes
-      .map(p => ({ palletTypeId: Number(p.id), quantity: Number(qty[p.id] || 0) }))
-      .filter(x => x.quantity > 0)
+        .filter(p =>
+            Object.prototype.hasOwnProperty.call(qty, p.id) &&
+            qty[p.id] !== '' &&
+            qty[p.id] !== null &&
+            qty[p.id] !== undefined
+        )
+        .map(p => ({
+          palletTypeId: Number(p.id),
+          quantity: Number(qty[p.id])
+        }))
 
     const summary = items
-      .map(item => {
-        const p = data.palletTypes.find(x => Number(x.id) === Number(item.palletTypeId))
-        return `${p?.name || 'Pallet'}: ${item.quantity}`
-      })
-      .join('\n')
+        .map(item => {
+          const p = data.palletTypes.find(x => Number(x.id) === Number(item.palletTypeId))
+          return `${p?.name || 'Pallet'}: ${item.quantity}`
+        })
+        .join('\n')
 
     const accepted = window.confirm(
-      `Are you sure you want to submit?\n\n` +
-      `Vehicle: ${selectedVehicle?.vehicleId || ''}\n` +
-      `Transporter: ${selectedVehicle?.transporter || 'Not assigned'}\n` +
-      `Driver: ${selectedDriver?.name || ''}\n` +
-      `Direction: ${direction}\n` +
-      `Receipt date: ${elevated ? businessDate : dateInput()}\n` +
-      summary
+        `Are you sure you want to submit?\n\n` +
+        `Vehicle: ${selectedVehicle?.vehicleId || ''}\n` +
+        `Transporter: ${selectedVehicle?.transporter || 'Not assigned'}\n` +
+        `Driver: ${selectedDriver?.name || ''}\n` +
+        `Direction: ${direction}\n` +
+        `Receipt date: ${elevated ? businessDate : dateInput()}\n` +
+        summary
     )
     if (!accepted) return
 
@@ -338,7 +428,7 @@ function Register({ me }) {
       if (check.warnings?.length) {
         const warningText = check.warnings.map(w => `• ${w.message}`).join('\n')
         const submitAnyway = window.confirm(
-          `⚠ Please check before submitting:\n\n${warningText}\n\nSubmit anyway?`
+            `⚠ Please check before submitting:\n\n${warningText}\n\nSubmit anyway?`
         )
         if (!submitAnyway) return
       }
@@ -352,6 +442,10 @@ function Register({ me }) {
       setSuccess(receipt)
       setNotifications(result.notifications || [])
       setQty({})
+
+      // Direction is intentionally cleared after every successful submission.
+      // The next person must actively press PALLETS IN or PALLETS OUT.
+      setDirection('')
 
       // Always return to Choose vehicle / Choose driver after a successful submission.
       setVehicle('')
@@ -374,133 +468,133 @@ function Register({ me }) {
   if (!data) return <div className="card">Loading…</div>
 
   return (
-    <section>
-      <h1>Register pallets</h1>
+      <section>
+        <h1>Register pallets</h1>
 
-      {success && (
-        <Modal
-          title="✓ Receipt registered"
-          close={() => {
-            setSuccess(null)
-            setNotifications([])
-          }}
-        >
-          <div className="receiptSuccessSummary">
-            <b>{success.receiptNumber}</b>
-            <div>{success.transporter} · {success.vehicle}</div>
-            <div>{success.driver}</div>
-            <div>Receipt date: {success.businessDate}</div>
-            <div>
-              {success.direction} · {success.items?.map(x => `${x.quantity} ${x.palletType}`).join(', ')}
-            </div>
-          </div>
-
-          {notifications.length > 0 && (
-            <div className="notificationStack submitPopupNotices">
-              {notifications.map((n, i) => (
-                <div className="submitNotice" key={i}>{n}</div>
-              ))}
-            </div>
-          )}
-
-          <div className="modalActions">
-            <button
-              type="button"
-              className="primary"
-              onClick={() => {
-                setSuccess(null)
-                setNotifications([])
-              }}
+        {success && (
+            <Modal
+                title="✓ Receipt registered"
+                close={() => {
+                  setSuccess(null)
+                  setNotifications([])
+                }}
             >
-              Close
-            </button>
-          </div>
-        </Modal>
-      )}
+              <div className="receiptSuccessSummary">
+                <b>{success.receiptNumber}</b>
+                <div>{success.transporter} · {success.vehicle}</div>
+                <div>{success.driver}</div>
+                <div>Receipt date: {success.businessDate}</div>
+                <div>
+                  {success.direction} · {success.items?.map(x => `${x.quantity} ${x.palletType}`).join(', ')}
+                </div>
+              </div>
 
-      <div className="card formGrid">
-        <label>
-          Terminal
-          <input value={me.terminalCode} disabled />
-        </label>
+              {notifications.length > 0 && (
+                  <div className="notificationStack submitPopupNotices">
+                    {notifications.map((n, i) => (
+                        <div className="submitNotice" key={i}>{n}</div>
+                    ))}
+                  </div>
+              )}
 
-        <label>
-          Receipt date
-          {elevated
-            ? <input type="date" value={businessDate} onChange={e => setBusinessDate(e.target.value)} />
-            : <input value={dateInput()} disabled />}
-          {elevated && <span className="fieldHint">Manual dates are audit logged.</span>}
-        </label>
-
-        <label>
-          Vehicle
-          <select value={vehicle} onChange={e => changeVehicle(e.target.value)}>
-            <option value="">Choose vehicle</option>
-            {data.vehicles.map(v => (
-              <option key={v.id} value={v.id}>{v.vehicleId} — {v.transporter}</option>
-            ))}
-          </select>
-        </label>
-
-        <label>
-          Driver
-          <select value={driver} onChange={e => setDriver(e.target.value)}>
-            <option value="">Choose driver</option>
-            {driverOptions.map(d => (
-              <option key={d.id} value={d.id}>
-                {d.name}{d.usageCount ? ` (${d.usageCount} uses on this vehicle)` : ''}
-              </option>
-            ))}
-          </select>
-        </label>
-
-        {data.allowUsersAddDrivers && (
-          <div className="addrow registerAddRow">
-            <input placeholder="Add new driver" value={newDriver} onChange={e => setNewDriver(e.target.value)} />
-            <button type="button" onClick={addDriver}>Add</button>
-          </div>
+              <div className="modalActions">
+                <button
+                    type="button"
+                    className="primary"
+                    onClick={() => {
+                      setSuccess(null)
+                      setNotifications([])
+                    }}
+                >
+                  Close
+                </button>
+              </div>
+            </Modal>
         )}
 
-        <div className="direction">
-          <button type="button" className={direction === 'IN' ? 'selected' : ''} onClick={() => setDirection('IN')}>PALLETS IN</button>
-          <button type="button" className={direction === 'OUT' ? 'selected' : ''} onClick={() => setDirection('OUT')}>PALLETS OUT</button>
+        <div className="card formGrid">
+          <label>
+            Terminal
+            <input value={me.terminalCode} disabled />
+          </label>
+
+          <label>
+            Receipt date
+            {elevated
+                ? <input type="date" value={businessDate} onChange={e => setBusinessDate(e.target.value)} />
+                : <input value={dateInput()} disabled />}
+            {elevated && <span className="fieldHint">Manual dates are audit logged.</span>}
+          </label>
+
+          <label>
+            Vehicle
+            <select value={vehicle} onChange={e => changeVehicle(e.target.value)}>
+              <option value="">Choose vehicle</option>
+              {data.vehicles.map(v => (
+                  <option key={v.id} value={v.id}>{v.vehicleId} — {v.transporter}</option>
+              ))}
+            </select>
+          </label>
+
+          <label>
+            Driver
+            <select value={driver} onChange={e => setDriver(e.target.value)}>
+              <option value="">Choose driver</option>
+              {driverOptions.map(d => (
+                  <option key={d.id} value={d.id}>
+                    {d.name}{d.usageCount ? ` (${d.usageCount} uses on this vehicle)` : ''}
+                  </option>
+              ))}
+            </select>
+          </label>
+
+          {data.allowUsersAddDrivers && (
+              <div className="addrow registerAddRow">
+                <input placeholder="Add new driver" value={newDriver} onChange={e => setNewDriver(e.target.value)} />
+                <button type="button" onClick={addDriver}>Add</button>
+              </div>
+          )}
+
+          <div className="direction">
+            <button type="button" className={direction === 'IN' ? 'selected' : ''} onClick={() => setDirection('IN')}>PALLETS IN</button>
+            <button type="button" className={direction === 'OUT' ? 'selected' : ''} onClick={() => setDirection('OUT')}>PALLETS OUT</button>
+          </div>
+
+          <div className="pallets">
+            {data.palletTypes.map(p => (
+                <div className="qtyRow" key={p.id}>
+                  <span>{p.name}</span>
+                  <button type="button" onClick={() => setQty(current => ({
+                    ...current,
+                    [p.id]: Math.max(0, Number(current[p.id] || 0) - 1)
+                  }))}>−</button>
+                  <input
+                      inputMode="numeric"
+                      type="number"
+                      min="0"
+                      max="10000"
+                      value={qty[p.id] ?? ''}
+                      onChange={e => setQty(current => ({ ...current, [p.id]: e.target.value }))}
+                  />
+                  <button type="button" onClick={() => setQty(current => ({
+                    ...current,
+                    [p.id]: Number(current[p.id] || 0) + 1
+                  }))}>+</button>
+                </div>
+            ))}
+          </div>
+
+          {error && <div className="error">{error}</div>}
+
+          <button type="button" className="primary submit" disabled={busy} onClick={submit}>
+            {busy ? 'Submitting…' : 'SUBMIT RECEIPT'}
+          </button>
         </div>
-
-        <div className="pallets">
-          {data.palletTypes.map(p => (
-            <div className="qtyRow" key={p.id}>
-              <span>{p.name}</span>
-              <button type="button" onClick={() => setQty(current => ({
-                ...current,
-                [p.id]: Math.max(0, Number(current[p.id] || 0) - 1)
-              }))}>−</button>
-              <input
-                inputMode="numeric"
-                type="number"
-                min="0"
-                max="10000"
-                value={qty[p.id] ?? ''}
-                onChange={e => setQty(current => ({ ...current, [p.id]: e.target.value }))}
-              />
-              <button type="button" onClick={() => setQty(current => ({
-                ...current,
-                [p.id]: Number(current[p.id] || 0) + 1
-              }))}>+</button>
-            </div>
-          ))}
-        </div>
-
-        {error && <div className="error">{error}</div>}
-
-        <button type="button" className="primary submit" disabled={busy} onClick={submit}>
-          {busy ? 'Submitting…' : 'SUBMIT RECEIPT'}
-        </button>
-      </div>
-    </section>
+      </section>
   )
 }
 
-function Stats() {
+function Stats({ me }) {
   const initial = periodDates('thisMonth')
   const [options, setOptions] = useState({ transporters: [], vehicles: [], drivers: [], palletTypes: [] })
   const [preset, setPreset] = useState('thisMonth')
@@ -519,14 +613,15 @@ function Stats() {
 
   async function loadOptions() { setOptions(await api('/statistics/options')) }
 
-  async function loadStats() {
-    const p = new URLSearchParams({ from, to, sortBy })
+  async function loadStats(nextFrom = from, nextTo = to) {
+    const p = new URLSearchParams({ from: nextFrom, to: nextTo, sortBy })
     if (palletTypeId) p.set('palletTypeId', palletTypeId)
     if (transporterIds.length) p.set('transporterIds', transporterIds.join(','))
     if (vehicleIds.length) p.set('vehicleIds', vehicleIds.join(','))
     if (driverIds.length) p.set('driverIds', driverIds.join(','))
     setResult(await api(`/statistics?${p}`))
   }
+
 
   async function loadLeaderboard(period = bestPeriod) {
     const p = new URLSearchParams({ period })
@@ -554,6 +649,17 @@ function Stats() {
     } catch (e) { setError(e.message) }
   }
 
+  async function applyQuickPeriod(value) {
+    const r = periodDates(value)
+    setPreset(value)
+    setFrom(r.from)
+    setTo(r.to)
+    setError('')
+    try {
+      await loadStats(r.from, r.to)
+    } catch (e) { setError(e.message) }
+  }
+
   async function toggleBest() {
     const next = !bestOpen
     setBestOpen(next)
@@ -574,7 +680,7 @@ function Stats() {
   }, [options.vehicles, transporterIds])
 
   return <section>
-    <div className="pageTitle"><div><h1>Statistics</h1><p>Filter pallet movements and compare driver performance.</p></div>
+    <div className="pageTitle"><div><h1>Statistics · {me.terminalCode}</h1><p>Only pallet movements belonging to terminal {me.terminalCode} are shown.</p></div>
       <button className="trophy" onClick={toggleBest}>🏆 Best Performing Driver</button>
     </div>
     {error && <div className="error">{error}</div>}
@@ -601,6 +707,16 @@ function Stats() {
     </div>}
 
     <div className="card statsFilterCard">
+      <div className="segmented" style={{ marginBottom: 14, flexWrap: 'wrap' }}>
+        {[
+          ['thisWeek', 'This week'],
+          ['previousWeek', 'Last week'],
+          ['thisMonth', 'This month'],
+          ['lastMonth', 'Last month'],
+          ['thisYear', 'This year'],
+          ['lastYear', 'Last year']
+        ].map(([value, label]) => <button key={value} className={preset === value ? 'active' : ''} onClick={() => applyQuickPeriod(value)}>{label}</button>)}
+      </div>
       <div className="filterGrid">
         <label>Date period<select value={preset} onChange={e => changePreset(e.target.value)}>
           <option value="thisWeek">This week</option><option value="previousWeek">Previous week</option>
@@ -636,20 +752,153 @@ function Stats() {
   </section>
 }
 
+function DailyVehicleCheck({ me }) {
+  const initial = periodDates('thisMonth')
+  const [preset, setPreset] = useState('thisMonth')
+  const [from, setFrom] = useState(initial.from)
+  const [to, setTo] = useState(initial.to)
+  const [compliance, setCompliance] = useState(null)
+  const [showCompleteCompliance, setShowCompleteCompliance] = useState(false)
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  async function load(nextFrom = from, nextTo = to) {
+    const p = new URLSearchParams({ from: nextFrom, to: nextTo })
+    setCompliance(await api(`/compliance?${p}`))
+  }
+
+  useEffect(() => {
+    load().catch(e => setError(e.message))
+  }, [])
+
+  function changePreset(value) {
+    setPreset(value)
+    if (value !== 'custom') {
+      const r = periodDates(value)
+      setFrom(r.from)
+      setTo(r.to)
+    }
+  }
+
+  async function apply() {
+    setError('')
+    setBusy(true)
+    try {
+      await load()
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function applyQuickPeriod(value) {
+    const r = periodDates(value)
+    setPreset(value)
+    setFrom(r.from)
+    setTo(r.to)
+    setError('')
+    setBusy(true)
+    try {
+      await load(r.from, r.to)
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return <section>
+    <div className="pageTitle">
+      <div>
+        <h1>Daily vehicle receipt check · {me.terminalCode}</h1>
+        <p>Checks whether each scheduled vehicle has at least one IN and one OUT receipt on its expected operating days. Holidays and unscheduled days are excluded from the requirement, but receipts can still be submitted on those days.</p>
+      </div>
+    </div>
+
+    {error && <div className="error">{error}</div>}
+
+    <div className="card statsFilterCard">
+      <div className="segmented" style={{ marginBottom: 14, flexWrap: 'wrap' }}>
+        {[
+          ['thisWeek', 'This week'],
+          ['previousWeek', 'Last week'],
+          ['thisMonth', 'This month'],
+          ['lastMonth', 'Last month'],
+          ['thisYear', 'This year'],
+          ['lastYear', 'Last year']
+        ].map(([value, label]) => <button key={value} className={preset === value ? 'active' : ''} onClick={() => applyQuickPeriod(value)} disabled={busy}>{label}</button>)}
+      </div>
+
+      <div className="filterGrid">
+        <label>Date period<select value={preset} onChange={e => changePreset(e.target.value)}>
+          <option value="thisWeek">This week</option>
+          <option value="previousWeek">Previous week</option>
+          <option value="thisMonth">This month</option>
+          <option value="lastMonth">Last month</option>
+          <option value="thisYear">This year</option>
+          <option value="lastYear">Last year</option>
+          <option value="custom">Custom dates</option>
+        </select></label>
+        <label>From<input type="date" value={from} onChange={e => { setPreset('custom'); setFrom(e.target.value) }} /></label>
+        <label>To<input type="date" value={to} onChange={e => { setPreset('custom'); setTo(e.target.value) }} /></label>
+      </div>
+
+      <button className="primary" onClick={apply} disabled={busy}>{busy ? 'Loading…' : 'Apply period'}</button>
+    </div>
+
+    {compliance && <>
+      <div className="statsCards">
+        <StatCard label="EXPECTED VEHICLE-DAYS" value={compliance.expectedVehicleDays} />
+        <StatCard label="COMPLETE" value={compliance.completeVehicleDays} cls="positive" />
+        <StatCard label="MISSED (PAST DAYS)" value={compliance.missedVehicleDays} cls={compliance.missedVehicleDays > 0 ? 'negative' : 'positive'} />
+        <StatCard label="PENDING TODAY" value={compliance.pendingTodayVehicleDays} />
+      </div>
+
+      <div className="card" style={{ marginTop: 16 }}>
+        <div className="sectionHead">
+          <div>
+            <h2>Vehicle-day status</h2>
+            <p>Schedule controls when a receipt is expected; it never blocks a vehicle from submitting on another day.</p>
+          </div>
+          <label className="miniCheck"><input type="checkbox" checked={showCompleteCompliance} onChange={e => setShowCompleteCompliance(e.target.checked)} /> Show completed</label>
+        </div>
+
+        {compliance.holidays?.length > 0 && <div className="muted small" style={{ marginBottom: 10 }}>Excluded holidays: {compliance.holidays.map(h => `${formatDate(h.date)} ${h.name}`).join(' · ')}</div>}
+
+        <div className="tableWrap"><table><thead><tr><th>Date</th><th>Vehicle</th><th>Transporter</th><th>IN receipt</th><th>OUT receipt</th><th>Status</th></tr></thead>
+          <tbody>{compliance.rows
+              .filter(r => showCompleteCompliance || !r.complete)
+              .map(r => <tr key={`${r.date}-${r.vehicleId}`}>
+                <td>{formatDate(r.date)}{r.isToday ? ' · today' : ''}</td>
+                <td><b>{r.vehicle}</b></td>
+                <td>{r.transporter}</td>
+                <td className={r.hasIn ? 'positive' : 'negative'}><b>{r.hasIn ? 'YES' : 'MISSING'}</b></td>
+                <td className={r.hasOut ? 'positive' : 'negative'}><b>{r.hasOut ? 'YES' : 'MISSING'}</b></td>
+                <td className={r.complete ? 'positive' : (r.isToday ? '' : 'negative')}><b>{r.complete ? 'Complete' : r.isToday ? 'Pending today' : r.status === 'MISSING_IN' ? 'Missing IN' : r.status === 'MISSING_OUT' ? 'Missing OUT' : 'Missing IN + OUT'}</b></td>
+              </tr>)}
+          </tbody></table></div>
+
+        {!showCompleteCompliance && compliance.rows.filter(r => !r.complete).length === 0 && <Empty text="All expected vehicle-days in this period have both an IN and an OUT receipt." />}
+      </div>
+    </>}
+  </section>
+}
+
 function MultiSelect({
-  label,
-  options,
-  selected,
-  setSelected,
-  valueKey = 'id',
-  labelKey = 'name'
-}) {
+                       label,
+                       options,
+                       selected,
+                       setSelected,
+                       valueKey = 'id',
+                       labelKey = 'name'
+                     }) {
   const selectedSet = useMemo(() => new Set(selected.map(Number)), [selected])
   const summary = selected.length === 0
-    ? 'All'
-    : selected.length === 1
-      ? options.find(x => Number(x[valueKey]) === Number(selected[0]))?.[labelKey] || '1 selected'
-      : `${selected.length} selected`
+      ? 'All'
+      : selected.length === 1
+          ? options.find(x => Number(x[valueKey]) === Number(selected[0]))?.[labelKey] || '1 selected'
+          : `${selected.length} selected`
 
   function toggle(id) {
     const numericId = Number(id)
@@ -661,22 +910,22 @@ function MultiSelect({
   }
 
   return (
-    <details className="multiSelect">
-      <summary><span>{label}</span><b>{summary}</b></summary>
-      <div className="multiMenu">
-        <button type="button" className="smallLink" onClick={() => setSelected([])}>Show all</button>
-        {options.length === 0 && <div className="muted smallText">No choices available.</div>}
-        {options.map(option => {
-          const id = Number(option[valueKey])
-          return (
-            <label className="checkChoice" key={id}>
-              <input type="checkbox" checked={selectedSet.has(id)} onChange={() => toggle(id)} />
-              <span>{option[labelKey]}</span>
-            </label>
-          )
-        })}
-      </div>
-    </details>
+      <details className="multiSelect">
+        <summary><span>{label}</span><b>{summary}</b></summary>
+        <div className="multiMenu">
+          <button type="button" className="smallLink" onClick={() => setSelected([])}>Show all</button>
+          {options.length === 0 && <div className="muted smallText">No choices available.</div>}
+          {options.map(option => {
+            const id = Number(option[valueKey])
+            return (
+                <label className="checkChoice" key={id}>
+                  <input type="checkbox" checked={selectedSet.has(id)} onChange={() => toggle(id)} />
+                  <span>{option[labelKey]}</span>
+                </label>
+            )
+          })}
+        </div>
+      </details>
   )
 }
 
@@ -747,7 +996,7 @@ function Receipts({ me }) {
   }
 
   return <section>
-    <div className="pageTitle"><div><h1>Receipts</h1><p>{elevated ? 'Default 25. Filter active, cancelled or previously reversed receipts for the selected date.' : 'Latest 25 receipts.'}</p></div></div>
+    <div className="pageTitle"><div><h1>Receipts · {me.terminalCode}</h1><p>{elevated ? `Only ${me.terminalCode} receipts. Default 25. Filter active, cancelled or previously reversed receipts for the selected date.` : `Latest 25 receipts for ${me.terminalCode}.`}</p></div></div>
     {error && <div className="error">{error}</div>}
 
     {elevated && <div className="card receiptControls">
@@ -792,7 +1041,7 @@ function Receipts({ me }) {
   </section>
 }
 
-function Warnings() {
+function Warnings({ me }) {
   const [onlyOpen, setOnlyOpen] = useState(true)
   const [search, setSearch] = useState('')
   const [data, setData] = useState({ openCount: 0, warnings: [] })
@@ -819,7 +1068,7 @@ function Warnings() {
   }
 
   return <section>
-    <div className="pageTitle"><div><h1>Warnings</h1><p>Visible to Superusers and Admins. Only Admin can configure warning rules.</p></div><div className="warningCount">{data.openCount} open</div></div>
+    <div className="pageTitle"><div><h1>Warnings · {me.terminalCode}</h1><p>Only warnings belonging to terminal {me.terminalCode} are shown. Only Admin can configure warning rules.</p></div><div className="warningCount">{data.openCount} open</div></div>
     {error && <div className="error">{error}</div>}
     <div className="warningToolbar">
       <div className="segmented warningTabs"><button className={onlyOpen ? 'active' : ''} onClick={() => setOnlyOpen(true)}>Open warnings</button><button className={!onlyOpen ? 'active' : ''} onClick={() => setOnlyOpen(false)}>All warnings</button></div>
@@ -869,7 +1118,7 @@ function Toggle({ label, text, checked, onChange }) {
   return <label className="toggleRow"><div><b>{label}</b><span>{text}</span></div><input type="checkbox" checked={!!checked} onChange={e => onChange(e.target.checked)} /></label>
 }
 
-function Export() {
+function Export({ me }) {
   const initial = periodDates('thisMonth')
   const [from, setFrom] = useState(initial.from)
   const [to, setTo] = useState(initial.to)
@@ -883,11 +1132,11 @@ function Export() {
       if (!res.ok) throw new Error(`Export failed (${res.status})`)
       const blob = await res.blob()
       const url = URL.createObjectURL(blob)
-      const a = document.createElement('a'); a.href = url; a.download = `PalletExport_${from}_${to}.csv`; a.click(); URL.revokeObjectURL(url)
+      const a = document.createElement('a'); a.href = url; a.download = `PalletExport_${me.terminalCode}_${from}_${to}.csv`; a.click(); URL.revokeObjectURL(url)
     } catch (e) { setError(e.message) }
   }
 
-  return <section><div className="pageTitle"><div><h1>Export</h1><p>CSV export for Admin and Superuser.</p></div></div>{error && <div className="error">{error}</div>}
+  return <section><div className="pageTitle"><div><h1>Export · {me.terminalCode}</h1><p>CSV export is restricted to terminal {me.terminalCode}.</p></div></div>{error && <div className="error">{error}</div>}
     <div className="card exportCard"><label>From<input type="date" value={from} onChange={e => setFrom(e.target.value)} /></label><label>To<input type="date" value={to} onChange={e => setTo(e.target.value)} /></label><button className="primary" onClick={download}>Download CSV</button></div>
   </section>
 }
@@ -903,6 +1152,7 @@ function Admin() {
   const [driverForm, setDriverForm] = useState({ name: '', terminalId: '' })
   const [userForm, setUserForm] = useState({ username: '', displayName: '', password: '', role: 'User', terminalId: '' })
   const [palletName, setPalletName] = useState('')
+  const [holidayForm, setHolidayForm] = useState({ date: dateInput(), name: '' })
   // Each category load gets a sequence number. If the user jumps to another
   // category before the previous request finishes, the stale response is ignored.
   const adminLoadSequence = useRef(0)
@@ -912,23 +1162,27 @@ function Admin() {
 
   const categories = [
     { id: 'users', icon: '👤', title: 'Users', description: 'Accounts, roles, terminals and passwords.' },
-    { id: 'vehicles', icon: '🚚', title: 'Vehicles', description: 'Vehicles and transporter assignments.' },
+    { id: 'vehicles', icon: '🚚', title: 'Vehicles', description: 'Vehicles, transporter assignments and expected operating days.' },
+    { id: 'holidays', icon: '📅', title: 'Holidays / non-working days', description: 'Exclude red days and other closed days from receipt tracking.' },
     { id: 'drivers', icon: '🪪', title: 'Driver names', description: 'Add or remove selectable driver names.' },
     { id: 'transporters', icon: '🏢', title: 'Transporters', description: 'Manage transport companies.' },
     { id: 'pallets', icon: '📦', title: 'Pallet types', description: 'Available pallet types and user visibility.' },
     { id: 'warnings', icon: '⚠️', title: 'Warning rules', description: 'Thresholds, duplicates and activity warnings.' },
-    { id: 'notifications', icon: '🔔', title: 'Notifications & general', description: 'Submit messages and general user options.' }
+    { id: 'notifications', icon: '🔔', title: 'Notifications & general', description: 'Submit messages and general user options.' },
+    { id: 'database', icon: '🗄️', title: 'Database & backup', description: 'See the real SQLite file and create a backup.' }
   ]
 
   function endpointFor(cat) {
     return {
       users: '/admin/users',
       vehicles: '/admin/vehicles',
+      holidays: '/admin/holidays',
       drivers: '/admin/drivers',
       transporters: '/admin/transporters',
       pallets: '/admin/pallet-types',
       warnings: '/admin/settings',
-      notifications: '/admin/settings'
+      notifications: '/admin/settings',
+      database: '/admin/database/status'
     }[cat]
   }
 
@@ -1031,7 +1285,7 @@ function Admin() {
   const activeTransporters = data?.transporters?.filter(t => t.active) || []
   const normalizedVehicleId = vehicleForm.vehicleId.trim().toUpperCase()
   const vehicleAlreadyExists = Boolean(
-    normalizedVehicleId && data?.vehicles?.some(v => v.vehicleId.toUpperCase() === normalizedVehicleId)
+      normalizedVehicleId && data?.vehicles?.some(v => v.vehicleId.toUpperCase() === normalizedVehicleId)
   )
 
   return <section>
@@ -1045,9 +1299,9 @@ function Admin() {
 
     <div className="adminCategoryGrid">
       {categories.map(c => <button
-        key={c.id}
-        className={`adminCategoryCard ${category === c.id ? 'active' : ''}`}
-        onClick={() => chooseCategory(c.id)}
+          key={c.id}
+          className={`adminCategoryCard ${category === c.id ? 'active' : ''}`}
+          onClick={() => chooseCategory(c.id)}
       >
         <span className="adminCategoryIcon">{c.icon}</span>
         <span className="adminCategoryText"><b>{c.title}</b><small>{c.description}</small></span>
@@ -1071,10 +1325,16 @@ function Admin() {
         <div className="adminRows">{data.transporters.map(t => <div className="adminRow" key={t.id}><b>{t.name}</b><span>{t.active ? 'Active' : 'Inactive'}</span><button className="dangerGhost" onClick={() => del('transporters', t, t.name)}>Delete</button></div>)}</div>
       </AdminSection>}
 
-      {category === 'vehicles' && <AdminSection title="Vehicles" subtitle="Every vehicle can be tied to a transporter. Delete removes it from future selection while receipt snapshots remain.">
+      {category === 'vehicles' && <AdminSection title="Vehicles" subtitle="Operating days only control when a vehicle is expected to have at least one IN and one OUT receipt. A vehicle can still submit receipts on any other day. New vehicles default to Monday–Friday.">
         <div className="inlineForm three"><input placeholder="Vehicle ID" value={vehicleForm.vehicleId} onChange={e => setVehicleForm({ ...vehicleForm, vehicleId: e.target.value })} /><select value={vehicleForm.terminalId} onChange={e => setVehicleForm({ ...vehicleForm, terminalId: e.target.value })}>{data.terminals.map(t => <option key={t.id} value={t.id}>{t.code}</option>)}</select><select value={vehicleForm.transporterId} onChange={e => setVehicleForm({ ...vehicleForm, transporterId: e.target.value })}><option value="">Choose transporter</option>{activeTransporters.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select><button className="primary" disabled={!normalizedVehicleId || !vehicleForm.terminalId || !vehicleForm.transporterId || vehicleAlreadyExists} onClick={() => action(async () => { await api('/admin/vehicles', { method: 'POST', body: JSON.stringify({ vehicleId: normalizedVehicleId, terminalId: Number(vehicleForm.terminalId), transporterId: Number(vehicleForm.transporterId) }) }); setVehicleForm({ ...vehicleForm, vehicleId: '' }) }, 'Vehicle added.')}>Add vehicle</button></div>
         {vehicleAlreadyExists && <div className="warningInline">Vehicle {normalizedVehicleId} already exists.</div>}
-        <div className="adminRows">{data.vehicles.map(v => <div className="adminRow vehicleAdmin" key={v.id}><b>{v.vehicleId}</b><span>{v.terminal}</span><select value={v.transporterId || ''} onChange={e => { if (e.target.value) action(() => api(`/admin/vehicles/${v.id}/transporter`, { method: 'PUT', body: JSON.stringify({ transporterId: Number(e.target.value) }) }), 'Transporter changed.') }}><option value="">Not assigned</option>{data.transporters.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select><button className="dangerGhost" onClick={() => del('vehicles', v, v.vehicleId)}>Delete</button></div>)}</div>
+        <div className="adminRows">{data.vehicles.map(v => <VehicleAdminRow key={v.id} row={v} transporters={data.transporters} saveTransporter={transporterId => action(() => api(`/admin/vehicles/${v.id}/transporter`, { method: 'PUT', body: JSON.stringify({ transporterId }) }), 'Transporter changed.')} saveSchedule={days => action(() => api(`/admin/vehicles/${v.id}/schedule`, { method: 'PUT', body: JSON.stringify({ days }) }), 'Operating days saved.')} remove={() => del('vehicles', v, v.vehicleId)} />)}</div>
+      </AdminSection>}
+
+      {category === 'holidays' && <AdminSection title="Holidays / non-working days" subtitle="These dates are excluded from the vehicle IN/OUT compliance check for every terminal. Receipts can still be submitted on a holiday if needed.">
+        <div className="inlineForm three"><input type="date" value={holidayForm.date} onChange={e => setHolidayForm({ ...holidayForm, date: e.target.value })} /><input placeholder="Name, e.g. Christmas Day" value={holidayForm.name} onChange={e => setHolidayForm({ ...holidayForm, name: e.target.value })} /><button className="primary" disabled={!holidayForm.date} onClick={() => action(async () => { await api('/admin/holidays', { method: 'POST', body: JSON.stringify(holidayForm) }); setHolidayForm({ date: dateInput(), name: '' }) }, 'Holiday added.')}>Add non-working day</button></div>
+        <div className="adminRows">{data.holidays.map(h => <div className="adminRow" key={h.id}><b>{formatDate(h.date)}</b><span>{h.name}</span><button className="dangerGhost" onClick={() => { if (window.confirm(`Remove ${formatDate(h.date)} ${h.name} from non-working days?`)) action(() => api(`/admin/holidays/${h.id}`, { method: 'DELETE' }), 'Holiday removed.') }}>Delete</button></div>)}</div>
+        {data.holidays.length === 0 && <Empty text="No holidays/non-working days registered yet." />}
       </AdminSection>}
 
       {category === 'drivers' && <AdminSection title="Driver names" subtitle="Delete removes a driver from future selection; historical receipts keep the driver snapshot.">
@@ -1095,8 +1355,45 @@ function Admin() {
       {category === 'warnings' && <AdminWarningSettings settings={data.settings} save={next => action(() => api('/admin/settings', { method: 'PUT', body: JSON.stringify(next) }), 'Warning rules saved.')} />}
 
       {category === 'notifications' && <AdminNotificationSettings settings={data.settings} save={next => action(() => api('/admin/settings', { method: 'PUT', body: JSON.stringify(next) }), 'Notification and general settings saved.')} />}
+
+      {category === 'database' && <AdminSection title="Database & backup" subtitle="This shows the actual SQLite file used by the running API. Backups are consistent SQLite snapshots, not normal file copies.">
+        <div className="detailGrid">
+          <span><small>Database file</small><b>{data.databasePath}</b></span>
+          <span><small>Database size</small>{Math.round(Number(data.databaseSizeBytes || 0) / 1024)} KB</span>
+          <span><small>Backup folder</small><b>{data.backupDirectory}</b></span>
+          <span><small>Automatic backup</small>Every {data.backupIntervalHours} hour(s)</span>
+          <span><small>Retention</small>{data.backupRetentionDays} days</span>
+          <span><small>Backup count</small>{data.backupCount}</span>
+          <span><small>Latest backup</small>{data.latestBackupUtc ? formatTimestamp(data.latestBackupUtc) : 'No backup yet'}</span>
+          <span><small>Latest backup file</small>{data.latestBackupPath || '—'}</span>
+        </div>
+        <button className="primary" onClick={() => action(() => api('/admin/database/backup', { method: 'POST', body: '{}' }), 'Database backup created.')}>Create backup now</button>
+      </AdminSection>}
     </div>}
   </section>
+}
+
+function VehicleAdminRow({ row, transporters, saveTransporter, saveSchedule, remove }) {
+  const [days, setDays] = useState(Array.isArray(row.operatingDays) ? row.operatingDays.map(Number) : [1, 2, 3, 4, 5])
+  const weekdayNames = [[1, 'Mon'], [2, 'Tue'], [3, 'Wed'], [4, 'Thu'], [5, 'Fri'], [6, 'Sat'], [7, 'Sun']]
+
+  function toggleDay(day) {
+    setDays(current => current.includes(day) ? current.filter(x => x !== day) : [...current, day].sort((a, b) => a - b))
+  }
+
+  return <div className="adminRow vehicleAdmin" style={{ alignItems: 'flex-start', flexWrap: 'wrap' }}>
+    <b>{row.vehicleId}</b>
+    <span>{row.terminal}</span>
+    <select value={row.transporterId || ''} onChange={e => { if (e.target.value) saveTransporter(Number(e.target.value)) }}>
+      <option value="">Not assigned</option>{transporters.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+    </select>
+    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+      {weekdayNames.map(([day, name]) => <label className="miniCheck" key={day}><input type="checkbox" checked={days.includes(day)} onChange={() => toggleDay(day)} /> {name}</label>)}
+      <button onClick={() => saveSchedule(days)}>Save days</button>
+      <span className="muted small">{days.length === 0 ? 'Never expected' : 'Expected on selected days'}</span>
+    </div>
+    <button className="dangerGhost" onClick={remove}>Delete</button>
+  </div>
 }
 
 function AdminSection({ title, subtitle, children }) { return <div className="card adminSection"><h2>{title}</h2>{subtitle && <p className="muted">{subtitle}</p>}{children}</div> }

@@ -1,3 +1,4 @@
+using System.Data;
 using System.Globalization;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
@@ -6,14 +7,50 @@ using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 
 var builder = WebApplication.CreateBuilder(args);
 
+// Resolve the SQLite file to an absolute path based on the API project/content root.
+// This makes the database location deterministic even when the app is started by Rider,
+// PowerShell, IIS or a Windows service from a different working directory.
+var configuredConnectionString = builder.Configuration.GetConnectionString("Default")
+                                 ?? "Data Source=palletcontrol-v5.db";
+var sqliteConnectionBuilder = new SqliteConnectionStringBuilder(configuredConnectionString);
+
+if (string.IsNullOrWhiteSpace(sqliteConnectionBuilder.DataSource))
+    throw new InvalidOperationException("SQLite Data Source is missing.");
+
+var databasePath = sqliteConnectionBuilder.DataSource;
+if (!Path.IsPathRooted(databasePath))
+    databasePath = Path.GetFullPath(Path.Combine(builder.Environment.ContentRootPath, databasePath));
+
+Directory.CreateDirectory(Path.GetDirectoryName(databasePath) ?? builder.Environment.ContentRootPath);
+sqliteConnectionBuilder.DataSource = databasePath;
+
+var configuredBackupDirectory = builder.Configuration["Database:BackupDirectory"] ?? "Backups";
+var backupDirectory = Path.IsPathRooted(configuredBackupDirectory)
+    ? configuredBackupDirectory
+    : Path.GetFullPath(Path.Combine(builder.Environment.ContentRootPath, configuredBackupDirectory));
+
+Directory.CreateDirectory(backupDirectory);
+
+var databaseStorage = new DatabaseStorageOptions(
+    databasePath,
+    sqliteConnectionBuilder.ConnectionString,
+    backupDirectory,
+    Math.Clamp(builder.Configuration.GetValue<int?>("Database:BackupIntervalHours") ?? 24, 1, 168),
+    Math.Clamp(builder.Configuration.GetValue<int?>("Database:BackupRetentionDays") ?? 30, 1, 3650));
+
+builder.Services.AddSingleton(databaseStorage);
+builder.Services.AddSingleton<DatabaseBackupManager>();
+builder.Services.AddHostedService<DatabaseBackupHostedService>();
+
 builder.Services.AddDbContext<AppDbContext>(o =>
     o.UseSqlite(
-        builder.Configuration.GetConnectionString("Default"),
+        databaseStorage.ConnectionString,
         sqlite => sqlite.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery)));
 
 builder.Services.AddCors(o => o.AddPolicy("ui", p =>
@@ -50,6 +87,55 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey)),
             ClockSkew = TimeSpan.FromMinutes(1)
         };
+
+        // The token proves who the user is, but role/terminal are refreshed from
+        // the database on every authenticated request. If an Admin changes a user's
+        // terminal (for example ARE -> SRD), the next request immediately uses SRD
+        // without requiring that user to log out and back in.
+        o.Events = new JwtBearerEvents
+        {
+            OnTokenValidated = async context =>
+            {
+                var principal = context.Principal;
+                var userIdText = principal?.FindFirstValue(ClaimTypes.NameIdentifier)
+                                 ?? principal?.FindFirstValue(JwtRegisteredClaimNames.Sub);
+
+                if (!int.TryParse(userIdText, out var userId))
+                {
+                    context.Fail("Invalid user id.");
+                    return;
+                }
+
+                var db = context.HttpContext.RequestServices.GetRequiredService<AppDbContext>();
+                var currentUser = await db.Users
+                    .AsNoTracking()
+                    .Include(x => x.Terminal)
+                    .SingleOrDefaultAsync(x => x.Id == userId && x.Active);
+
+                if (currentUser is null)
+                {
+                    context.Fail("User is inactive or no longer exists.");
+                    return;
+                }
+
+                if (principal?.Identity is not ClaimsIdentity identity)
+                {
+                    context.Fail("Invalid identity.");
+                    return;
+                }
+
+                foreach (var claim in identity.FindAll(ClaimTypes.Role).ToList())
+                    identity.RemoveClaim(claim);
+                foreach (var claim in identity.FindAll("terminalId").ToList())
+                    identity.RemoveClaim(claim);
+                foreach (var claim in identity.FindAll("terminalCode").ToList())
+                    identity.RemoveClaim(claim);
+
+                identity.AddClaim(new Claim(ClaimTypes.Role, currentUser.Role));
+                identity.AddClaim(new Claim("terminalId", currentUser.TerminalId.ToString(CultureInfo.InvariantCulture)));
+                identity.AddClaim(new Claim("terminalCode", currentUser.Terminal?.Code ?? ""));
+            }
+        };
     });
 
 builder.Services.AddAuthorization();
@@ -63,6 +149,7 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
     db.Database.EnsureCreated();
+    EnsureCompatibilitySchema(db);
     Seed(db);
 }
 
@@ -70,11 +157,15 @@ app.MapGet("/", () => Results.Ok(new
 {
     name = "Pallet Control API",
     status = "running",
-    version = "5.4.2"
+    version = "5.6.0"
 }));
 
-// Public health endpoint. If this endpoint answers, the API process itself is online.
-app.MapGet("/api/health", async (AppDbContext db) =>
+// Public health endpoint. This performs a real SQLite connection, real table read,
+// and SQLite PRAGMA quick_check. It also reports whether a real backup exists.
+app.MapGet("/api/health", async (
+    AppDbContext db,
+    DatabaseStorageOptions storage,
+    DatabaseBackupManager backupManager) =>
 {
     var started = DateTime.UtcNow;
     try
@@ -88,21 +179,53 @@ app.MapGet("/api/health", async (AppDbContext db) =>
                 api = new { status = "online" },
                 database = new { status = "offline", message = "Database connection failed." },
                 checkedAtUtc = DateTime.UtcNow,
-                responseMs = (DateTime.UtcNow - started).TotalMilliseconds
+                responseMs = Math.Round((DateTime.UtcNow - started).TotalMilliseconds, 1)
             }, statusCode: StatusCodes.Status503ServiceUnavailable);
         }
 
-        // A real read verifies more than simply opening a connection.
+        // Real application read.
         _ = await db.Settings.AsNoTracking().CountAsync();
 
-        return Results.Ok(new
+        // Real SQLite integrity check.
+        string quickCheck;
+        await db.Database.OpenConnectionAsync();
+        try
         {
-            status = "healthy",
+            await using var command = db.Database.GetDbConnection().CreateCommand();
+            command.CommandText = "PRAGMA quick_check;";
+            quickCheck = Convert.ToString(await command.ExecuteScalarAsync(), CultureInfo.InvariantCulture) ?? "unknown";
+        }
+        finally
+        {
+            await db.Database.CloseConnectionAsync();
+        }
+
+        var dbFile = new FileInfo(storage.DatabasePath);
+        var backupStatus = backupManager.GetStatus();
+        var healthy = string.Equals(quickCheck, "ok", StringComparison.OrdinalIgnoreCase);
+
+        var payload = new
+        {
+            status = healthy ? "healthy" : "unhealthy",
             api = new { status = "online" },
-            database = new { status = "online", provider = "SQLite" },
+            database = new
+            {
+                status = healthy ? "online" : "unhealthy",
+                provider = "SQLite",
+                file = dbFile.Name,
+                exists = dbFile.Exists,
+                sizeBytes = dbFile.Exists ? dbFile.Length : 0,
+                quickCheck,
+                latestBackupUtc = backupStatus.LatestBackupUtc,
+                backupCount = backupStatus.BackupCount
+            },
             checkedAtUtc = DateTime.UtcNow,
             responseMs = Math.Round((DateTime.UtcNow - started).TotalMilliseconds, 1)
-        });
+        };
+
+        return healthy
+            ? Results.Ok(payload)
+            : Results.Json(payload, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
     catch (Exception ex)
     {
@@ -509,8 +632,8 @@ app.MapGet("/api/receipts", async (
         .Include(x => x.Items).ThenInclude(x => x.PalletType)
         .Include(x => x.Actions).ThenInclude(x => x.User);
 
-    if (role != Roles.Admin)
-        query = query.Where(x => x.TerminalId == terminalId);
+    // Operational data is always isolated by the user's currently assigned terminal.
+    query = query.Where(x => x.TerminalId == terminalId);
 
     if (isRegularUser)
     {
@@ -597,6 +720,7 @@ app.MapPost("/api/receipts/{id:int}/cancel", async (
         .FirstOrDefaultAsync(x => x.Id == id);
 
     if (receipt is null) return Results.NotFound();
+    if (receipt.TerminalId != TerminalId(principal)) return Results.NotFound();
     if (receipt.Status == ReceiptStatus.Cancelled)
         return Results.BadRequest(new { message = "Receipt is already cancelled." });
 
@@ -653,6 +777,7 @@ app.MapPost("/api/receipts/{id:int}/reverse-cancellation", async (
         .FirstOrDefaultAsync(x => x.Id == id);
 
     if (receipt is null) return Results.NotFound();
+    if (receipt.TerminalId != TerminalId(principal)) return Results.NotFound();
     if (receipt.Status != ReceiptStatus.Cancelled)
         return Results.BadRequest(new { message = "Receipt is not cancelled." });
 
@@ -703,23 +828,27 @@ app.MapPost("/api/receipts/{id:int}/reverse-cancellation", async (
 app.MapGet("/api/statistics/options", async (ClaimsPrincipal principal, AppDbContext db) =>
 {
     var terminalId = TerminalId(principal);
-    var role = Role(principal);
 
-    var transporterQuery = db.Transporters.AsNoTracking().Where(x => x.Active);
-    var vehicleQuery = db.Vehicles.AsNoTracking().Where(x => x.Active && x.TransporterId != null).Include(x => x.Transporter).AsQueryable();
-    var driverQuery = db.Drivers.AsNoTracking().Where(x => x.Active).AsQueryable();
+    var vehicleQuery = db.Vehicles
+        .AsNoTracking()
+        .Where(x => x.Active && x.TransporterId != null && x.TerminalId == terminalId)
+        .Include(x => x.Transporter)
+        .AsQueryable();
 
-    if (role != Roles.Admin)
-    {
-        vehicleQuery = vehicleQuery.Where(x => x.TerminalId == terminalId);
-        driverQuery = driverQuery.Where(x => x.TerminalId == terminalId);
-        var transporterIds = await vehicleQuery
-            .Where(x => x.TransporterId != null)
-            .Select(x => x.TransporterId!.Value)
-            .Distinct()
-            .ToListAsync();
-        transporterQuery = transporterQuery.Where(x => transporterIds.Contains(x.Id));
-    }
+    var driverQuery = db.Drivers
+        .AsNoTracking()
+        .Where(x => x.Active && x.TerminalId == terminalId)
+        .AsQueryable();
+
+    var transporterIdsForTerminal = await vehicleQuery
+        .Where(x => x.TransporterId != null)
+        .Select(x => x.TransporterId!.Value)
+        .Distinct()
+        .ToListAsync();
+
+    var transporterQuery = db.Transporters
+        .AsNoTracking()
+        .Where(x => x.Active && transporterIdsForTerminal.Contains(x.Id));
 
     var transporters = await transporterQuery
         .OrderBy(x => x.Name)
@@ -772,7 +901,6 @@ app.MapGet("/api/statistics", async (
     var selectedVehicleIds = ParseIds(vehicleIds);
     var selectedDriverIds = ParseIds(driverIds);
     var terminalId = TerminalId(principal);
-    var role = Role(principal);
 
     var query = db.Receipts
         .AsNoTracking()
@@ -784,8 +912,7 @@ app.MapGet("/api/statistics", async (
             r.BusinessDate >= from.Value &&
             r.BusinessDate <= to.Value);
 
-    if (role != Roles.Admin)
-        query = query.Where(r => r.TerminalId == terminalId);
+    query = query.Where(r => r.TerminalId == terminalId);
 
     if (selectedTransporterIds.Count > 0)
         query = query.Where(r => r.Vehicle != null && r.Vehicle.TransporterId != null &&
@@ -877,6 +1004,135 @@ app.MapGet("/api/statistics", async (
     });
 }).RequireAuthorization();
 
+app.MapGet("/api/compliance", async (
+    DateOnly? from,
+    DateOnly? to,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var today = DateOnly.FromDateTime(DateTime.Today);
+    from ??= new DateOnly(today.Year, today.Month, 1);
+    to ??= today;
+
+    if (to.Value < from.Value)
+        return Results.BadRequest(new { message = "To date cannot be before From date." });
+
+    // Future dates are never treated as missed/pending work days.
+    var effectiveTo = to.Value > today ? today : to.Value;
+    if (effectiveTo < from.Value)
+    {
+        return Results.Ok(new
+        {
+            from,
+            to,
+            effectiveTo,
+            expectedVehicleDays = 0,
+            completeVehicleDays = 0,
+            missedVehicleDays = 0,
+            pendingTodayVehicleDays = 0,
+            rows = Array.Empty<object>(),
+            holidays = Array.Empty<object>()
+        });
+    }
+
+    var terminalId = TerminalId(principal);
+
+    var vehicles = await db.Vehicles
+        .AsNoTracking()
+        .Include(x => x.Transporter)
+        .Where(x => x.Active && x.TerminalId == terminalId)
+        .OrderBy(x => x.VehicleId)
+        .ToListAsync();
+
+    var holidays = await db.Holidays
+        .AsNoTracking()
+        .Where(x => x.Date >= from.Value && x.Date <= effectiveTo)
+        .OrderBy(x => x.Date)
+        .ToListAsync();
+
+    var holidayDates = holidays.Select(x => x.Date).ToHashSet();
+
+    var receipts = await db.Receipts
+        .AsNoTracking()
+        .Where(x =>
+            x.Status == ReceiptStatus.Active &&
+            x.TerminalId == terminalId &&
+            x.VehicleId != null &&
+            x.BusinessDate >= from.Value &&
+            x.BusinessDate <= effectiveTo)
+        .Select(x => new { x.VehicleId, x.BusinessDate, x.Direction })
+        .ToListAsync();
+
+    var receiptLookup = receipts
+        .GroupBy(x => new { VehicleId = x.VehicleId!.Value, x.BusinessDate })
+        .ToDictionary(
+            g => (g.Key.VehicleId, g.Key.BusinessDate),
+            g => g.Select(x => x.Direction.ToUpperInvariant()).ToHashSet(StringComparer.OrdinalIgnoreCase));
+
+    var rows = new List<VehicleComplianceRow>();
+
+    for (var date = from.Value; date <= effectiveTo; date = date.AddDays(1))
+    {
+        if (holidayDates.Contains(date))
+            continue;
+
+        var isoDay = IsoDayOfWeek(date);
+
+        foreach (var vehicle in vehicles)
+        {
+            var operatingDays = ParseOperatingDays(vehicle.OperatingDays);
+            if (!operatingDays.Contains(isoDay))
+                continue;
+
+            receiptLookup.TryGetValue((vehicle.Id, date), out var directions);
+            var hasIn = directions?.Contains("IN") == true;
+            var hasOut = directions?.Contains("OUT") == true;
+            var complete = hasIn && hasOut;
+            var isToday = date == today;
+
+            rows.Add(new VehicleComplianceRow
+            {
+                Date = date,
+                VehicleId = vehicle.Id,
+                Vehicle = vehicle.VehicleId,
+                Transporter = vehicle.Transporter?.Name ?? "Not assigned",
+                HasIn = hasIn,
+                HasOut = hasOut,
+                Complete = complete,
+                IsToday = isToday,
+                Status = complete
+                    ? "COMPLETE"
+                    : hasIn
+                        ? "MISSING_OUT"
+                        : hasOut
+                            ? "MISSING_IN"
+                            : "MISSING_BOTH"
+            });
+        }
+    }
+
+    var sortedRows = rows
+        .OrderByDescending(x => x.Date)
+        .ThenBy(x => x.Complete)
+        .ThenBy(x => x.Vehicle)
+        .ToList();
+
+    return Results.Ok(new
+    {
+        from,
+        to,
+        effectiveTo,
+        expectedVehicleDays = rows.Count,
+        completeVehicleDays = rows.Count(x => x.Complete),
+        missedVehicleDays = rows.Count(x => !x.IsToday && !x.Complete),
+        pendingTodayVehicleDays = rows.Count(x => x.IsToday && !x.Complete),
+        missingIn = rows.Count(x => !x.Complete && !x.HasIn),
+        missingOut = rows.Count(x => !x.Complete && !x.HasOut),
+        rows = sortedRows,
+        holidays = holidays.Select(x => new { x.Id, x.Date, x.Name }).ToList()
+    });
+}).RequireAuthorization();
+
 app.MapGet("/api/statistics/best-drivers", async (
     string? period,
     int? palletTypeId,
@@ -885,7 +1141,6 @@ app.MapGet("/api/statistics/best-drivers", async (
 {
     var (from, to, normalizedPeriod) = ResolvePeriod(period);
     var terminalId = TerminalId(principal);
-    var role = Role(principal);
 
     var query = db.Receipts
         .AsNoTracking()
@@ -893,8 +1148,7 @@ app.MapGet("/api/statistics/best-drivers", async (
         .Where(x => x.Status == ReceiptStatus.Active &&
                     x.BusinessDate >= from && x.BusinessDate <= to);
 
-    if (role != Roles.Admin)
-        query = query.Where(x => x.TerminalId == terminalId);
+    query = query.Where(x => x.TerminalId == terminalId);
 
     var receipts = await query.ToListAsync();
     var leaderboard = BuildDriverLeaderboard(receipts, palletTypeId);
@@ -916,7 +1170,6 @@ app.MapGet("/api/warnings", async (
     ClaimsPrincipal principal,
     AppDbContext db) =>
 {
-    var role = Role(principal);
     var terminalId = TerminalId(principal);
     var take = Math.Clamp(limit ?? 100, 1, 500);
 
@@ -927,8 +1180,7 @@ app.MapGet("/api/warnings", async (
         .Include(x => x.AcknowledgedByUser)
         .AsQueryable();
 
-    if (role != Roles.Admin)
-        query = query.Where(x => x.TerminalId == terminalId);
+    query = query.Where(x => x.TerminalId == terminalId);
 
     if (unacknowledgedOnly == true)
         query = query.Where(x => x.AcknowledgedAtUtc == null);
@@ -973,9 +1225,9 @@ app.MapGet("/api/warnings", async (
         })
         .ToListAsync();
 
-    var openCountQuery = db.WarningEvents.AsNoTracking().Where(x => x.AcknowledgedAtUtc == null);
-    if (role != Roles.Admin)
-        openCountQuery = openCountQuery.Where(x => x.TerminalId == terminalId);
+    var openCountQuery = db.WarningEvents
+        .AsNoTracking()
+        .Where(x => x.AcknowledgedAtUtc == null && x.TerminalId == terminalId);
 
     return Results.Ok(new { openCount = await openCountQuery.CountAsync(), warnings = rows });
 }).RequireAuthorization(AdminOrSuperuser());
@@ -988,8 +1240,8 @@ app.MapPost("/api/warnings/{id:int}/acknowledge", async (
     var warning = await db.WarningEvents.FindAsync(id);
     if (warning is null) return Results.NotFound();
 
-    if (Role(principal) != Roles.Admin && warning.TerminalId != TerminalId(principal))
-        return Results.Forbid();
+    if (warning.TerminalId != TerminalId(principal))
+        return Results.NotFound();
 
     if (warning.AcknowledgedAtUtc == null)
     {
@@ -1012,7 +1264,7 @@ app.MapGet("/api/export", async (
         return Results.BadRequest(new { message = "To date cannot be before From date." });
 
     var terminalId = TerminalId(principal);
-    var role = Role(principal);
+    var terminalCode = principal.FindFirstValue("terminalCode") ?? "TERM";
 
     var q = db.Receipts
         .AsNoTracking()
@@ -1021,8 +1273,7 @@ app.MapGet("/api/export", async (
         .Include(x => x.Items).ThenInclude(x => x.PalletType)
         .Where(x => x.BusinessDate >= from && x.BusinessDate <= to);
 
-    if (role != Roles.Admin)
-        q = q.Where(x => x.TerminalId == terminalId);
+    q = q.Where(x => x.TerminalId == terminalId);
 
     var rows = await q.OrderBy(x => x.BusinessDate).ThenBy(x => x.SubmittedAtUtc).ToListAsync();
     var sb = new StringBuilder();
@@ -1046,12 +1297,48 @@ app.MapGet("/api/export", async (
             Csv(r.Status)));
     }
 
-    await Audit(db, principal, "EXPORT", $"Exported {from:yyyy-MM-dd} to {to:yyyy-MM-dd}");
+    await Audit(db, principal, "EXPORT", $"Exported terminal {terminalCode} from {from:yyyy-MM-dd} to {to:yyyy-MM-dd}");
     return Results.File(
         Encoding.UTF8.GetBytes(sb.ToString()),
         "text/csv",
-        $"PalletExport_{from:yyyy-MM-dd}_{to:yyyy-MM-dd}.csv");
+        $"PalletExport_{terminalCode}_{from:yyyy-MM-dd}_{to:yyyy-MM-dd}.csv");
 }).RequireAuthorization(AdminOrSuperuser());
+
+// Database status is Admin-only because it contains server filesystem paths.
+app.MapGet("/api/admin/database/status", (
+    DatabaseStorageOptions storage,
+    DatabaseBackupManager backupManager) =>
+{
+    var dbFile = new FileInfo(storage.DatabasePath);
+    var backupStatus = backupManager.GetStatus();
+
+    return Results.Ok(new
+    {
+        databasePath = storage.DatabasePath,
+        databaseExists = dbFile.Exists,
+        databaseSizeBytes = dbFile.Exists ? dbFile.Length : 0,
+        backupDirectory = storage.BackupDirectory,
+        backupIntervalHours = storage.BackupIntervalHours,
+        backupRetentionDays = storage.BackupRetentionDays,
+        backupCount = backupStatus.BackupCount,
+        latestBackupPath = backupStatus.LatestBackupPath,
+        latestBackupUtc = backupStatus.LatestBackupUtc
+    });
+}).RequireAuthorization(new AuthorizeAttribute { Roles = Roles.Admin });
+
+app.MapPost("/api/admin/database/backup", async (
+    DatabaseBackupManager backupManager,
+    CancellationToken cancellationToken) =>
+{
+    var backup = await backupManager.CreateBackupAsync(cancellationToken);
+    return Results.Ok(new
+    {
+        message = "Database backup created.",
+        backup.Path,
+        backup.CreatedAtUtc,
+        backup.SizeBytes
+    });
+}).RequireAuthorization(new AuthorizeAttribute { Roles = Roles.Admin });
 
 // ---------------- ADMIN ----------------
 
@@ -1119,24 +1406,27 @@ app.MapGet("/api/admin/transporters", async (AppDbContext db) =>
 
 app.MapGet("/api/admin/vehicles", async (AppDbContext db) =>
 {
+    var vehicles = await db.Vehicles.AsNoTracking()
+        .Include(x => x.Terminal)
+        .Include(x => x.Transporter)
+        .OrderBy(x => x.VehicleId)
+        .ToListAsync();
+
     return Results.Ok(new
     {
         terminals = await db.Terminals.AsNoTracking().OrderBy(x => x.Code).ToListAsync(),
         transporters = await db.Transporters.AsNoTracking().OrderBy(x => x.Name).ToListAsync(),
-        vehicles = await db.Vehicles.AsNoTracking()
-            .Include(x => x.Terminal)
-            .Include(x => x.Transporter)
-            .OrderBy(x => x.VehicleId)
-            .Select(x => new
-            {
-                x.Id,
-                x.VehicleId,
-                x.Active,
-                x.TerminalId,
-                terminal = x.Terminal!.Code,
-                x.TransporterId,
-                transporter = x.Transporter != null ? x.Transporter.Name : "Not assigned"
-            }).ToListAsync()
+        vehicles = vehicles.Select(x => new
+        {
+            x.Id,
+            x.VehicleId,
+            x.Active,
+            x.TerminalId,
+            terminal = x.Terminal!.Code,
+            x.TransporterId,
+            transporter = x.Transporter != null ? x.Transporter.Name : "Not assigned",
+            operatingDays = ParseOperatingDays(x.OperatingDays).OrderBy(day => day).ToArray()
+        }).ToList()
     });
 }).RequireAuthorization(AdminOnly());
 
@@ -1194,6 +1484,51 @@ app.MapGet("/api/admin/users", async (AppDbContext db) =>
 app.MapGet("/api/admin/settings", async (AppDbContext db) =>
 {
     return Results.Ok(await db.Settings.AsNoTracking().SingleAsync());
+}).RequireAuthorization(AdminOnly());
+
+app.MapGet("/api/admin/holidays", async (AppDbContext db) =>
+{
+    return Results.Ok(new
+    {
+        holidays = await db.Holidays
+            .AsNoTracking()
+            .OrderByDescending(x => x.Date)
+            .Select(x => new { x.Id, x.Date, x.Name })
+            .ToListAsync()
+    });
+}).RequireAuthorization(AdminOnly());
+
+app.MapPost("/api/admin/holidays", async (
+    AdminHolidayRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var name = (req.Name ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(name))
+        name = "Holiday / non-working day";
+
+    if (await db.Holidays.AnyAsync(x => x.Date == req.Date))
+        return Results.Conflict(new { message = $"{req.Date:yyyy-MM-dd} is already registered as a holiday." });
+
+    var row = new Holiday { Date = req.Date, Name = name };
+    db.Holidays.Add(row);
+    await db.SaveChangesAsync();
+    await Audit(db, principal, "HOLIDAY_CREATE", $"Added non-working day {row.Date:yyyy-MM-dd}: {row.Name}");
+    return Results.Ok(new { row.Id, row.Date, row.Name });
+}).RequireAuthorization(AdminOnly());
+
+app.MapDelete("/api/admin/holidays/{id:int}", async (
+    int id,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var row = await db.Holidays.FindAsync(id);
+    if (row is null) return Results.NotFound();
+
+    db.Holidays.Remove(row);
+    await db.SaveChangesAsync();
+    await Audit(db, principal, "HOLIDAY_DELETE", $"Removed non-working day {row.Date:yyyy-MM-dd}: {row.Name}");
+    return Results.Ok();
 }).RequireAuthorization(AdminOnly());
 
 app.MapPost("/api/admin/transporters", async (
@@ -1256,7 +1591,8 @@ app.MapPost("/api/admin/vehicles", async (
         VehicleId = idText,
         TerminalId = req.TerminalId,
         TransporterId = req.TransporterId,
-        Active = true
+        Active = true,
+        OperatingDays = "1,2,3,4,5"
     };
     db.Vehicles.Add(row);
     await db.SaveChangesAsync();
@@ -1280,6 +1616,29 @@ app.MapPut("/api/admin/vehicles/{id:int}/transporter", async (
     await db.SaveChangesAsync();
     await Audit(db, principal, "VEHICLE_TRANSPORTER", $"Changed transporter for {row.VehicleId}");
     return Results.Ok();
+}).RequireAuthorization(AdminOnly());
+
+app.MapPut("/api/admin/vehicles/{id:int}/schedule", async (
+    int id,
+    VehicleScheduleRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var row = await db.Vehicles.FindAsync(id);
+    if (row is null) return Results.NotFound();
+
+    var days = (req.Days ?? [])
+        .Distinct()
+        .OrderBy(x => x)
+        .ToList();
+
+    if (days.Any(x => x < 1 || x > 7))
+        return Results.BadRequest(new { message = "Operating days must be between Monday (1) and Sunday (7)." });
+
+    row.OperatingDays = string.Join(',', days);
+    await db.SaveChangesAsync();
+    await Audit(db, principal, "VEHICLE_SCHEDULE", $"Changed operating days for {row.VehicleId} to {(days.Count == 0 ? "none" : string.Join(',', days))}");
+    return Results.Ok(new { operatingDays = days });
 }).RequireAuthorization(AdminOnly());
 
 app.MapDelete("/api/admin/vehicles/{id:int}", async (
@@ -1499,6 +1858,70 @@ static List<int> ParseIds(string? value) =>
             .Distinct()
             .ToList();
 
+static HashSet<int> ParseOperatingDays(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value))
+        return [];
+
+    return value
+        .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Select(x => int.TryParse(x, out var day) ? day : 0)
+        .Where(x => x is >= 1 and <= 7)
+        .ToHashSet();
+}
+
+static int IsoDayOfWeek(DateOnly date)
+{
+    var day = (int)date.DayOfWeek;
+    return day == 0 ? 7 : day;
+}
+
+static void EnsureCompatibilitySchema(AppDbContext db)
+{
+    // EnsureCreated() creates the complete schema for a new database, but it does not
+    // add newly introduced columns/tables to an existing SQLite database. These small
+    // compatibility migrations preserve all existing PalletControl data.
+    var connection = (SqliteConnection)db.Database.GetDbConnection();
+    var shouldClose = connection.State != ConnectionState.Open;
+    if (shouldClose) connection.Open();
+
+    try
+    {
+        var vehicleColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA table_info('Vehicles');";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+                vehicleColumns.Add(reader.GetString(1));
+        }
+
+        if (!vehicleColumns.Contains("OperatingDays"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"Vehicles\" ADD COLUMN \"OperatingDays\" TEXT NOT NULL DEFAULT '1,2,3,4,5';";
+            cmd.ExecuteNonQuery();
+        }
+
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = """
+CREATE TABLE IF NOT EXISTS "Holidays" (
+    "Id" INTEGER NOT NULL CONSTRAINT "PK_Holidays" PRIMARY KEY AUTOINCREMENT,
+    "Date" TEXT NOT NULL,
+    "Name" TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS "IX_Holidays_Date" ON "Holidays" ("Date");
+""";
+            cmd.ExecuteNonQuery();
+        }
+    }
+    finally
+    {
+        if (shouldClose) connection.Close();
+    }
+}
+
 static string Csv(string value) => $"\"{value.Replace("\"", "\"\"")}\"";
 
 static async Task Audit(
@@ -1548,14 +1971,17 @@ static async Task<ReceiptValidation> ValidateReceiptRequest(
     if (vehicle.TerminalId != terminalId || driver.TerminalId != terminalId)
         return ReceiptValidation.Fail("Vehicle and driver must belong to your terminal.");
 
+    // v5.5.2: an explicitly submitted quantity of 0 is valid. Only an empty Items list is rejected.
+    if (req.Items.Count == 0)
+        return ReceiptValidation.Fail("Enter a pallet quantity. 0 is allowed.");
+
+    if (req.Items.Any(x => x.Quantity < 0))
+        return ReceiptValidation.Fail("Pallet quantity cannot be negative.");
+
     var positiveItems = req.Items
-        .Where(x => x.Quantity > 0)
         .GroupBy(x => x.PalletTypeId)
         .Select(g => new ReceiptItemRequest(g.Key, g.Sum(x => x.Quantity)))
         .ToList();
-
-    if (positiveItems.Count == 0)
-        return ReceiptValidation.Fail("Enter at least one pallet quantity.");
 
     if (positiveItems.Any(x => x.Quantity > 5000))
         return ReceiptValidation.Fail("A pallet quantity is too large.");
@@ -1940,6 +2366,152 @@ static void Seed(AppDbContext db)
     }
 }
 
+// ---------------- DATABASE STORAGE / BACKUP ----------------
+
+public sealed record DatabaseStorageOptions(
+    string DatabasePath,
+    string ConnectionString,
+    string BackupDirectory,
+    int BackupIntervalHours,
+    int BackupRetentionDays);
+
+public sealed record DatabaseBackupInfo(string Path, DateTime CreatedAtUtc, long SizeBytes);
+public sealed record DatabaseBackupStatus(int BackupCount, string? LatestBackupPath, DateTime? LatestBackupUtc);
+
+public sealed class DatabaseBackupManager
+{
+    private readonly DatabaseStorageOptions _options;
+    private readonly ILogger<DatabaseBackupManager> _logger;
+    private readonly SemaphoreSlim _backupLock = new(1, 1);
+
+    public DatabaseBackupManager(
+        DatabaseStorageOptions options,
+        ILogger<DatabaseBackupManager> logger)
+    {
+        _options = options;
+        _logger = logger;
+    }
+
+    public DatabaseBackupStatus GetStatus()
+    {
+        Directory.CreateDirectory(_options.BackupDirectory);
+
+        var backups = new DirectoryInfo(_options.BackupDirectory)
+            .GetFiles("PalletControlBackup_*.db")
+            .OrderByDescending(x => x.LastWriteTimeUtc)
+            .ToList();
+
+        var latest = backups.FirstOrDefault();
+        return new DatabaseBackupStatus(
+            backups.Count,
+            latest?.FullName,
+            latest?.LastWriteTimeUtc);
+    }
+
+    public async Task<DatabaseBackupInfo> CreateBackupAsync(CancellationToken cancellationToken = default)
+    {
+        await _backupLock.WaitAsync(cancellationToken);
+        try
+        {
+            Directory.CreateDirectory(_options.BackupDirectory);
+
+            var stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
+            var backupPath = Path.Combine(_options.BackupDirectory, $"PalletControlBackup_{stamp}.db");
+
+            await using var source = new SqliteConnection(_options.ConnectionString);
+            await source.OpenAsync(cancellationToken);
+
+            var destinationBuilder = new SqliteConnectionStringBuilder
+            {
+                DataSource = backupPath,
+                Mode = SqliteOpenMode.ReadWriteCreate
+            };
+
+            await using var destination = new SqliteConnection(destinationBuilder.ConnectionString);
+            await destination.OpenAsync(cancellationToken);
+
+            // SQLite's native online backup API gives a consistent snapshot even while
+            // the web app is being used.
+            source.BackupDatabase(destination);
+
+            var cutoff = DateTime.UtcNow.AddDays(-_options.BackupRetentionDays);
+            foreach (var oldBackup in new DirectoryInfo(_options.BackupDirectory)
+                         .GetFiles("PalletControlBackup_*.db")
+                         .Where(x => x.LastWriteTimeUtc < cutoff))
+            {
+                try
+                {
+                    oldBackup.Delete();
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Could not delete old database backup {Backup}", oldBackup.FullName);
+                }
+            }
+
+            var file = new FileInfo(backupPath);
+            _logger.LogInformation("SQLite backup created: {BackupPath}", backupPath);
+            return new DatabaseBackupInfo(file.FullName, file.LastWriteTimeUtc, file.Length);
+        }
+        finally
+        {
+            _backupLock.Release();
+        }
+    }
+}
+
+public sealed class DatabaseBackupHostedService : BackgroundService
+{
+    private readonly DatabaseBackupManager _backupManager;
+    private readonly DatabaseStorageOptions _options;
+    private readonly ILogger<DatabaseBackupHostedService> _logger;
+
+    public DatabaseBackupHostedService(
+        DatabaseBackupManager backupManager,
+        DatabaseStorageOptions options,
+        ILogger<DatabaseBackupHostedService> logger)
+    {
+        _backupManager = backupManager;
+        _options = options;
+        _logger = logger;
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                var status = _backupManager.GetStatus();
+                var due = status.LatestBackupUtc is null ||
+                          DateTime.UtcNow - status.LatestBackupUtc.Value >= TimeSpan.FromHours(_options.BackupIntervalHours);
+
+                if (due)
+                    await _backupManager.CreateBackupAsync(stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Automatic SQLite backup failed.");
+            }
+
+            try
+            {
+                // Check hourly whether a backup is due. Actual backup cadence is controlled
+                // by BackupIntervalHours.
+                await Task.Delay(TimeSpan.FromHours(1), stoppingToken);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+        }
+    }
+}
+
 // ---------------- TYPES ----------------
 
 public static class Roles
@@ -1969,6 +2541,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     public DbSet<WarningEvent> WarningEvents => Set<WarningEvent>();
     public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
     public DbSet<AppSettings> Settings => Set<AppSettings>();
+    public DbSet<Holiday> Holidays => Set<Holiday>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -1979,6 +2552,8 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         b.Entity<PalletReceipt>().HasIndex(x => x.ReceiptNumber).IsUnique();
         b.Entity<PalletReceipt>().HasIndex(x => x.IdempotencyKey).IsUnique();
         b.Entity<WarningEvent>().HasIndex(x => new { x.TerminalId, x.AcknowledgedAtUtc, x.CreatedAtUtc });
+        b.Entity<Holiday>().HasIndex(x => x.Date).IsUnique();
+        b.Entity<Vehicle>().Property(x => x.OperatingDays).HasDefaultValue("1,2,3,4,5");
 
         b.Entity<Vehicle>()
             .HasOne(x => x.Transporter)
@@ -2074,9 +2649,17 @@ public class Vehicle
     public string VehicleId { get; set; } = "";
     public bool Active { get; set; } = true;
     public int TerminalId { get; set; }
+    public string OperatingDays { get; set; } = "1,2,3,4,5";
     [JsonIgnore] public Terminal? Terminal { get; set; }
     public int? TransporterId { get; set; }
     [JsonIgnore] public Transporter? Transporter { get; set; }
+}
+
+public class Holiday
+{
+    public int Id { get; set; }
+    public DateOnly Date { get; set; }
+    public string Name { get; set; } = "";
 }
 
 public class Driver
@@ -2215,6 +2798,19 @@ public class AppSettings
     public bool BalanceNotificationsEnabled { get; set; } = true;
 }
 
+public class VehicleComplianceRow
+{
+    public DateOnly Date { get; set; }
+    public int VehicleId { get; set; }
+    public string Vehicle { get; set; } = "";
+    public string Transporter { get; set; } = "";
+    public bool HasIn { get; set; }
+    public bool HasOut { get; set; }
+    public bool Complete { get; set; }
+    public bool IsToday { get; set; }
+    public string Status { get; set; } = "";
+}
+
 public class StatisticsRow
 {
     public string Transporter { get; set; } = "";
@@ -2256,6 +2852,8 @@ public record UserPreferenceRequest(bool ShowMilestoneNotifications, bool ShowLe
 public record AdminTransporterRequest(string Name);
 public record AdminVehicleRequest(string VehicleId, int TerminalId, int TransporterId);
 public record VehicleTransporterRequest(int TransporterId);
+public record VehicleScheduleRequest(List<int>? Days);
+public record AdminHolidayRequest(DateOnly Date, string? Name);
 public record AdminDriverRequest(string Name, int TerminalId);
 public record AdminPalletTypeRequest(string Name, bool UserSelectable);
 public record AdminPalletTypeUpdate(bool Active, bool UserSelectable);

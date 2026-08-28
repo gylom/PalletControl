@@ -1361,3 +1361,167 @@ body {
         font-size: 10px;
     }
 }
+
+/* ===== v5.8.0 MULTI-MODULE NAVIGATION ===== */
+.moduleNav {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(max-content, 1fr));
+    gap: 10px;
+    align-items: stretch;
+    padding: 10px 14px;
+}
+
+.navGroup {
+    min-width: max-content;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 6px;
+    background: #f8fafc;
+}
+
+.navGroupTitle {
+    display: block;
+    padding: 2px 8px 5px;
+    font-size: 10px;
+    line-height: 1;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    color: #64748b;
+}
+
+.navGroupButtons {
+    display: flex;
+    gap: 4px;
+}
+
+.moduleNav .navGroupButtons button {
+    padding: 8px 10px;
+}
+
+.navInternal { border-top: 3px solid #334155; }
+.navLinehaul { border-top: 3px solid #2563eb; }
+.navReceived { border-top: 3px solid #7c3aed; }
+.navUtility { border-top: 3px solid #94a3b8; }
+
+/* ===== MODULE FORMS ===== */
+.moduleFormCard { max-width: 900px; }
+.fullSpan { grid-column: 1 / -1; }
+textarea {
+    font: inherit;
+    min-height: 96px;
+    resize: vertical;
+    border: 1px solid #cbd5df;
+    border-radius: 10px;
+    padding: 12px;
+    background: #fff;
+}
+
+.periodBar,
+.filterRow {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+}
+.periodBar { margin-bottom: 12px; }
+.filterRow input { min-width: 220px; flex: 1; }
+.tableCard { margin-top: 16px; }
+.moduleExport { display: flex; flex-direction: column; gap: 14px; max-width: 850px; }
+
+.checkCard {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 12px;
+    border: 1px solid #dbe3ec;
+    border-radius: 12px;
+    padding: 14px;
+    background: #f8fafc;
+}
+.checkCard input { width: 20px; height: 20px; }
+.checkCard span { display: flex; flex-direction: column; gap: 3px; }
+.checkCard small { color: #64748b; font-weight: 500; }
+
+.rcLegend { display: flex; flex-wrap: wrap; gap: 8px; }
+.rcLegend span { padding: 7px 10px; border-radius: 999px; font-size: 12px; font-weight: 800; border: 1px solid transparent; }
+.legendBlue { background: #dbeafe; color: #1e40af; border-color: #93c5fd !important; }
+.legendRed { background: #fee2e2; color: #991b1b; border-color: #fca5a5 !important; }
+.legendOrange { background: #ffedd5; color: #9a3412; border-color: #fdba74 !important; }
+.legendGreen { background: #dcfce7; color: #166534; border-color: #86efac !important; }
+
+tr.rcBlue > td, .receivedSuccess.rcBlue { background: #dbeafe !important; }
+tr.rcRed > td, .receivedSuccess.rcRed, .warningCard.rcRed { background: #fee2e2 !important; }
+tr.rcOrange > td, .receivedSuccess.rcOrange { background: #ffedd5 !important; }
+tr.rcGreen > td, .receivedSuccess.rcGreen { background: #dcfce7 !important; }
+.colourToggle { flex-direction: row; align-items: center; white-space: nowrap; }
+.colourToggle input { width: 18px; height: 18px; }
+
+/* ===== ADMIN v5.8.0 ===== */
+.adminTerminalPicker {
+    max-width: 360px;
+    margin-bottom: 14px;
+}
+.userCreateCard {
+    border: 1px solid #e2e8f0;
+    border-radius: 14px;
+    padding: 14px;
+    margin-bottom: 16px;
+    background: #f8fafc;
+}
+.moduleChecks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 18px;
+    padding: 10px 0;
+}
+.moduleChecks .miniCheck {
+    flex-direction: row;
+    align-items: center;
+}
+.subAccess {
+    padding: 6px 10px;
+    border-radius: 10px;
+    background: #f1f5f9;
+}
+.userAdminExpanded {
+    grid-template-columns: minmax(150px, 1.2fr) minmax(150px, 1fr) minmax(120px, .8fr) minmax(90px, .55fr) auto;
+    align-items: center;
+}
+.userAdminExpanded .moduleChecks,
+.userAdminExpanded .subAccess,
+.userAdminExpanded .userAdminActions {
+    grid-column: 1 / -1;
+}
+.userIdentity { min-width: 0; overflow-wrap: anywhere; }
+.userIdentity small { display: block; color: #64748b; margin-top: 3px; }
+.userAdminActions { display: flex; gap: 8px; justify-content: flex-end; }
+
+@media (max-width: 1100px) {
+    .moduleNav { display: flex; overflow-x: auto; }
+    .navGroup { flex: 0 0 auto; }
+}
+
+@media (max-width: 720px) {
+    .formGrid, .linehaulForm, .receivedForm { grid-template-columns: 1fr; }
+    .fullSpan { grid-column: 1; }
+    .periodBar, .filterRow { align-items: stretch; }
+    .periodBar > *, .filterRow > * { flex: 1 1 100%; }
+    .userAdminExpanded { grid-template-columns: 1fr; }
+    .userAdminExpanded .moduleChecks,
+    .userAdminExpanded .subAccess,
+    .userAdminExpanded .userAdminActions { grid-column: 1; }
+}
+
+
+/* v5.8.1 historical import */
+.importCard { max-width: 1100px; margin-bottom: 16px; }
+.importCard h2, .importResult h3 { margin-top: 0; }
+.importSchema code { font-weight: 700; white-space: nowrap; }
+.templateButtons { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+.fileInput { display: block; width: 100%; max-width: 620px; margin: 12px 0; padding: 12px; border: 1px dashed var(--border, #cfd5dd); border-radius: 10px; background: var(--card, #fff); }
+.importResult { margin-top: 16px; max-width: 1100px; }
+.importIssues { margin-top: 14px; display: grid; gap: 8px; }
+.importIssue { margin: 0; }
+.compactStats { margin: 0 0 12px; }
+@media (max-width: 800px) { .importSchema { min-width: 760px; } }

@@ -131,15 +131,38 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
                     identity.RemoveClaim(claim);
                 foreach (var claim in identity.FindAll("terminalCode").ToList())
                     identity.RemoveClaim(claim);
+                foreach (var claim in identity.FindAll("moduleInternal").ToList())
+                    identity.RemoveClaim(claim);
+                foreach (var claim in identity.FindAll("moduleLinehaul").ToList())
+                    identity.RemoveClaim(claim);
+                foreach (var claim in identity.FindAll("moduleReceivedControl").ToList())
+                    identity.RemoveClaim(claim);
 
                 identity.AddClaim(new Claim(ClaimTypes.Role, currentUser.Role));
                 identity.AddClaim(new Claim("terminalId", currentUser.TerminalId.ToString(CultureInfo.InvariantCulture)));
                 identity.AddClaim(new Claim("terminalCode", currentUser.Terminal?.Code ?? ""));
+                identity.AddClaim(new Claim("moduleInternal", currentUser.HasInternalPalletAccounting ? "1" : "0"));
+                identity.AddClaim(new Claim("moduleLinehaul", currentUser.HasLinehaul ? "1" : "0"));
+                identity.AddClaim(new Claim("moduleReceivedControl", currentUser.HasReceivedControl ? "1" : "0"));
             }
         };
     });
 
-builder.Services.AddAuthorization();
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("InternalModule", policy => policy.RequireClaim("moduleInternal", "1"));
+    options.AddPolicy("InternalElevated", policy => policy.RequireAssertion(ctx =>
+        ctx.User.FindFirstValue("moduleInternal") == "1" &&
+        (ctx.User.IsInRole(Roles.SuperAdmin) || ctx.User.IsInRole(Roles.TerminalAdmin) || ctx.User.IsInRole(Roles.LegacyAdmin) || ctx.User.IsInRole(Roles.Superuser))));
+    options.AddPolicy("LinehaulModule", policy => policy.RequireClaim("moduleLinehaul", "1"));
+    options.AddPolicy("LinehaulAdmin", policy => policy.RequireAssertion(ctx =>
+        ctx.User.FindFirstValue("moduleLinehaul") == "1" &&
+        (ctx.User.IsInRole(Roles.SuperAdmin) || ctx.User.IsInRole(Roles.TerminalAdmin) || ctx.User.IsInRole(Roles.LegacyAdmin))));
+    options.AddPolicy("ReceivedControlModule", policy => policy.RequireClaim("moduleReceivedControl", "1"));
+    options.AddPolicy("ReceivedControlAdmin", policy => policy.RequireAssertion(ctx =>
+        ctx.User.FindFirstValue("moduleReceivedControl") == "1" &&
+        (ctx.User.IsInRole(Roles.SuperAdmin) || ctx.User.IsInRole(Roles.TerminalAdmin) || ctx.User.IsInRole(Roles.LegacyAdmin))));
+});
 
 var app = builder.Build();
 app.UseCors("ui");
@@ -158,7 +181,7 @@ app.MapGet("/", () => Results.Ok(new
 {
     name = "Pallet Control API",
     status = "running",
-    version = "5.7.3"
+    version = "5.8.5"
 }));
 
 // Public health endpoint. This performs a real SQLite connection, real table read,
@@ -263,7 +286,10 @@ app.MapPost("/api/auth/login", async (LoginRequest req, AppDbContext db) =>
         new(ClaimTypes.Name, user.Username),
         new(ClaimTypes.Role, user.Role),
         new("terminalId", user.TerminalId.ToString()),
-        new("terminalCode", user.Terminal?.Code ?? "")
+        new("terminalCode", user.Terminal?.Code ?? ""),
+        new("moduleInternal", user.HasInternalPalletAccounting ? "1" : "0"),
+        new("moduleLinehaul", user.HasLinehaul ? "1" : "0"),
+        new("moduleReceivedControl", user.HasReceivedControl ? "1" : "0")
     };
 
     var creds = new SigningCredentials(
@@ -285,7 +311,10 @@ app.MapPost("/api/auth/login", async (LoginRequest req, AppDbContext db) =>
         user.TerminalId,
         user.Terminal?.Code ?? "",
         user.ShowDriverStatisticsTab,
-        user.ShowDailyCheckTab));
+        user.ShowDailyCheckTab,
+        user.HasInternalPalletAccounting,
+        user.HasLinehaul,
+        user.HasReceivedControl));
 });
 
 app.MapGet("/api/me", async (ClaimsPrincipal principal, AppDbContext db) =>
@@ -301,7 +330,10 @@ app.MapGet("/api/me", async (ClaimsPrincipal principal, AppDbContext db) =>
         user.TerminalId,
         terminalCode = user.Terminal?.Code ?? "",
         user.ShowDriverStatisticsTab,
-        user.ShowDailyCheckTab
+        user.ShowDailyCheckTab,
+        user.HasInternalPalletAccounting,
+        user.HasLinehaul,
+        user.HasReceivedControl
     });
 }).RequireAuthorization();
 
@@ -309,7 +341,7 @@ app.MapGet("/api/me/settings", async (ClaimsPrincipal principal, AppDbContext db
 {
     var user = await db.Users.FindAsync(UserId(principal));
     if (user is null) return Results.NotFound();
-    var settings = await db.Settings.AsNoTracking().SingleAsync();
+    var settings = await GetTerminalSettings(db, user.TerminalId);
 
     return Results.Ok(new
     {
@@ -333,7 +365,7 @@ app.MapPut("/api/me/settings", async (
     user.ShowBalanceNotifications = req.ShowBalanceNotifications;
     await db.SaveChangesAsync();
 
-    var settings = await db.Settings.AsNoTracking().SingleAsync();
+    var settings = await GetTerminalSettings(db, user.TerminalId);
     return Results.Ok(new
     {
         user.ShowMilestoneNotifications,
@@ -375,7 +407,7 @@ app.MapGet("/api/setup/register", async (ClaimsPrincipal principal, AppDbContext
         .Select(x => new { x.Id, x.Name })
         .ToListAsync();
 
-    var settings = await db.Settings.AsNoTracking().SingleAsync();
+    var settings = await GetTerminalSettings(db, terminalId);
 
     return Results.Ok(new
     {
@@ -384,7 +416,7 @@ app.MapGet("/api/setup/register", async (ClaimsPrincipal principal, AppDbContext
         palletTypes,
         settings.AllowUsersAddDrivers
     });
-}).RequireAuthorization();
+}).RequireAuthorization("InternalModule");
 
 app.MapGet("/api/drivers/for-vehicle/{vehicleId:int}", async (
     int vehicleId,
@@ -421,22 +453,24 @@ app.MapGet("/api/drivers/for-vehicle/{vehicleId:int}", async (
         .ToList();
 
     return Results.Ok(sorted);
-}).RequireAuthorization();
+}).RequireAuthorization("InternalModule");
 
 app.MapPost("/api/drivers/quick-add", async (
     QuickDriverRequest req,
     ClaimsPrincipal principal,
     AppDbContext db) =>
 {
-    var settings = await db.Settings.SingleAsync();
+    var terminalId = TerminalId(principal);
+    var settings = await GetTerminalSettings(db, terminalId);
     if (!settings.AllowUsersAddDrivers)
         return Results.Forbid();
 
+    // Quick-add is always scoped to the terminal assigned to the logged-in user.
+    // The client is intentionally not allowed to choose another terminal here.
     var name = req.Name.Trim();
     if (string.IsNullOrWhiteSpace(name))
         return Results.BadRequest(new { message = "Driver name is required." });
 
-    var terminalId = TerminalId(principal);
     var existing = await db.Drivers.FirstOrDefaultAsync(x =>
         x.TerminalId == terminalId && x.Name.ToLower() == name.ToLower());
 
@@ -455,7 +489,7 @@ app.MapPost("/api/drivers/quick-add", async (
     await db.SaveChangesAsync();
     await Audit(db, principal, "DRIVER_QUICK_ADD", $"Added driver {driver.Name}");
     return Results.Ok(new { driver.Id, driver.Name });
-}).RequireAuthorization();
+}).RequireAuthorization("InternalModule");
 
 app.MapPost("/api/receipts/check", async (
     CreateReceiptRequest req,
@@ -474,7 +508,7 @@ app.MapPost("/api/receipts/check", async (
         db);
 
     return Results.Ok(new { warnings });
-}).RequireAuthorization();
+}).RequireAuthorization("InternalModule");
 
 app.MapPost("/api/receipts", async (
     CreateReceiptRequest req,
@@ -604,7 +638,7 @@ app.MapPost("/api/receipts", async (
         warnings,
         notifications = submitNotifications
     });
-}).RequireAuthorization();
+}).RequireAuthorization("InternalModule");
 
 app.MapGet("/api/receipts", async (
     DateOnly? date,
@@ -711,7 +745,7 @@ app.MapGet("/api/receipts", async (
         limit = effectiveLimit == 0 ? "all" : effectiveLimit.ToString(CultureInfo.InvariantCulture),
         receipts = receipts.Select(ToReceiptDto).ToList()
     });
-}).RequireAuthorization();
+}).RequireAuthorization("InternalModule");
 
 app.MapPost("/api/receipts/{id:int}/cancel", async (
     int id,
@@ -750,7 +784,7 @@ app.MapPost("/api/receipts/{id:int}/cancel", async (
 
     await db.SaveChangesAsync();
 
-    var settings = await db.Settings.AsNoTracking().SingleAsync();
+    var settings = await GetTerminalSettings(db, receipt.TerminalId);
     if (settings.CancellationWarningEnabled)
     {
         db.WarningEvents.Add(new WarningEvent
@@ -772,7 +806,7 @@ app.MapPost("/api/receipts/{id:int}/cancel", async (
         await db.Entry(action).Reference(x => x.User).LoadAsync();
 
     return Results.Ok(ToReceiptDto(receipt));
-}).RequireAuthorization(AdminOrSuperuser());
+}).RequireAuthorization("InternalElevated");
 
 app.MapPost("/api/receipts/{id:int}/reverse-cancellation", async (
     int id,
@@ -810,7 +844,7 @@ app.MapPost("/api/receipts/{id:int}/reverse-cancellation", async (
 
     await db.SaveChangesAsync();
 
-    var settings = await db.Settings.AsNoTracking().SingleAsync();
+    var settings = await GetTerminalSettings(db, receipt.TerminalId);
     if (settings.CancellationReversedWarningEnabled)
     {
         db.WarningEvents.Add(new WarningEvent
@@ -832,7 +866,7 @@ app.MapPost("/api/receipts/{id:int}/reverse-cancellation", async (
         await db.Entry(action).Reference(x => x.User).LoadAsync();
 
     return Results.Ok(ToReceiptDto(receipt));
-}).RequireAuthorization(AdminOrSuperuser());
+}).RequireAuthorization("InternalElevated");
 
 app.MapGet("/api/statistics/options", async (ClaimsPrincipal principal, AppDbContext db) =>
 {
@@ -889,7 +923,7 @@ app.MapGet("/api/statistics/options", async (ClaimsPrincipal principal, AppDbCon
         .ToListAsync();
 
     return Results.Ok(new { transporters, vehicles, drivers, palletTypes });
-}).RequireAuthorization();
+}).RequireAuthorization("InternalModule");
 
 app.MapGet("/api/statistics", async (
     DateOnly? from,
@@ -1013,7 +1047,7 @@ app.MapGet("/api/statistics", async (
         totalsByPalletType,
         rows = sorted.ToList()
     });
-}).RequireAuthorization();
+}).RequireAuthorization("InternalModule");
 
 app.MapGet("/api/statistics/drivers", async (
     DateOnly? from,
@@ -1040,7 +1074,7 @@ app.MapGet("/api/statistics/drivers", async (
     var selectedTransporterIds = ParseIds(transporterIds);
     var selectedVehicleIds = ParseIds(vehicleIds);
     var selectedDriverIds = ParseIds(driverIds);
-    var settings = await db.Settings.AsNoTracking().SingleAsync();
+    var settings = await GetTerminalSettings(db, terminalId);
     var deductionPerUnmatchedIn = Math.Max(0, settings.DriverUnmatchedInDeduction);
 
     var receiptQuery = db.Receipts
@@ -1185,7 +1219,7 @@ app.MapGet("/api/statistics/drivers", async (
         rows = sortedRows,
         adjustmentDetails
     });
-}).RequireAuthorization();
+}).RequireAuthorization("InternalModule");
 
 app.MapGet("/api/compliance", async (
     DateOnly? from,
@@ -1353,7 +1387,7 @@ app.MapGet("/api/compliance", async (
         rows = sortedRows,
         holidays = holidays.Select(x => new { x.Id, x.Date, x.Name }).ToList()
     });
-}).RequireAuthorization();
+}).RequireAuthorization("InternalModule");
 
 app.MapGet("/api/statistics/best-drivers", async (
     string? period,
@@ -1383,7 +1417,7 @@ app.MapGet("/api/statistics/best-drivers", async (
         palletTypeId,
         drivers = leaderboard.Take(50).ToList()
     });
-}).RequireAuthorization();
+}).RequireAuthorization("InternalModule");
 
 app.MapGet("/api/warnings", async (
     bool? unacknowledgedOnly,
@@ -1452,7 +1486,7 @@ app.MapGet("/api/warnings", async (
         .Where(x => x.AcknowledgedAtUtc == null && x.TerminalId == terminalId);
 
     return Results.Ok(new { openCount = await openCountQuery.CountAsync(), warnings = rows });
-}).RequireAuthorization(AdminOrSuperuser());
+}).RequireAuthorization("InternalElevated");
 
 app.MapPost("/api/warnings/{id:int}/acknowledge", async (
     int id,
@@ -1474,7 +1508,7 @@ app.MapPost("/api/warnings/{id:int}/acknowledge", async (
     }
 
     return Results.Ok();
-}).RequireAuthorization(AdminOrSuperuser());
+}).RequireAuthorization("InternalElevated");
 
 app.MapGet("/api/export", async (
     DateOnly from,
@@ -1564,7 +1598,7 @@ app.MapGet("/api/export", async (
         ? new Dictionary<int, string>()
         : await db.Users.AsNoTracking().Where(x => cancellationUserIds.Contains(x.Id)).ToDictionaryAsync(x => x.Id, x => x.Username);
 
-    var settings = await db.Settings.AsNoTracking().SingleAsync();
+    var settings = await GetTerminalSettings(db, terminalId);
     var deductionPerUnmatchedIn = Math.Max(0, settings.DriverUnmatchedInDeduction);
 
     var detailTable = new ExportTable(
@@ -1865,7 +1899,1019 @@ app.MapGet("/api/export", async (
     await Audit(db, principal, "EXPORT", $"Exported {exportType}/{exportFormat} for terminal {terminalCode} from {from:yyyy-MM-dd} to {to:yyyy-MM-dd}");
     var safeType = exportType == "complete" ? "CompleteReport" : selectedTable.Name.Replace(" ", "");
     return Results.File(bytes, contentType, $"PalletControl_{terminalCode}_{safeType}_{from:yyyy-MM-dd}_{to:yyyy-MM-dd}.{extension}");
-}).RequireAuthorization(AdminOrSuperuser());
+}).RequireAuthorization("InternalElevated");
+
+
+// ---------------- LINEHAUL PALLET ACCOUNTING ----------------
+
+app.MapGet("/api/linehaul/setup", async (ClaimsPrincipal principal, AppDbContext db) =>
+{
+    var terminalId = TerminalId(principal);
+    var terminals = await db.Terminals.AsNoTracking()
+        .Where(x => x.Active)
+        .OrderBy(x => x.Code)
+        .Select(x => new { x.Id, x.Code, x.Name })
+        .ToListAsync();
+    var comments = await db.LinehaulCommentOptions.AsNoTracking()
+        .Where(x => x.TerminalId == terminalId && x.Active)
+        .OrderBy(x => x.Text)
+        .Select(x => new { x.Id, x.Text })
+        .ToListAsync();
+    return Results.Ok(new { terminalId, terminalCode = principal.FindFirstValue("terminalCode") ?? "", terminals, comments });
+}).RequireAuthorization("LinehaulModule");
+
+app.MapPost("/api/linehaul/receipts", async (
+    CreateLinehaulReceiptRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var currentTerminalId = TerminalId(principal);
+    var reference = (req.UnitReference ?? "").Trim();
+    var palletReceiptNumber = (req.PalletReceiptNumber ?? "").Trim();
+    // Container/trailer reference is optional. This supports historical/manual movements
+    // where the pallet receipt is known but no unit number was recorded.
+    if (reference.Length > 120)
+        return Results.BadRequest(new { message = "Container/trailer text is too long." });
+    if (string.IsNullOrWhiteSpace(palletReceiptNumber))
+        return Results.BadRequest(new { message = "Pallet receipt number is required." });
+    if (palletReceiptNumber.Length > 120)
+        return Results.BadRequest(new { message = "Pallet receipt number is too long." });
+
+    var normalizedPalletReceiptNumber = palletReceiptNumber.ToUpperInvariant();
+    if (await db.LinehaulReceipts.AsNoTracking().AnyAsync(x =>
+            x.PalletReceiptNumber != "" && x.PalletReceiptNumber.ToUpper() == normalizedPalletReceiptNumber))
+        return Results.Conflict(new { message = $"Pallet receipt number {palletReceiptNumber} already exists in Linehaul." });
+    if (req.PalletCount < 0 || req.PalletCount > 10000)
+        return Results.BadRequest(new { message = "Pallet count must be between 0 and 10000." });
+    if (req.FromTerminalId == req.ToTerminalId)
+        return Results.BadRequest(new { message = "From terminal and To terminal must be different." });
+
+    var terminals = await db.Terminals.AsNoTracking()
+        .Where(x => x.Active && (x.Id == req.FromTerminalId || x.Id == req.ToTerminalId))
+        .ToListAsync();
+    var fromTerminal = terminals.FirstOrDefault(x => x.Id == req.FromTerminalId);
+    var toTerminal = terminals.FirstOrDefault(x => x.Id == req.ToTerminalId);
+    if (fromTerminal is null || toTerminal is null)
+        return Results.BadRequest(new { message = "From or To terminal was not found/active." });
+
+    // Operational Linehaul registration is always tied to the user's assigned terminal,
+    // including SuperAdmin. Admin rights must not bypass terminal ownership of operational data.
+    if (req.FromTerminalId != currentTerminalId && req.ToTerminalId != currentTerminalId)
+        return Results.BadRequest(new { message = "One side of the Linehaul movement must be your assigned terminal." });
+
+    string optionText = "";
+    if (req.CommentOptionId.HasValue)
+    {
+        var option = await db.LinehaulCommentOptions.AsNoTracking()
+            .FirstOrDefaultAsync(x => x.Id == req.CommentOptionId.Value && x.TerminalId == currentTerminalId && x.Active);
+        if (option is null)
+            return Results.BadRequest(new { message = "Selected standard comment is not available for your terminal." });
+        optionText = option.Text;
+    }
+
+    var businessDate = req.BusinessDate ?? DateOnly.FromDateTime(DateTime.Today);
+    var now = DateTime.UtcNow;
+    var terminalCode = principal.FindFirstValue("terminalCode") ?? "TERM";
+    var row = new LinehaulReceipt
+    {
+        ReceiptNumber = $"LH-{terminalCode}-{now:yyyyMMdd}-{Guid.NewGuid().ToString("N")[..6].ToUpperInvariant()}",
+        OwnerTerminalId = currentTerminalId,
+        FromTerminalId = fromTerminal.Id,
+        ToTerminalId = toTerminal.Id,
+        FromTerminalSnapshot = fromTerminal.Code,
+        ToTerminalSnapshot = toTerminal.Code,
+        UnitReference = reference,
+        PalletReceiptNumber = palletReceiptNumber,
+        PalletCount = req.PalletCount,
+        CommentOptionSnapshot = optionText,
+        FreeComment = (req.FreeComment ?? "").Trim(),
+        BusinessDate = businessDate,
+        SubmittedAtUtc = now,
+        SubmittedByUserId = UserId(principal),
+        Status = ReceiptStatus.Active
+    };
+    db.LinehaulReceipts.Add(row);
+    await db.SaveChangesAsync();
+    await Audit(db, principal, "LINEHAUL_CREATE", $"{row.ReceiptNumber}: {row.FromTerminalSnapshot}->{row.ToTerminalSnapshot}, {row.PalletCount} pallets, {row.UnitReference}, pallet receipt {row.PalletReceiptNumber}");
+    return Results.Ok(ToLinehaulDto(row));
+}).RequireAuthorization("LinehaulModule");
+
+app.MapGet("/api/linehaul/receipts", async (
+    DateOnly? from,
+    DateOnly? to,
+    int? fromTerminalId,
+    int? toTerminalId,
+    string? direction,
+    string? status,
+    string? search,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var terminalId = TerminalId(principal);
+    var start = from ?? new DateOnly(DateTime.Today.Year, DateTime.Today.Month, 1);
+    var end = to ?? DateOnly.FromDateTime(DateTime.Today);
+    if (end < start) return Results.BadRequest(new { message = "To date cannot be before From date." });
+
+    var q = db.LinehaulReceipts.AsNoTracking()
+        .Where(x => (x.FromTerminalId == terminalId || x.ToTerminalId == terminalId || x.OwnerTerminalId == terminalId) && x.BusinessDate >= start && x.BusinessDate <= end);
+    if (fromTerminalId.HasValue) q = q.Where(x => x.FromTerminalId == fromTerminalId.Value);
+    if (toTerminalId.HasValue) q = q.Where(x => x.ToTerminalId == toTerminalId.Value);
+    var recordStatus = (status ?? "all").Trim().ToLowerInvariant();
+    if (recordStatus == "active") q = q.Where(x => x.Status == ReceiptStatus.Active);
+    if (recordStatus == "cancelled") q = q.Where(x => x.Status == ReceiptStatus.Cancelled);
+    var dir = (direction ?? "all").Trim().ToLowerInvariant();
+    if (dir == "sent") q = q.Where(x => x.FromTerminalId == terminalId);
+    if (dir == "received") q = q.Where(x => x.ToTerminalId == terminalId);
+    var term = search?.Trim();
+    if (!string.IsNullOrWhiteSpace(term))
+        q = q.Where(x => x.UnitReference.Contains(term) || x.PalletReceiptNumber.Contains(term) || x.FreeComment.Contains(term) || x.CommentOptionSnapshot.Contains(term) || x.ReceiptNumber.Contains(term));
+
+    var rows = await q.OrderByDescending(x => x.BusinessDate).ThenByDescending(x => x.SubmittedAtUtc).Take(5000).ToListAsync();
+    var userIds = rows.Select(x => x.SubmittedByUserId)
+        .Concat(rows.Where(x => x.CancelledByUserId.HasValue).Select(x => x.CancelledByUserId!.Value))
+        .Distinct().ToList();
+    var users = await db.Users.AsNoTracking().Where(x => userIds.Contains(x.Id)).ToDictionaryAsync(x => x.Id, x => x.DisplayName);
+    var terminalCodes = await db.Terminals.AsNoTracking().ToDictionaryAsync(x => x.Id, x => x.Code);
+    var adminCanManageOwn = IsTerminalAdmin(principal) || Role(principal) == Roles.LegacyAdmin;
+    return Results.Ok(new
+    {
+        from = start,
+        to = end,
+        terminalId,
+        rows = rows.Select(x => new
+        {
+            x.Id, x.ReceiptNumber, x.BusinessDate, x.SubmittedAtUtc, x.UnitReference, x.PalletReceiptNumber, x.PalletCount,
+            x.OwnerTerminalId, x.FromTerminalId, x.ToTerminalId,
+            fromTerminal = terminalCodes.GetValueOrDefault(x.FromTerminalId, x.FromTerminalSnapshot),
+            toTerminal = terminalCodes.GetValueOrDefault(x.ToTerminalId, x.ToTerminalSnapshot),
+            standardComment = x.CommentOptionSnapshot, x.FreeComment, x.Status, x.CancelledAtUtc, x.CancelReason,
+            cancelledBy = x.CancelledByUserId.HasValue ? users.GetValueOrDefault(x.CancelledByUserId.Value, "Unknown") : null,
+            submittedBy = users.GetValueOrDefault(x.SubmittedByUserId, "Unknown"),
+            canManage = IsSuperAdmin(principal) || (adminCanManageOwn && x.OwnerTerminalId == terminalId)
+        })
+    });
+}).RequireAuthorization("LinehaulModule");
+
+app.MapPost("/api/linehaul/receipts/{id:int}/cancel", async (
+    int id,
+    CancelRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var row = await db.LinehaulReceipts.FirstOrDefaultAsync(x => x.Id == id);
+    if (row is null) return Results.NotFound();
+    var terminalId = TerminalId(principal);
+    if (!IsSuperAdmin(principal) && (!IsTerminalAdmin(principal) || row.OwnerTerminalId != terminalId))
+        return Results.Forbid();
+    if (row.Status == ReceiptStatus.Cancelled)
+        return Results.BadRequest(new { message = "Linehaul receipt is already cancelled." });
+
+    var reason = string.IsNullOrWhiteSpace(req.Reason) ? "Cancelled by administrator" : req.Reason.Trim();
+    row.Status = ReceiptStatus.Cancelled;
+    row.CancelledAtUtc = DateTime.UtcNow;
+    row.CancelledByUserId = UserId(principal);
+    row.CancelReason = reason;
+    await db.SaveChangesAsync();
+    await Audit(db, principal, "LINEHAUL_CANCEL", $"Cancelled {row.ReceiptNumber}: {reason}");
+    return Results.Ok(new { row.Id, row.Status, row.CancelledAtUtc, row.CancelReason });
+}).RequireAuthorization("LinehaulAdmin");
+
+app.MapDelete("/api/linehaul/receipts/{id:int}", async (
+    int id,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var row = await db.LinehaulReceipts.FirstOrDefaultAsync(x => x.Id == id);
+    if (row is null) return Results.NotFound();
+    var terminalId = TerminalId(principal);
+    if (!IsSuperAdmin(principal) && (!IsTerminalAdmin(principal) || row.OwnerTerminalId != terminalId))
+        return Results.Forbid();
+
+    var receiptNumber = row.ReceiptNumber;
+    var palletReceiptNumber = row.PalletReceiptNumber;
+    db.LinehaulReceipts.Remove(row);
+    await db.SaveChangesAsync();
+    await Audit(db, principal, "LINEHAUL_DELETE_PERMANENT", $"Permanently deleted {receiptNumber}; pallet receipt {palletReceiptNumber}");
+    return Results.Ok();
+}).RequireAuthorization("LinehaulAdmin");
+
+app.MapGet("/api/linehaul/statistics", async (
+    DateOnly? from,
+    DateOnly? to,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var terminalId = TerminalId(principal);
+    var start = from ?? new DateOnly(DateTime.Today.Year, DateTime.Today.Month, 1);
+    var end = to ?? DateOnly.FromDateTime(DateTime.Today);
+    if (end < start) return Results.BadRequest(new { message = "To date cannot be before From date." });
+
+    var receipts = await db.LinehaulReceipts.AsNoTracking()
+        .Where(x => x.Status == ReceiptStatus.Active &&
+                    (x.FromTerminalId == terminalId || x.ToTerminalId == terminalId) &&
+                    x.BusinessDate >= start && x.BusinessDate <= end)
+        .ToListAsync();
+    var terminals = await db.Terminals.AsNoTracking().ToDictionaryAsync(x => x.Id, x => x.Code);
+    var counterpartIds = receipts.Select(x => x.FromTerminalId == terminalId ? x.ToTerminalId : x.FromTerminalId).Distinct().ToList();
+    var rows = counterpartIds.Select(otherId =>
+    {
+        var sentRows = receipts.Where(x => x.FromTerminalId == terminalId && x.ToTerminalId == otherId).ToList();
+        var receivedRows = receipts.Where(x => x.ToTerminalId == terminalId && x.FromTerminalId == otherId).ToList();
+        var sent = sentRows.Sum(x => x.PalletCount);
+        var received = receivedRows.Sum(x => x.PalletCount);
+        return new
+        {
+            terminalId = otherId,
+            terminal = terminals.GetValueOrDefault(otherId, $"#{otherId}"),
+            sentLoads = sentRows.Count,
+            receivedLoads = receivedRows.Count,
+            sentPallets = sent,
+            receivedPallets = received,
+            balance = sent - received
+        };
+    }).OrderByDescending(x => Math.Abs(x.balance)).ThenBy(x => x.terminal).ToList();
+
+    return Results.Ok(new
+    {
+        from = start, to = end,
+        terminalId,
+        terminalCode = terminals.GetValueOrDefault(terminalId, ""),
+        totalSentLoads = receipts.Count(x => x.FromTerminalId == terminalId),
+        totalReceivedLoads = receipts.Count(x => x.ToTerminalId == terminalId),
+        totalSentPallets = receipts.Where(x => x.FromTerminalId == terminalId).Sum(x => x.PalletCount),
+        totalReceivedPallets = receipts.Where(x => x.ToTerminalId == terminalId).Sum(x => x.PalletCount),
+        globalBalance = receipts.Where(x => x.FromTerminalId == terminalId).Sum(x => x.PalletCount) - receipts.Where(x => x.ToTerminalId == terminalId).Sum(x => x.PalletCount),
+        rows
+    });
+}).RequireAuthorization("LinehaulModule");
+
+app.MapGet("/api/linehaul/export", async (
+    DateOnly from,
+    DateOnly to,
+    string? type,
+    string? format,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    if (to < from) return Results.BadRequest(new { message = "To date cannot be before From date." });
+    var terminalId = TerminalId(principal);
+    var terminalCode = principal.FindFirstValue("terminalCode") ?? "TERM";
+    var receipts = await db.LinehaulReceipts.AsNoTracking()
+        .Where(x => (x.FromTerminalId == terminalId || x.ToTerminalId == terminalId || x.OwnerTerminalId == terminalId) && x.BusinessDate >= from && x.BusinessDate <= to)
+        .OrderBy(x => x.BusinessDate).ThenBy(x => x.SubmittedAtUtc).ToListAsync();
+    var activeReceipts = receipts.Where(x => x.Status == ReceiptStatus.Active && (x.FromTerminalId == terminalId || x.ToTerminalId == terminalId)).ToList();
+    var terminalCodes = await db.Terminals.AsNoTracking().ToDictionaryAsync(x => x.Id, x => x.Code);
+
+    var details = new ExportTable("Linehaul receipts",
+        ["Receipt ID", "Date", "Container/Trailer", "Pallet Receipt Number", "From", "To", "Pallets", "Standard comment", "Free comment", "Status", "Cancelled UTC", "Cancel reason", "Submitted UTC"], []);
+    foreach (var x in receipts)
+        details.Rows.Add([x.ReceiptNumber, x.BusinessDate, x.UnitReference, x.PalletReceiptNumber,
+            terminalCodes.GetValueOrDefault(x.FromTerminalId, x.FromTerminalSnapshot), terminalCodes.GetValueOrDefault(x.ToTerminalId, x.ToTerminalSnapshot),
+            x.PalletCount, x.CommentOptionSnapshot, x.FreeComment, x.Status, x.CancelledAtUtc, x.CancelReason, x.SubmittedAtUtc]);
+    var summary = new ExportTable("Linehaul summary",
+        ["Other terminal", "Sent loads", "Received loads", "Sent pallets", "Received pallets", "Balance"], []);
+    var counterpartIds = activeReceipts.Select(x => x.FromTerminalId == terminalId ? x.ToTerminalId : x.FromTerminalId).Distinct().OrderBy(x => terminalCodes.GetValueOrDefault(x, "")).ToList();
+    foreach (var otherId in counterpartIds)
+    {
+        var sentRows = activeReceipts.Where(x => x.FromTerminalId == terminalId && x.ToTerminalId == otherId).ToList();
+        var receivedRows = activeReceipts.Where(x => x.ToTerminalId == terminalId && x.FromTerminalId == otherId).ToList();
+        var sent = sentRows.Sum(x => x.PalletCount); var received = receivedRows.Sum(x => x.PalletCount);
+        summary.Rows.Add([terminalCodes.GetValueOrDefault(otherId, $"#{otherId}"), sentRows.Count, receivedRows.Count, sent, received, sent - received]);
+    }
+
+    var exportType = (type ?? "receipts").Trim().ToLowerInvariant();
+    var exportFormat = (format ?? "xlsx").Trim().ToLowerInvariant();
+    var selected = exportType == "summary" ? summary : details;
+    byte[] bytes; string contentType; string extension;
+    if (exportFormat == "csv")
+    {
+        bytes = Encoding.UTF8.GetPreamble().Concat(Encoding.UTF8.GetBytes(ExportCsv(selected))).ToArray();
+        contentType = "text/csv; charset=utf-8"; extension = "csv";
+    }
+    else
+    {
+        bytes = ExportWorkbook(exportType == "complete" ? [details, summary] : [selected]);
+        contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"; extension = "xlsx";
+    }
+    await Audit(db, principal, "LINEHAUL_EXPORT", $"Exported {exportType}/{exportFormat} {from:yyyy-MM-dd}-{to:yyyy-MM-dd}");
+    return Results.File(bytes, contentType, $"Linehaul_{terminalCode}_{exportType}_{from:yyyy-MM-dd}_{to:yyyy-MM-dd}.{extension}");
+}).RequireAuthorization("LinehaulModule");
+
+app.MapGet("/api/linehaul/import-template", (string? format) =>
+{
+    var exportFormat = (format ?? "xlsx").Trim().ToLowerInvariant();
+    var headers = new List<string>
+    {
+        "Date", "ContainerTrailer", "PalletReceiptNumber", "Pallets", "FromTerminal", "ToTerminal", "StandardComment", "Comment"
+    };
+
+    if (exportFormat == "csv")
+    {
+        var csv = string.Join(",", headers.Select(Csv)) + Environment.NewLine;
+        var bytes = Encoding.UTF8.GetPreamble().Concat(Encoding.UTF8.GetBytes(csv)).ToArray();
+        return Results.File(bytes, "text/csv; charset=utf-8", "Linehaul_Import_Template.csv");
+    }
+
+    var data = new ExportTable("Linehaul Import", headers, []);
+    var instructions = new ExportTable("Instructions", ["Column", "Required", "Description", "Example"], [
+        ["Date", "Yes", "Business date. Recommended format YYYY-MM-DD.", "2026-08-28"],
+        ["ContainerTrailer", "No", "Optional container/trailer number or other reference text.", "TTR12345"],
+        ["PalletReceiptNumber", "New data: Yes / legacy import: optional", "Pallekvitteringsnummer. Blank is accepted only to make old historical data importable.", "PK-123456"],
+        ["Pallets", "Yes", "Whole number of pallets, 0-10000.", "33"],
+        ["FromTerminal", "At least From or To", "Existing terminal Code, Name or Alias. If blank/missing, your current terminal is inferred.", "SRD / SRD123 / Sandefjord"],
+        ["ToTerminal", "At least From or To", "Existing terminal Code, Name or Alias. If blank/missing, your current terminal is inferred.", "ARE"],
+        ["StandardComment", "No", "Historical selectable comment text. Does not need to exist as a current option.", "Loaded by night shift"],
+        ["Comment", "No", "Free-text comment.", "Old Excel import"]
+    ]);
+    return Results.File(ExportWorkbook([data, instructions]),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "Linehaul_Import_Template.xlsx");
+}).RequireAuthorization("LinehaulAdmin");
+
+app.MapPost("/api/linehaul/import", async (
+    HttpRequest request,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    if (!request.HasFormContentType)
+        return Results.BadRequest(new { message = "Upload an .xlsx or .csv file using multipart/form-data." });
+
+    var form = await request.ReadFormAsync();
+    var file = form.Files.GetFile("file") ?? form.Files.FirstOrDefault();
+    if (file is null || file.Length == 0)
+        return Results.BadRequest(new { message = "Choose a non-empty .xlsx or .csv file." });
+    var confirmImport = bool.TryParse(form["confirm"].FirstOrDefault(), out var parsedConfirm) && parsedConfirm;
+
+    ImportGrid grid;
+    try { grid = await ReadImportGrid(file); }
+    catch (Exception ex) { return Results.BadRequest(new { message = $"Could not read import file: {ex.Message}" }); }
+
+    var missingHeaders = new List<string>();
+    if (!HasImportHeader(grid, "Date", "Dato")) missingHeaders.Add("Date");
+    if (!HasImportHeader(grid, "Pallets", "PalletCount", "Paller", "AntallPaller")) missingHeaders.Add("Pallets");
+    var hasFromTerminalHeader = HasImportHeader(grid, "FromTerminal", "FraTerminal", "From", "Fra");
+    var hasToTerminalHeader = HasImportHeader(grid, "ToTerminal", "TilTerminal", "To", "Til");
+    if (!hasFromTerminalHeader && !hasToTerminalHeader) missingHeaders.Add("FromTerminal or ToTerminal");
+    if (missingHeaders.Count > 0)
+        return Results.BadRequest(new { message = $"Missing required column(s): {string.Join(", ", missingHeaders)}." });
+
+    var terminalId = TerminalId(principal);
+    var userId = UserId(principal);
+    var terminalRows = await db.Terminals.AsNoTracking().ToListAsync();
+    var terminalLookup = BuildTerminalLookup(terminalRows);
+    var ownerTerminal = terminalRows.FirstOrDefault(x => x.Id == terminalId);
+    if (ownerTerminal is null) return Results.BadRequest(new { message = "Your assigned terminal no longer exists." });
+
+    var issues = new List<ImportIssue>();
+    var warnings = new List<ImportIssue>();
+    var pending = new List<PendingLinehaulImport>();
+    var fileKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var sourceRow in grid.Rows)
+    {
+        var dateText = ImportValue(sourceRow, "Date", "Dato");
+        var reference = ImportValue(sourceRow, "ContainerTrailer", "ContainerTrailerNo", "UnitReference", "Container", "Trailer", "Tralle").Trim();
+        var palletReceiptNumber = ImportValue(sourceRow, "PalletReceiptNumber", "Pallekvitteringsnummer", "PallekvitteringNr", "PalletReceiptNr", "Kvitteringsnummer").Trim();
+        var palletsText = ImportValue(sourceRow, "Pallets", "PalletCount", "Paller", "AntallPaller");
+        var fromCode = ImportValue(sourceRow, "FromTerminal", "FraTerminal", "From", "Fra").Trim();
+        var toCode = ImportValue(sourceRow, "ToTerminal", "TilTerminal", "To", "Til").Trim();
+        var standardComment = ImportValue(sourceRow, "StandardComment", "SelectableComment", "StandardKommentar").Trim();
+        var freeComment = ImportValue(sourceRow, "Comment", "FreeComment", "Kommentar").Trim();
+
+        var rowErrors = new List<string>();
+        if (!TryParseImportDate(dateText, out var businessDate)) rowErrors.Add("invalid Date");
+        if (reference.Length > 120) rowErrors.Add("ContainerTrailer exceeds 120 characters");
+        if (!TryParseImportInt(palletsText, out var palletCount) || palletCount < 0 || palletCount > 10000) rowErrors.Add("Pallets must be a whole number from 0 to 10000");
+
+        var fromTerminal = string.IsNullOrWhiteSpace(fromCode) ? null : ResolveImportTerminal(fromCode, terminalLookup, terminalRows);
+        var toTerminal = string.IsNullOrWhiteSpace(toCode) ? null : ResolveImportTerminal(toCode, terminalLookup, terminalRows);
+        if (!string.IsNullOrWhiteSpace(fromCode) && fromTerminal is null) rowErrors.Add($"unknown FromTerminal '{fromCode}'");
+        if (!string.IsNullOrWhiteSpace(toCode) && toTerminal is null) rowErrors.Add($"unknown ToTerminal '{toCode}'");
+        // Historical files often omit the local side because it was implicit in that terminal's spreadsheet.
+        if (fromTerminal is null && string.IsNullOrWhiteSpace(fromCode) && toTerminal is not null) fromTerminal = ownerTerminal;
+        if (toTerminal is null && string.IsNullOrWhiteSpace(toCode) && fromTerminal is not null) toTerminal = ownerTerminal;
+        if (fromTerminal is null && toTerminal is null && string.IsNullOrWhiteSpace(fromCode) && string.IsNullOrWhiteSpace(toCode))
+            rowErrors.Add("enter at least FromTerminal or ToTerminal");
+        if (fromTerminal != null && toTerminal != null && fromTerminal.Id == toTerminal.Id) rowErrors.Add("FromTerminal and ToTerminal must be different");
+        // Imports may contain historical rows from the wider terminal network. Both terminals only need
+        // to resolve to entries in the PalletControl terminal master list; manual registration remains local.
+        if (palletReceiptNumber.Length > 120) rowErrors.Add("PalletReceiptNumber exceeds 120 characters");
+        if (standardComment.Length > 500) rowErrors.Add("StandardComment exceeds 500 characters");
+        if (freeComment.Length > 2000) rowErrors.Add("Comment exceeds 2000 characters");
+
+        if (rowErrors.Count > 0)
+        {
+            issues.Add(new ImportIssue(sourceRow.RowNumber, string.Join("; ", rowErrors)));
+            continue;
+        }
+
+        if (string.IsNullOrWhiteSpace(palletReceiptNumber))
+            warnings.Add(new ImportIssue(sourceRow.RowNumber, "PalletReceiptNumber is blank. Imported as legacy history; new manual registrations require a unique number."));
+
+        var key = LinehaulImportKey(businessDate, fromTerminal!.Id, toTerminal!.Id, reference, palletReceiptNumber, palletCount);
+        if (!fileKeys.Add(key))
+        {
+            issues.Add(new ImportIssue(sourceRow.RowNumber, "duplicate row inside the import file"));
+            continue;
+        }
+        pending.Add(new PendingLinehaulImport(sourceRow.RowNumber, businessDate, reference, palletReceiptNumber, palletCount,
+            fromTerminal.Id, toTerminal.Id, fromTerminal.Code, toTerminal.Code, standardComment, freeComment, key));
+    }
+
+    // Non-blank pallet receipt numbers are globally unique across Linehaul, including cancelled records.
+    var palletNumberRows = pending.Where(x => !string.IsNullOrWhiteSpace(x.PalletReceiptNumber)).ToList();
+    var duplicatePalletNumbersInFile = palletNumberRows
+        .GroupBy(x => x.PalletReceiptNumber.Trim(), StringComparer.OrdinalIgnoreCase)
+        .Where(g => g.Count() > 1)
+        .SelectMany(g => g.Skip(1))
+        .ToHashSet();
+    if (duplicatePalletNumbersInFile.Count > 0)
+    {
+        foreach (var duplicate in duplicatePalletNumbersInFile)
+            issues.Add(new ImportIssue(duplicate.RowNumber, $"PalletReceiptNumber '{duplicate.PalletReceiptNumber}' appears more than once in the import file"));
+        pending = pending.Where(x => !duplicatePalletNumbersInFile.Contains(x)).ToList();
+    }
+
+    if (palletNumberRows.Count > 0)
+    {
+        var existingPalletNumbers = (await db.LinehaulReceipts.AsNoTracking()
+                .Where(x => x.PalletReceiptNumber != "")
+                .Select(x => x.PalletReceiptNumber)
+                .ToListAsync())
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var conflicts = pending.Where(x => !string.IsNullOrWhiteSpace(x.PalletReceiptNumber) && existingPalletNumbers.Contains(x.PalletReceiptNumber.Trim())).ToList();
+        foreach (var conflict in conflicts)
+            issues.Add(new ImportIssue(conflict.RowNumber, $"PalletReceiptNumber '{conflict.PalletReceiptNumber}' already exists in the database"));
+        if (conflicts.Count > 0)
+        {
+            var conflictRows = conflicts.Select(x => x.RowNumber).ToHashSet();
+            pending = pending.Where(x => !conflictRows.Contains(x.RowNumber)).ToList();
+        }
+    }
+
+    var existingKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    if (pending.Count > 0)
+    {
+        var minDate = pending.Min(x => x.BusinessDate);
+        var maxDate = pending.Max(x => x.BusinessDate);
+        var existing = await db.LinehaulReceipts.AsNoTracking()
+            .Where(x => x.BusinessDate >= minDate && x.BusinessDate <= maxDate)
+            .Select(x => new { x.BusinessDate, x.FromTerminalId, x.ToTerminalId, x.UnitReference, x.PalletReceiptNumber, x.PalletCount })
+            .ToListAsync();
+        foreach (var x in existing)
+            existingKeys.Add(LinehaulImportKey(x.BusinessDate, x.FromTerminalId, x.ToTerminalId, x.UnitReference, x.PalletReceiptNumber, x.PalletCount));
+    }
+
+    var ready = new List<PendingLinehaulImport>();
+    var skippedDuplicates = 0;
+    foreach (var p in pending)
+    {
+        if (existingKeys.Contains(p.DuplicateKey))
+        {
+            skippedDuplicates++;
+            issues.Add(new ImportIssue(p.RowNumber, "matching Linehaul record already exists; skipped"));
+            continue;
+        }
+        ready.Add(p);
+        existingKeys.Add(p.DuplicateKey);
+    }
+
+    var previewRows = ready.OrderBy(x => x.RowNumber).Take(500).Select(x => new
+    {
+        row = x.RowNumber, date = x.BusinessDate, containerTrailer = x.UnitReference, palletReceiptNumber = x.PalletReceiptNumber,
+        pallets = x.PalletCount, fromTerminal = x.FromTerminalCode, toTerminal = x.ToTerminalCode,
+        standardComment = x.StandardComment, comment = x.FreeComment
+    }).ToList();
+
+    if (!confirmImport)
+    {
+        return Results.Ok(new
+        {
+            preview = true, file = file.FileName, rowsRead = grid.Rows.Count, readyToImport = ready.Count, imported = 0, skippedDuplicates,
+            rejected = issues.Count, previewRows, previewRowsTruncated = ready.Count > 500,
+            warnings = warnings.Take(200).ToList(), issues = issues.Take(200).ToList(), issueListTruncated = issues.Count > 200
+        });
+    }
+
+    var now = DateTime.UtcNow;
+    var importedRows = new List<LinehaulReceipt>();
+    foreach (var p in ready)
+    {
+        var entity = new LinehaulReceipt
+        {
+            ReceiptNumber = $"LH-{ownerTerminal.Code}-{now:yyyyMMdd}-{Guid.NewGuid().ToString("N")[..6].ToUpperInvariant()}",
+            OwnerTerminalId = terminalId,
+            FromTerminalId = p.FromTerminalId,
+            ToTerminalId = p.ToTerminalId,
+            FromTerminalSnapshot = p.FromTerminalCode,
+            ToTerminalSnapshot = p.ToTerminalCode,
+            UnitReference = p.UnitReference,
+            PalletReceiptNumber = p.PalletReceiptNumber,
+            PalletCount = p.PalletCount,
+            CommentOptionSnapshot = p.StandardComment,
+            FreeComment = p.FreeComment,
+            BusinessDate = p.BusinessDate,
+            SubmittedAtUtc = now,
+            SubmittedByUserId = userId,
+            Status = ReceiptStatus.Active
+        };
+        importedRows.Add(entity);
+    }
+
+    if (importedRows.Count > 0)
+    {
+        await using var tx = await db.Database.BeginTransactionAsync();
+        db.LinehaulReceipts.AddRange(importedRows);
+        await db.SaveChangesAsync();
+        await Audit(db, principal, "LINEHAUL_IMPORT", $"Imported {importedRows.Count} historical Linehaul rows for terminal {ownerTerminal.Code} from {file.FileName}");
+        await tx.CommitAsync();
+    }
+
+    return Results.Ok(new
+    {
+        preview = false, file = file.FileName, rowsRead = grid.Rows.Count, imported = importedRows.Count, skippedDuplicates, rejected = issues.Count,
+        importedRows = importedRows.OrderBy(x => x.BusinessDate).ThenBy(x => x.ReceiptNumber).Take(500).Select(x => new
+        {
+            x.ReceiptNumber, date = x.BusinessDate, containerTrailer = x.UnitReference, x.PalletReceiptNumber, pallets = x.PalletCount,
+            fromTerminal = x.FromTerminalSnapshot, toTerminal = x.ToTerminalSnapshot, standardComment = x.CommentOptionSnapshot, comment = x.FreeComment
+        }).ToList(),
+        importedRowsTruncated = importedRows.Count > 500, warnings = warnings.Take(200).ToList(), issues = issues.Take(200).ToList(), issueListTruncated = issues.Count > 200
+    });
+}).RequireAuthorization("LinehaulAdmin");
+
+// ---------------- RECEIVED PALLET CONTROL ----------------
+
+app.MapGet("/api/received-control/setup", async (ClaimsPrincipal principal, AppDbContext db) =>
+{
+    var terminalId = TerminalId(principal);
+    var terminals = await db.Terminals.AsNoTracking()
+        .Where(x => x.Active)
+        .OrderBy(x => x.Code)
+        .Select(x => new { x.Id, x.Code, x.Name })
+        .ToListAsync();
+    return Results.Ok(new { terminalId, terminalCode = principal.FindFirstValue("terminalCode") ?? "", terminals });
+}).RequireAuthorization("ReceivedControlModule");
+
+app.MapPost("/api/received-control/entries", async (
+    CreateReceivedControlRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var terminalId = TerminalId(principal);
+    var reference = (req.UnitReference ?? "").Trim();
+    var comment = (req.Comment ?? "").Trim();
+    if (reference.Length > 120) return Results.BadRequest(new { message = "Container/trailer text is too long." });
+    if (comment.Length > 2000) return Results.BadRequest(new { message = "Comment is too long." });
+    if (req.ActualPalletCount < 0 || req.ActualPalletCount > 10000) return Results.BadRequest(new { message = "Actual pallet count must be between 0 and 10000." });
+    if (req.PalletReceiptReceived && (!req.ReceiptPalletCount.HasValue || req.ReceiptPalletCount.Value < 0 || req.ReceiptPalletCount.Value > 10000))
+        return Results.BadRequest(new { message = "Enter the pallet quantity written on the received pallet receipt." });
+
+    var fromTerminal = await db.Terminals.AsNoTracking().FirstOrDefaultAsync(x => x.Id == req.FromTerminalId && x.Active);
+    if (fromTerminal is null) return Results.BadRequest(new { message = "From terminal was not found or is inactive." });
+    if (fromTerminal.Id == terminalId) return Results.BadRequest(new { message = "From terminal must be different from your receiving terminal." });
+
+    var receiptQty = req.PalletReceiptReceived ? req.ReceiptPalletCount : null;
+    var status = ReceivedControlStatus.Resolve(req.PalletReceiptReceived, receiptQty, req.ActualPalletCount);
+    var now = DateTime.UtcNow;
+    var businessDate = req.BusinessDate ?? DateOnly.FromDateTime(DateTime.Today);
+    var terminalCode = principal.FindFirstValue("terminalCode") ?? "TERM";
+    var row = new ReceivedControlEntry
+    {
+        ControlNumber = $"RC-{terminalCode}-{now:yyyyMMdd}-{Guid.NewGuid().ToString("N")[..6].ToUpperInvariant()}",
+        TerminalId = terminalId,
+        FromTerminalId = fromTerminal.Id,
+        FromTerminalSnapshot = fromTerminal.Code,
+        UnitReference = reference,
+        Comment = comment,
+        PalletReceiptReceived = req.PalletReceiptReceived,
+        ReceiptPalletCount = receiptQty,
+        ActualPalletCount = req.ActualPalletCount,
+        Result = status,
+        BusinessDate = businessDate,
+        SubmittedAtUtc = now,
+        SubmittedByUserId = UserId(principal),
+        Status = ReceiptStatus.Active
+    };
+    db.ReceivedControlEntries.Add(row);
+    await db.SaveChangesAsync();
+
+    if (status == ReceivedControlStatus.ReceiptHigher)
+    {
+        var difference = receiptQty!.Value - req.ActualPalletCount;
+        db.ReceivedControlWarnings.Add(new ReceivedControlWarning
+        {
+            TerminalId = terminalId,
+            EntryId = row.Id,
+            Message = $"From {fromTerminal.Code}{(string.IsNullOrWhiteSpace(reference) ? "" : $" · {reference}")}: pallet receipt says {receiptQty.Value}, but {req.ActualPalletCount} pallets were actually received. Shortage: {difference}.",
+            CreatedAtUtc = now
+        });
+        await db.SaveChangesAsync();
+    }
+    await Audit(db, principal, "RECEIVED_CONTROL_CREATE", $"{row.ControlNumber}: from {fromTerminal.Code}, {reference}, {status}");
+    return Results.Ok(ToReceivedControlDto(row));
+}).RequireAuthorization("ReceivedControlModule");
+
+app.MapPost("/api/received-control/entries/{id:int}/cancel", async (
+    int id,
+    CancelRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var row = await db.ReceivedControlEntries.FirstOrDefaultAsync(x => x.Id == id);
+    if (row is null) return Results.NotFound();
+    var terminalId = TerminalId(principal);
+    if (!IsSuperAdmin(principal) && (!IsTerminalAdmin(principal) || row.TerminalId != terminalId))
+        return Results.Forbid();
+    if (row.Status == ReceiptStatus.Cancelled)
+        return Results.BadRequest(new { message = "MottattKontroll entry is already cancelled." });
+
+    var reason = string.IsNullOrWhiteSpace(req.Reason) ? "Cancelled by administrator" : req.Reason.Trim();
+    row.Status = ReceiptStatus.Cancelled;
+    row.CancelledAtUtc = DateTime.UtcNow;
+    row.CancelledByUserId = UserId(principal);
+    row.CancelReason = reason;
+    await db.SaveChangesAsync();
+    await Audit(db, principal, "RECEIVED_CONTROL_CANCEL", $"Cancelled {row.ControlNumber}: {reason}");
+    return Results.Ok(new { row.Id, row.Status, row.CancelledAtUtc, row.CancelReason });
+}).RequireAuthorization("ReceivedControlAdmin");
+
+app.MapDelete("/api/received-control/entries/{id:int}", async (
+    int id,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var row = await db.ReceivedControlEntries.FirstOrDefaultAsync(x => x.Id == id);
+    if (row is null) return Results.NotFound();
+    var terminalId = TerminalId(principal);
+    if (!IsSuperAdmin(principal) && (!IsTerminalAdmin(principal) || row.TerminalId != terminalId))
+        return Results.Forbid();
+
+    var warnings = await db.ReceivedControlWarnings.Where(x => x.EntryId == id).ToListAsync();
+    if (warnings.Count > 0) db.ReceivedControlWarnings.RemoveRange(warnings);
+    var controlNumber = row.ControlNumber;
+    db.ReceivedControlEntries.Remove(row);
+    await db.SaveChangesAsync();
+    await Audit(db, principal, "RECEIVED_CONTROL_DELETE_PERMANENT", $"Permanently deleted {controlNumber}");
+    return Results.Ok();
+}).RequireAuthorization("ReceivedControlAdmin");
+
+app.MapGet("/api/received-control/statistics", async (
+    DateOnly? from,
+    DateOnly? to,
+    string? status,
+    string? recordStatus,
+    string? search,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var terminalId = TerminalId(principal);
+    var start = from ?? new DateOnly(DateTime.Today.Year, DateTime.Today.Month, 1);
+    var end = to ?? DateOnly.FromDateTime(DateTime.Today);
+    if (end < start) return Results.BadRequest(new { message = "To date cannot be before From date." });
+    var baseQuery = db.ReceivedControlEntries.AsNoTracking()
+        .Where(x => x.TerminalId == terminalId && x.BusinessDate >= start && x.BusinessDate <= end);
+    var activeRowsForTotals = await baseQuery.Where(x => x.Status == ReceiptStatus.Active).ToListAsync();
+
+    var q = baseQuery;
+    var normalizedStatus = (status ?? "all").Trim().ToUpperInvariant();
+    if (normalizedStatus != "ALL") q = q.Where(x => x.Result == normalizedStatus);
+    var normalizedRecordStatus = (recordStatus ?? "all").Trim().ToLowerInvariant();
+    if (normalizedRecordStatus == "active") q = q.Where(x => x.Status == ReceiptStatus.Active);
+    if (normalizedRecordStatus == "cancelled") q = q.Where(x => x.Status == ReceiptStatus.Cancelled);
+    var term = search?.Trim();
+    if (!string.IsNullOrWhiteSpace(term)) q = q.Where(x => x.UnitReference.Contains(term) || x.Comment.Contains(term) || x.FromTerminalSnapshot.Contains(term) || x.ControlNumber.Contains(term));
+    var rows = await q.OrderByDescending(x => x.BusinessDate).ThenByDescending(x => x.SubmittedAtUtc).Take(5000).ToListAsync();
+    var userIds = rows.Select(x => x.SubmittedByUserId)
+        .Concat(rows.Where(x => x.CancelledByUserId.HasValue).Select(x => x.CancelledByUserId!.Value))
+        .Distinct().ToList();
+    var users = await db.Users.AsNoTracking().Where(x => userIds.Contains(x.Id)).ToDictionaryAsync(x => x.Id, x => x.DisplayName);
+    var terminalCodes = await db.Terminals.AsNoTracking().ToDictionaryAsync(x => x.Id, x => x.Code);
+    var canManage = IsSuperAdmin(principal) || IsTerminalAdmin(principal) || Role(principal) == Roles.LegacyAdmin;
+    return Results.Ok(new
+    {
+        from = start, to = end,
+        total = activeRowsForTotals.Count,
+        noReceipt = activeRowsForTotals.Count(x => x.Result == ReceivedControlStatus.NoReceipt),
+        receiptHigher = activeRowsForTotals.Count(x => x.Result == ReceivedControlStatus.ReceiptHigher),
+        receiptLower = activeRowsForTotals.Count(x => x.Result == ReceivedControlStatus.ReceiptLower),
+        exact = activeRowsForTotals.Count(x => x.Result == ReceivedControlStatus.Exact),
+        totalShortage = activeRowsForTotals.Where(x => x.Result == ReceivedControlStatus.ReceiptHigher).Sum(x => (x.ReceiptPalletCount ?? 0) - x.ActualPalletCount),
+        totalExcess = activeRowsForTotals.Where(x => x.Result == ReceivedControlStatus.ReceiptLower).Sum(x => x.ActualPalletCount - (x.ReceiptPalletCount ?? 0)),
+        rows = rows.Select(x => new
+        {
+            x.Id, x.ControlNumber, x.BusinessDate, x.SubmittedAtUtc, x.UnitReference, x.Comment, x.FromTerminalId,
+            fromTerminal = terminalCodes.GetValueOrDefault(x.FromTerminalId, x.FromTerminalSnapshot),
+            x.PalletReceiptReceived, x.ReceiptPalletCount, x.ActualPalletCount, x.Result, x.Status, x.CancelledAtUtc, x.CancelReason,
+            cancelledBy = x.CancelledByUserId.HasValue ? users.GetValueOrDefault(x.CancelledByUserId.Value, "Unknown") : null,
+            difference = x.PalletReceiptReceived ? x.ActualPalletCount - (x.ReceiptPalletCount ?? 0) : (int?)null,
+            submittedBy = users.GetValueOrDefault(x.SubmittedByUserId, "Unknown"),
+            canManage
+        })
+    });
+}).RequireAuthorization("ReceivedControlModule");
+
+app.MapGet("/api/received-control/warnings", async (
+    bool? unacknowledgedOnly,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var terminalId = TerminalId(principal);
+    var activeEntryIds = db.ReceivedControlEntries.AsNoTracking()
+        .Where(x => x.TerminalId == terminalId && x.Status == ReceiptStatus.Active)
+        .Select(x => x.Id);
+    var q = db.ReceivedControlWarnings.AsNoTracking()
+        .Where(x => x.TerminalId == terminalId && activeEntryIds.Contains(x.EntryId));
+    if (unacknowledgedOnly == true) q = q.Where(x => x.AcknowledgedAtUtc == null);
+    var warnings = await q.OrderByDescending(x => x.CreatedAtUtc).Take(2000).ToListAsync();
+    var entryIds = warnings.Select(x => x.EntryId).Distinct().ToList();
+    var entries = await db.ReceivedControlEntries.AsNoTracking().Where(x => entryIds.Contains(x.Id)).ToDictionaryAsync(x => x.Id);
+    var terminalCodes = await db.Terminals.AsNoTracking().ToDictionaryAsync(x => x.Id, x => x.Code);
+    var ackIds = warnings.Where(x => x.AcknowledgedByUserId.HasValue).Select(x => x.AcknowledgedByUserId!.Value).Distinct().ToList();
+    var users = await db.Users.AsNoTracking().Where(x => ackIds.Contains(x.Id)).ToDictionaryAsync(x => x.Id, x => x.DisplayName);
+    return Results.Ok(new
+    {
+        warnings = warnings.Select(x => new
+        {
+            x.Id, x.Message, x.CreatedAtUtc, x.AcknowledgedAtUtc,
+            acknowledgedBy = x.AcknowledgedByUserId.HasValue ? users.GetValueOrDefault(x.AcknowledgedByUserId.Value, "Unknown") : null,
+            entry = entries.TryGetValue(x.EntryId, out var e) ? new { e.ControlNumber, e.UnitReference, e.BusinessDate, e.FromTerminalId, fromTerminal = terminalCodes.GetValueOrDefault(e.FromTerminalId, e.FromTerminalSnapshot), e.Comment, e.ReceiptPalletCount, e.ActualPalletCount } : null
+        })
+    });
+}).RequireAuthorization("ReceivedControlModule");
+
+app.MapPost("/api/received-control/warnings/{id:int}/acknowledge", async (
+    int id,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var terminalId = TerminalId(principal);
+    var warning = await db.ReceivedControlWarnings.FirstOrDefaultAsync(x => x.Id == id && x.TerminalId == terminalId);
+    if (warning is null) return Results.NotFound();
+    if (warning.AcknowledgedAtUtc == null)
+    {
+        warning.AcknowledgedAtUtc = DateTime.UtcNow;
+        warning.AcknowledgedByUserId = UserId(principal);
+        await db.SaveChangesAsync();
+        await Audit(db, principal, "RECEIVED_CONTROL_WARNING_ACK", $"Acknowledged received-control warning #{warning.Id}");
+    }
+    return Results.Ok();
+}).RequireAuthorization("ReceivedControlModule");
+
+app.MapGet("/api/received-control/export", async (
+    DateOnly from,
+    DateOnly to,
+    string? format,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    if (to < from) return Results.BadRequest(new { message = "To date cannot be before From date." });
+    var terminalId = TerminalId(principal);
+    var terminalCode = principal.FindFirstValue("terminalCode") ?? "TERM";
+    var rows = await db.ReceivedControlEntries.AsNoTracking()
+        .Where(x => x.TerminalId == terminalId && x.BusinessDate >= from && x.BusinessDate <= to)
+        .OrderBy(x => x.BusinessDate).ThenBy(x => x.SubmittedAtUtc).ToListAsync();
+    var activeRows = rows.Where(x => x.Status == ReceiptStatus.Active).ToList();
+    var terminalCodes = await db.Terminals.AsNoTracking().ToDictionaryAsync(x => x.Id, x => x.Code);
+    var details = new ExportTable("Received control",
+        ["Control ID", "Date", "From terminal", "Container/Trailer", "Comment", "Pallet receipt received", "Receipt pallets", "Actual pallets", "Difference actual-receipt", "Result", "Status", "Cancelled UTC", "Cancel reason", "Submitted UTC"], []);
+    foreach (var x in rows)
+        details.Rows.Add([x.ControlNumber, x.BusinessDate, terminalCodes.GetValueOrDefault(x.FromTerminalId, x.FromTerminalSnapshot), x.UnitReference, x.Comment, x.PalletReceiptReceived ? "Yes" : "No", x.ReceiptPalletCount, x.ActualPalletCount, x.PalletReceiptReceived ? x.ActualPalletCount - (x.ReceiptPalletCount ?? 0) : null, x.Result, x.Status, x.CancelledAtUtc, x.CancelReason, x.SubmittedAtUtc]);
+    var summary = new ExportTable("Received summary", ["Metric", "Value"], [
+        ["Active controls", activeRows.Count],
+        ["Cancelled controls", rows.Count(x => x.Status == ReceiptStatus.Cancelled)],
+        ["No pallet receipt", activeRows.Count(x => x.Result == ReceivedControlStatus.NoReceipt)],
+        ["Receipt higher than actual (red)", activeRows.Count(x => x.Result == ReceivedControlStatus.ReceiptHigher)],
+        ["Receipt lower than actual (orange)", activeRows.Count(x => x.Result == ReceivedControlStatus.ReceiptLower)],
+        ["Exact (green)", activeRows.Count(x => x.Result == ReceivedControlStatus.Exact)],
+        ["Total shortage pallets", activeRows.Where(x => x.Result == ReceivedControlStatus.ReceiptHigher).Sum(x => (x.ReceiptPalletCount ?? 0) - x.ActualPalletCount)],
+        ["Total excess pallets", activeRows.Where(x => x.Result == ReceivedControlStatus.ReceiptLower).Sum(x => x.ActualPalletCount - (x.ReceiptPalletCount ?? 0))]
+    ]);
+    var exportFormat = (format ?? "xlsx").Trim().ToLowerInvariant();
+    byte[] bytes; string contentType; string extension;
+    if (exportFormat == "csv")
+    {
+        bytes = Encoding.UTF8.GetPreamble().Concat(Encoding.UTF8.GetBytes(ExportCsv(details))).ToArray();
+        contentType = "text/csv; charset=utf-8"; extension = "csv";
+    }
+    else
+    {
+        bytes = ExportWorkbook([details, summary]);
+        contentType = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"; extension = "xlsx";
+    }
+    await Audit(db, principal, "RECEIVED_CONTROL_EXPORT", $"Exported received control {from:yyyy-MM-dd}-{to:yyyy-MM-dd}");
+    return Results.File(bytes, contentType, $"ReceivedControl_{terminalCode}_{from:yyyy-MM-dd}_{to:yyyy-MM-dd}.{extension}");
+}).RequireAuthorization("ReceivedControlModule");
+
+app.MapGet("/api/received-control/import-template", (string? format) =>
+{
+    var exportFormat = (format ?? "xlsx").Trim().ToLowerInvariant();
+    var headers = new List<string> { "Date", "FromTerminal", "ContainerTrailer", "PalletReceiptReceived", "ReceiptPallets", "ActualPallets", "Comment" };
+    if (exportFormat == "csv")
+    {
+        var csv = string.Join(",", headers.Select(Csv)) + Environment.NewLine;
+        var bytes = Encoding.UTF8.GetPreamble().Concat(Encoding.UTF8.GetBytes(csv)).ToArray();
+        return Results.File(bytes, "text/csv; charset=utf-8", "MottattKontroll_Import_Template.csv");
+    }
+
+    var data = new ExportTable("MottattKontroll Import", headers, []);
+    var instructions = new ExportTable("Instructions", ["Column", "Required", "Description", "Example"], [
+        ["Date", "Yes", "Business date. Recommended format YYYY-MM-DD.", "2026-08-28"],
+        ["FromTerminal", "Yes", "Existing terminal Code, Name or Alias. SRD, SRD123 and Sandefjord can all resolve to the same terminal when configured.", "ARE"],
+        ["ContainerTrailer", "Yes", "Container/trailer number or reference.", "TTR12345"],
+        ["PalletReceiptReceived", "Yes", "Yes/No. Ja/Nei, true/false and 1/0 are also accepted.", "Yes"],
+        ["ReceiptPallets", "When receipt received", "Pallet quantity written on the pallet receipt. Leave blank when PalletReceiptReceived=No.", "33"],
+        ["ActualPallets", "Yes", "Actual pallets physically received, 0-10000.", "31"],
+        ["Comment", "No", "Optional free-text comment.", "Seal damaged on arrival"]
+    ]);
+    return Results.File(ExportWorkbook([data, instructions]),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "MottattKontroll_Import_Template.xlsx");
+}).RequireAuthorization("ReceivedControlAdmin");
+
+app.MapPost("/api/received-control/import", async (
+    HttpRequest request,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    if (!request.HasFormContentType)
+        return Results.BadRequest(new { message = "Upload an .xlsx or .csv file using multipart/form-data." });
+    var form = await request.ReadFormAsync();
+    var file = form.Files.GetFile("file") ?? form.Files.FirstOrDefault();
+    if (file is null || file.Length == 0)
+        return Results.BadRequest(new { message = "Choose a non-empty .xlsx or .csv file." });
+    var confirmImport = bool.TryParse(form["confirm"].FirstOrDefault(), out var parsedConfirm) && parsedConfirm;
+
+    ImportGrid grid;
+    try { grid = await ReadImportGrid(file); }
+    catch (Exception ex) { return Results.BadRequest(new { message = $"Could not read import file: {ex.Message}" }); }
+
+    var missingHeaders = new List<string>();
+    if (!HasImportHeader(grid, "Date", "Dato")) missingHeaders.Add("Date");
+    if (!HasImportHeader(grid, "FromTerminal", "FraTerminal", "From", "Fra")) missingHeaders.Add("FromTerminal");
+    if (!HasImportHeader(grid, "ContainerTrailer", "ContainerTrailerNo", "UnitReference", "Container", "Trailer", "Tralle")) missingHeaders.Add("ContainerTrailer");
+    if (!HasImportHeader(grid, "PalletReceiptReceived", "PallekvitteringReceived", "PallekvitteringMottatt", "ReceiptReceived")) missingHeaders.Add("PalletReceiptReceived");
+    if (!HasImportHeader(grid, "ReceiptPallets", "PalletReceiptPallets", "KvitteringPaller", "PallekvitteringAntall")) missingHeaders.Add("ReceiptPallets");
+    if (!HasImportHeader(grid, "ActualPallets", "ActualPalletCount", "FaktiskePaller", "ReeltAntall")) missingHeaders.Add("ActualPallets");
+    if (missingHeaders.Count > 0)
+        return Results.BadRequest(new { message = $"Missing required column(s): {string.Join(", ", missingHeaders)}." });
+
+    var terminalId = TerminalId(principal);
+    var userId = UserId(principal);
+    var terminalRows = await db.Terminals.AsNoTracking().ToListAsync();
+    var terminalLookup = BuildTerminalLookup(terminalRows);
+    var terminal = terminalRows.FirstOrDefault(x => x.Id == terminalId);
+    if (terminal is null) return Results.BadRequest(new { message = "Your assigned terminal no longer exists." });
+
+    var issues = new List<ImportIssue>();
+    var pending = new List<PendingReceivedControlImport>();
+    var fileKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var sourceRow in grid.Rows)
+    {
+        var dateText = ImportValue(sourceRow, "Date", "Dato");
+        var fromCode = ImportValue(sourceRow, "FromTerminal", "FraTerminal", "From", "Fra").Trim();
+        var reference = ImportValue(sourceRow, "ContainerTrailer", "ContainerTrailerNo", "UnitReference", "Container", "Trailer", "Tralle").Trim();
+        var receivedText = ImportValue(sourceRow, "PalletReceiptReceived", "PallekvitteringReceived", "PallekvitteringMottatt", "ReceiptReceived");
+        var receiptPalletsText = ImportValue(sourceRow, "ReceiptPallets", "PalletReceiptPallets", "KvitteringPaller", "PallekvitteringAntall");
+        var actualText = ImportValue(sourceRow, "ActualPallets", "ActualPalletCount", "FaktiskePaller", "ReeltAntall");
+        var comment = ImportValue(sourceRow, "Comment", "FreeComment", "Kommentar").Trim();
+
+        var rowErrors = new List<string>();
+        if (!TryParseImportDate(dateText, out var businessDate)) rowErrors.Add("invalid Date");
+        var fromTerminal = ResolveImportTerminal(fromCode, terminalLookup, terminalRows);
+        if (string.IsNullOrWhiteSpace(fromCode)) rowErrors.Add("FromTerminal is required");
+        else if (fromTerminal is null) rowErrors.Add($"unknown FromTerminal '{fromCode}'");
+        else if (fromTerminal.Id == terminalId) rowErrors.Add("FromTerminal cannot be the receiving terminal itself");
+        if (string.IsNullOrWhiteSpace(reference)) rowErrors.Add("ContainerTrailer is required");
+        if (reference.Length > 120) rowErrors.Add("ContainerTrailer exceeds 120 characters");
+        if (comment.Length > 2000) rowErrors.Add("Comment exceeds 2000 characters");
+        if (!TryParseImportBool(receivedText, out var receiptReceived)) rowErrors.Add("PalletReceiptReceived must be Yes/No");
+        if (!TryParseImportInt(actualText, out var actualPallets) || actualPallets < 0 || actualPallets > 10000) rowErrors.Add("ActualPallets must be a whole number from 0 to 10000");
+        int? receiptPallets = null;
+        if (receiptReceived)
+        {
+            if (!TryParseImportInt(receiptPalletsText, out var parsedReceiptPallets) || parsedReceiptPallets < 0 || parsedReceiptPallets > 10000)
+                rowErrors.Add("ReceiptPallets is required and must be 0-10000 when a pallet receipt was received");
+            else receiptPallets = parsedReceiptPallets;
+        }
+
+        if (rowErrors.Count > 0)
+        {
+            issues.Add(new ImportIssue(sourceRow.RowNumber, string.Join("; ", rowErrors)));
+            continue;
+        }
+
+        var key = ReceivedControlImportKey(businessDate, fromTerminal!.Id, reference, receiptReceived, receiptPallets, actualPallets, comment);
+        if (!fileKeys.Add(key))
+        {
+            issues.Add(new ImportIssue(sourceRow.RowNumber, "duplicate row inside the import file"));
+            continue;
+        }
+        pending.Add(new PendingReceivedControlImport(sourceRow.RowNumber, businessDate, fromTerminal.Id, fromTerminal.Code, reference, receiptReceived, receiptPallets, actualPallets, comment, key));
+    }
+
+    var existingKeys = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    if (pending.Count > 0)
+    {
+        var minDate = pending.Min(x => x.BusinessDate);
+        var maxDate = pending.Max(x => x.BusinessDate);
+        var existing = await db.ReceivedControlEntries.AsNoTracking()
+            .Where(x => x.TerminalId == terminalId && x.BusinessDate >= minDate && x.BusinessDate <= maxDate)
+            .Select(x => new { x.BusinessDate, x.FromTerminalId, x.UnitReference, x.PalletReceiptReceived, x.ReceiptPalletCount, x.ActualPalletCount, x.Comment })
+            .ToListAsync();
+        foreach (var x in existing)
+            existingKeys.Add(ReceivedControlImportKey(x.BusinessDate, x.FromTerminalId, x.UnitReference, x.PalletReceiptReceived, x.ReceiptPalletCount, x.ActualPalletCount, x.Comment));
+    }
+
+    var ready = new List<PendingReceivedControlImport>();
+    var skippedDuplicates = 0;
+    foreach (var p in pending)
+    {
+        if (existingKeys.Contains(p.DuplicateKey))
+        {
+            skippedDuplicates++;
+            issues.Add(new ImportIssue(p.RowNumber, "matching MottattKontroll record already exists; skipped"));
+            continue;
+        }
+        ready.Add(p);
+        existingKeys.Add(p.DuplicateKey);
+    }
+
+    var previewRows = ready.OrderBy(x => x.RowNumber).Take(500).Select(x => new
+    {
+        row = x.RowNumber, date = x.BusinessDate, fromTerminal = x.FromTerminalCode, containerTrailer = x.UnitReference, comment = x.Comment,
+        palletReceiptReceived = x.PalletReceiptReceived, receiptPallets = x.ReceiptPalletCount, actualPallets = x.ActualPalletCount,
+        result = ReceivedControlStatus.Resolve(x.PalletReceiptReceived, x.ReceiptPalletCount, x.ActualPalletCount)
+    }).ToList();
+
+    if (!confirmImport)
+    {
+        return Results.Ok(new
+        {
+            preview = true, file = file.FileName, rowsRead = grid.Rows.Count, readyToImport = ready.Count, imported = 0, skippedDuplicates,
+            rejected = issues.Count, redWarningsCreated = 0, previewRows, previewRowsTruncated = ready.Count > 500,
+            issues = issues.Take(200).ToList(), issueListTruncated = issues.Count > 200
+        });
+    }
+
+    var now = DateTime.UtcNow;
+    var importedRows = new List<ReceivedControlEntry>();
+    foreach (var p in ready)
+    {
+        var result = ReceivedControlStatus.Resolve(p.PalletReceiptReceived, p.ReceiptPalletCount, p.ActualPalletCount);
+        var entity = new ReceivedControlEntry
+        {
+            ControlNumber = $"RC-{terminal.Code}-{now:yyyyMMdd}-{Guid.NewGuid().ToString("N")[..6].ToUpperInvariant()}",
+            TerminalId = terminalId,
+            FromTerminalId = p.FromTerminalId,
+            FromTerminalSnapshot = p.FromTerminalCode,
+            UnitReference = p.UnitReference,
+            Comment = p.Comment,
+            PalletReceiptReceived = p.PalletReceiptReceived,
+            ReceiptPalletCount = p.ReceiptPalletCount,
+            ActualPalletCount = p.ActualPalletCount,
+            Result = result,
+            BusinessDate = p.BusinessDate,
+            SubmittedAtUtc = now,
+            SubmittedByUserId = userId,
+            Status = ReceiptStatus.Active
+        };
+        importedRows.Add(entity);
+    }
+
+    if (importedRows.Count > 0)
+    {
+        await using var tx = await db.Database.BeginTransactionAsync();
+        db.ReceivedControlEntries.AddRange(importedRows);
+        await db.SaveChangesAsync();
+        foreach (var row in importedRows.Where(x => x.Result == ReceivedControlStatus.ReceiptHigher))
+        {
+            var difference = (row.ReceiptPalletCount ?? 0) - row.ActualPalletCount;
+            db.ReceivedControlWarnings.Add(new ReceivedControlWarning
+            {
+                TerminalId = terminalId,
+                EntryId = row.Id,
+                Message = $"From {row.FromTerminalSnapshot}{(string.IsNullOrWhiteSpace(row.UnitReference) ? "" : $" · {row.UnitReference}")}: pallet receipt says {row.ReceiptPalletCount}, but {row.ActualPalletCount} pallets were actually received. Shortage: {difference}. Imported historical control.",
+                CreatedAtUtc = now
+            });
+        }
+        await db.SaveChangesAsync();
+        await Audit(db, principal, "RECEIVED_CONTROL_IMPORT", $"Imported {importedRows.Count} historical MottattKontroll rows for terminal {terminal.Code} from {file.FileName}");
+        await tx.CommitAsync();
+    }
+
+    var terminalCodesForResult = terminalRows.ToDictionary(x => x.Id, x => x.Code);
+    return Results.Ok(new
+    {
+        preview = false, file = file.FileName, rowsRead = grid.Rows.Count, imported = importedRows.Count, skippedDuplicates, rejected = issues.Count,
+        redWarningsCreated = importedRows.Count(x => x.Result == ReceivedControlStatus.ReceiptHigher),
+        importedRows = importedRows.OrderBy(x => x.BusinessDate).ThenBy(x => x.ControlNumber).Take(500).Select(x => new
+        {
+            x.ControlNumber, date = x.BusinessDate, fromTerminal = terminalCodesForResult.GetValueOrDefault(x.FromTerminalId, x.FromTerminalSnapshot),
+            containerTrailer = x.UnitReference, comment = x.Comment, palletReceiptReceived = x.PalletReceiptReceived, receiptPallets = x.ReceiptPalletCount,
+            actualPallets = x.ActualPalletCount, x.Result
+        }).ToList(), importedRowsTruncated = importedRows.Count > 500,
+        issues = issues.Take(200).ToList(), issueListTruncated = issues.Count > 200
+    });
+}).RequireAuthorization("ReceivedControlAdmin");
 
 // Database status is Admin-only because it contains server filesystem paths.
 app.MapGet("/api/admin/database/status", (
@@ -1887,7 +2933,7 @@ app.MapGet("/api/admin/database/status", (
         latestBackupPath = backupStatus.LatestBackupPath,
         latestBackupUtc = backupStatus.LatestBackupUtc
     });
-}).RequireAuthorization(new AuthorizeAttribute { Roles = Roles.Admin });
+}).RequireAuthorization(SuperAdminOnly());
 
 app.MapPost("/api/admin/database/backup", async (
     DatabaseBackupManager backupManager,
@@ -1901,9 +2947,175 @@ app.MapPost("/api/admin/database/backup", async (
         backup.CreatedAtUtc,
         backup.SizeBytes
     });
-}).RequireAuthorization(new AuthorizeAttribute { Roles = Roles.Admin });
+}).RequireAuthorization(SuperAdminOnly());
 
 // ---------------- ADMIN ----------------
+
+
+app.MapGet("/api/admin/terminals", async (AppDbContext db) =>
+{
+    return Results.Ok(new { terminals = await db.Terminals.AsNoTracking().OrderBy(x => x.Code).ToListAsync() });
+}).RequireAuthorization(SuperAdminOnly());
+
+app.MapPost("/api/admin/terminals", async (
+    AdminTerminalRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var code = (req.Code ?? "").Trim().ToUpperInvariant();
+    var name = (req.Name ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(code) || code.Length > 24) return Results.BadRequest(new { message = "Terminal code is required (max 24 characters)." });
+    if (string.IsNullOrWhiteSpace(name)) name = code;
+    var existing = await db.Terminals.FirstOrDefaultAsync(x => x.Code.ToUpper() == code);
+    if (existing != null)
+    {
+        if (existing.Active) return Results.Conflict(new { message = $"Terminal {code} already exists." });
+        existing.Active = true; existing.Name = name; existing.Aliases = string.Join(", ", ParseTerminalAliases(req.Aliases)); await db.SaveChangesAsync();
+        await EnsureTerminalSettings(db, existing.Id);
+        return Results.Ok(existing);
+    }
+    var row = new Terminal { Code = code, Name = name, Aliases = string.Join(", ", ParseTerminalAliases(req.Aliases)), Active = true };
+    db.Terminals.Add(row); await db.SaveChangesAsync();
+    await EnsureTerminalSettings(db, row.Id);
+    await Audit(db, principal, "TERMINAL_CREATE", $"Created terminal {code} - {name}");
+    return Results.Ok(row);
+}).RequireAuthorization(SuperAdminOnly());
+
+app.MapPut("/api/admin/terminals/{id:int}", async (
+    int id,
+    AdminTerminalUpdateRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var row = await db.Terminals.FindAsync(id);
+    if (row is null) return Results.NotFound();
+
+    var oldCode = row.Code;
+    var oldName = row.Name;
+    var code = string.IsNullOrWhiteSpace(req.Code) ? row.Code : req.Code.Trim().ToUpperInvariant();
+    var name = string.IsNullOrWhiteSpace(req.Name) ? row.Name : req.Name.Trim();
+    if (string.IsNullOrWhiteSpace(code) || code.Length > 24)
+        return Results.BadRequest(new { message = "Terminal code is required (max 24 characters)." });
+    if (await db.Terminals.AsNoTracking().AnyAsync(x => x.Id != id && x.Code.ToUpper() == code))
+        return Results.Conflict(new { message = $"Terminal code {code} is already in use." });
+
+    var aliases = req.Aliases is null ? ParseTerminalAliases(row.Aliases) : ParseTerminalAliases(req.Aliases);
+    if (!oldCode.Equals(code, StringComparison.OrdinalIgnoreCase)) aliases.Add(oldCode);
+    if (!oldName.Equals(name, StringComparison.OrdinalIgnoreCase)) aliases.Add(oldName);
+    aliases = aliases
+        .Where(x => !x.Equals(code, StringComparison.OrdinalIgnoreCase) && !x.Equals(name, StringComparison.OrdinalIgnoreCase))
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
+        .ToList();
+
+    row.Code = code;
+    row.Name = name;
+    row.Aliases = string.Join(", ", aliases);
+    row.Active = req.Active;
+    await db.SaveChangesAsync();
+
+    // Keep snapshots readable and consistent with the current terminal display code.
+    var snapshotRows = await db.LinehaulReceipts.Where(x => x.FromTerminalId == id || x.ToTerminalId == id).ToListAsync();
+    foreach (var receipt in snapshotRows)
+    {
+        if (receipt.FromTerminalId == id) receipt.FromTerminalSnapshot = code;
+        if (receipt.ToTerminalId == id) receipt.ToTerminalSnapshot = code;
+    }
+    if (snapshotRows.Count > 0) await db.SaveChangesAsync();
+
+    await Audit(db, principal, "TERMINAL_UPDATE", $"Updated terminal {oldCode} -> {row.Code}: name={row.Name}, aliases={row.Aliases}, active={row.Active}");
+    return Results.Ok(row);
+}).RequireAuthorization(SuperAdminOnly());
+
+app.MapGet("/api/admin/terminal-settings", async (
+    int? terminalId,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var targetTerminalId = ResolveAdminTerminal(principal, terminalId);
+    if (targetTerminalId <= 0) return Results.Forbid();
+    var terminal = await db.Terminals.AsNoTracking().FirstOrDefaultAsync(x => x.Id == targetTerminalId);
+    if (terminal is null) return Results.NotFound(new { message = "Terminal not found." });
+    var settings = await GetTerminalSettings(db, targetTerminalId);
+    return Results.Ok(new
+    {
+        terminalId = targetTerminalId,
+        terminalCode = terminal.Code,
+        terminals = IsSuperAdmin(principal)
+            ? await db.Terminals.AsNoTracking().Where(x => x.Active).OrderBy(x => x.Code).Select(x => new { x.Id, x.Code, x.Name }).ToListAsync()
+            : await db.Terminals.AsNoTracking().Where(x => x.Id == targetTerminalId).Select(x => new { x.Id, x.Code, x.Name }).ToListAsync(),
+        settings
+    });
+}).RequireAuthorization(AdminOnly());
+
+app.MapPut("/api/admin/terminal-settings", async (
+    int? terminalId,
+    AdminSettingsRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var targetTerminalId = ResolveAdminTerminal(principal, terminalId);
+    if (targetTerminalId <= 0) return Results.Forbid();
+    var s = await GetTerminalSettings(db, targetTerminalId, tracking: true);
+    ApplySettings(s, req);
+    await db.SaveChangesAsync();
+    await Audit(db, principal, "TERMINAL_SETTINGS_UPDATE", $"Updated terminal settings for terminal #{targetTerminalId}");
+    return Results.Ok(s);
+}).RequireAuthorization(AdminOnly());
+
+app.MapGet("/api/admin/linehaul-comments", async (
+    int? terminalId,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var targetTerminalId = ResolveAdminTerminal(principal, terminalId);
+    if (targetTerminalId <= 0) return Results.Forbid();
+    var terminal = await db.Terminals.AsNoTracking().FirstOrDefaultAsync(x => x.Id == targetTerminalId);
+    if (terminal is null) return Results.NotFound();
+    return Results.Ok(new
+    {
+        terminalId = targetTerminalId,
+        terminalCode = terminal.Code,
+        terminals = IsSuperAdmin(principal)
+            ? await db.Terminals.AsNoTracking().Where(x => x.Active).OrderBy(x => x.Code).Select(x => new { x.Id, x.Code, x.Name }).ToListAsync()
+            : await db.Terminals.AsNoTracking().Where(x => x.Id == targetTerminalId).Select(x => new { x.Id, x.Code, x.Name }).ToListAsync(),
+        comments = await db.LinehaulCommentOptions.AsNoTracking().Where(x => x.TerminalId == targetTerminalId).OrderBy(x => x.Text).ToListAsync()
+    });
+}).RequireAuthorization(AdminOnly());
+
+app.MapPost("/api/admin/linehaul-comments", async (
+    AdminLinehaulCommentRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var targetTerminalId = ResolveAdminTerminal(principal, req.TerminalId);
+    if (targetTerminalId <= 0) return Results.Forbid();
+    var text = (req.Text ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(text)) return Results.BadRequest(new { message = "Comment text is required." });
+    var existing = await db.LinehaulCommentOptions.FirstOrDefaultAsync(x => x.TerminalId == targetTerminalId && x.Text.ToLower() == text.ToLower());
+    if (existing != null)
+    {
+        existing.Active = true; await db.SaveChangesAsync(); return Results.Ok(existing);
+    }
+    var row = new LinehaulCommentOption { TerminalId = targetTerminalId, Text = text, Active = true };
+    db.LinehaulCommentOptions.Add(row); await db.SaveChangesAsync();
+    await Audit(db, principal, "LINEHAUL_COMMENT_CREATE", $"Added linehaul comment for terminal #{targetTerminalId}: {text}");
+    return Results.Ok(row);
+}).RequireAuthorization(AdminOnly());
+
+app.MapPut("/api/admin/linehaul-comments/{id:int}/active", async (
+    int id,
+    AdminActiveRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var row = await db.LinehaulCommentOptions.FindAsync(id);
+    if (row is null) return Results.NotFound();
+    if (!CanManageTerminal(principal, row.TerminalId)) return Results.Forbid();
+    row.Active = req.Active; await db.SaveChangesAsync();
+    await Audit(db, principal, "LINEHAUL_COMMENT_UPDATE", $"Set linehaul comment #{id} active={req.Active}");
+    return Results.Ok();
+}).RequireAuthorization(AdminOnly());
 
 app.MapGet("/api/admin/all", async (AppDbContext db) =>
 {
@@ -1954,11 +3166,14 @@ app.MapGet("/api/admin/all", async (AppDbContext db) =>
                 x.ShowLeaderboardNotifications,
                 x.ShowBalanceNotifications,
                 x.ShowDriverStatisticsTab,
-                x.ShowDailyCheckTab
+                x.ShowDailyCheckTab,
+                x.HasInternalPalletAccounting,
+                x.HasLinehaul,
+                x.HasReceivedControl
             }).ToListAsync(),
         settings
     });
-}).RequireAuthorization(AdminOnly());
+}).RequireAuthorization(SuperAdminOnly());
 
 
 app.MapGet("/api/admin/transporters", async (AppDbContext db) =>
@@ -1967,50 +3182,42 @@ app.MapGet("/api/admin/transporters", async (AppDbContext db) =>
     {
         transporters = await db.Transporters.AsNoTracking().OrderBy(x => x.Name).ToListAsync()
     });
-}).RequireAuthorization(AdminOnly());
+}).RequireAuthorization(SuperAdminOnly());
 
-app.MapGet("/api/admin/vehicles", async (AppDbContext db) =>
+app.MapGet("/api/admin/vehicles", async (ClaimsPrincipal principal, AppDbContext db) =>
 {
-    var vehicles = await db.Vehicles.AsNoTracking()
-        .Include(x => x.Terminal)
-        .Include(x => x.Transporter)
-        .OrderBy(x => x.VehicleId)
-        .ToListAsync();
-
+    var terminalId = TerminalId(principal);
+    var q = db.Vehicles.AsNoTracking().Include(x => x.Terminal).Include(x => x.Transporter).AsQueryable();
+    if (!IsSuperAdmin(principal)) q = q.Where(x => x.TerminalId == terminalId);
+    var vehicles = await q.OrderBy(x => x.VehicleId).ToListAsync();
+    var terminals = IsSuperAdmin(principal)
+        ? await db.Terminals.AsNoTracking().Where(x => x.Active).OrderBy(x => x.Code).ToListAsync()
+        : await db.Terminals.AsNoTracking().Where(x => x.Id == terminalId).ToListAsync();
     return Results.Ok(new
     {
-        terminals = await db.Terminals.AsNoTracking().OrderBy(x => x.Code).ToListAsync(),
+        terminals,
         transporters = await db.Transporters.AsNoTracking().OrderBy(x => x.Name).ToListAsync(),
         vehicles = vehicles.Select(x => new
         {
-            x.Id,
-            x.VehicleId,
-            x.Active,
-            x.TerminalId,
-            terminal = x.Terminal!.Code,
-            x.TransporterId,
-            transporter = x.Transporter != null ? x.Transporter.Name : "Not assigned",
+            x.Id, x.VehicleId, x.Active, x.TerminalId, terminal = x.Terminal!.Code,
+            x.TransporterId, transporter = x.Transporter != null ? x.Transporter.Name : "Not assigned",
             operatingDays = ParseOperatingDays(x.OperatingDays).OrderBy(day => day).ToArray()
         }).ToList()
     });
 }).RequireAuthorization(AdminOnly());
 
-app.MapGet("/api/admin/drivers", async (AppDbContext db) =>
+app.MapGet("/api/admin/drivers", async (ClaimsPrincipal principal, AppDbContext db) =>
 {
+    var terminalId = TerminalId(principal);
+    var q = db.Drivers.AsNoTracking().Include(x => x.Terminal).AsQueryable();
+    if (!IsSuperAdmin(principal)) q = q.Where(x => x.TerminalId == terminalId);
+    var terminals = IsSuperAdmin(principal)
+        ? await db.Terminals.AsNoTracking().Where(x => x.Active).OrderBy(x => x.Code).ToListAsync()
+        : await db.Terminals.AsNoTracking().Where(x => x.Id == terminalId).ToListAsync();
     return Results.Ok(new
     {
-        terminals = await db.Terminals.AsNoTracking().OrderBy(x => x.Code).ToListAsync(),
-        drivers = await db.Drivers.AsNoTracking()
-            .Include(x => x.Terminal)
-            .OrderBy(x => x.Name)
-            .Select(x => new
-            {
-                x.Id,
-                x.Name,
-                x.Active,
-                x.TerminalId,
-                terminal = x.Terminal!.Code
-            }).ToListAsync()
+        terminals,
+        drivers = await q.OrderBy(x => x.Name).Select(x => new { x.Id, x.Name, x.Active, x.TerminalId, terminal = x.Terminal!.Code }).ToListAsync()
     });
 }).RequireAuthorization(AdminOnly());
 
@@ -2020,36 +3227,33 @@ app.MapGet("/api/admin/pallet-types", async (AppDbContext db) =>
     {
         palletTypes = await db.PalletTypes.AsNoTracking().OrderBy(x => x.Name).ToListAsync()
     });
-}).RequireAuthorization(AdminOnly());
+}).RequireAuthorization(SuperAdminOnly());
 
-app.MapGet("/api/admin/users", async (AppDbContext db) =>
+app.MapGet("/api/admin/users", async (ClaimsPrincipal principal, AppDbContext db) =>
 {
+    var terminalId = TerminalId(principal);
+    var q = db.Users.AsNoTracking().Include(x => x.Terminal).AsQueryable();
+    if (!IsSuperAdmin(principal)) q = q.Where(x => x.TerminalId == terminalId && x.Role != Roles.SuperAdmin && x.Role != Roles.LegacyAdmin);
+    var terminals = IsSuperAdmin(principal)
+        ? await db.Terminals.AsNoTracking().Where(x => x.Active).OrderBy(x => x.Code).ToListAsync()
+        : await db.Terminals.AsNoTracking().Where(x => x.Id == terminalId).ToListAsync();
     return Results.Ok(new
     {
-        terminals = await db.Terminals.AsNoTracking().OrderBy(x => x.Code).ToListAsync(),
-        users = await db.Users.AsNoTracking()
-            .Include(x => x.Terminal)
-            .OrderBy(x => x.Username)
-            .Select(x => new
-            {
-                x.Id,
-                x.Username,
-                x.DisplayName,
-                x.Role,
-                x.Active,
-                x.TerminalId,
-                terminal = x.Terminal!.Code,
-                x.ShowMilestoneNotifications,
-                x.ShowLeaderboardNotifications,
-                x.ShowBalanceNotifications
-            }).ToListAsync()
+        terminals,
+        users = await q.OrderBy(x => x.Username).Select(x => new
+        {
+            x.Id, x.Username, x.DisplayName, x.Role, x.Active, x.TerminalId, terminal = x.Terminal!.Code,
+            x.ShowMilestoneNotifications, x.ShowLeaderboardNotifications, x.ShowBalanceNotifications,
+            x.ShowDriverStatisticsTab, x.ShowDailyCheckTab,
+            x.HasInternalPalletAccounting, x.HasLinehaul, x.HasReceivedControl
+        }).ToListAsync()
     });
 }).RequireAuthorization(AdminOnly());
 
 app.MapGet("/api/admin/settings", async (AppDbContext db) =>
 {
     return Results.Ok(await db.Settings.AsNoTracking().SingleAsync());
-}).RequireAuthorization(AdminOnly());
+}).RequireAuthorization(SuperAdminOnly());
 
 app.MapGet("/api/admin/holidays", async (AppDbContext db) =>
 {
@@ -2061,7 +3265,7 @@ app.MapGet("/api/admin/holidays", async (AppDbContext db) =>
             .Select(x => new { x.Id, x.Date, x.Name })
             .ToListAsync()
     });
-}).RequireAuthorization(AdminOnly());
+}).RequireAuthorization(SuperAdminOnly());
 
 app.MapPost("/api/admin/holidays", async (
     AdminHolidayRequest req,
@@ -2080,7 +3284,7 @@ app.MapPost("/api/admin/holidays", async (
     await db.SaveChangesAsync();
     await Audit(db, principal, "HOLIDAY_CREATE", $"Added non-working day {row.Date:yyyy-MM-dd}: {row.Name}");
     return Results.Ok(new { row.Id, row.Date, row.Name });
-}).RequireAuthorization(AdminOnly());
+}).RequireAuthorization(SuperAdminOnly());
 
 app.MapDelete("/api/admin/holidays/{id:int}", async (
     int id,
@@ -2094,7 +3298,7 @@ app.MapDelete("/api/admin/holidays/{id:int}", async (
     await db.SaveChangesAsync();
     await Audit(db, principal, "HOLIDAY_DELETE", $"Removed non-working day {row.Date:yyyy-MM-dd}: {row.Name}");
     return Results.Ok();
-}).RequireAuthorization(AdminOnly());
+}).RequireAuthorization(SuperAdminOnly());
 
 app.MapPost("/api/admin/transporters", async (
     AdminTransporterRequest req,
@@ -2113,7 +3317,7 @@ app.MapPost("/api/admin/transporters", async (
     await db.SaveChangesAsync();
     await Audit(db, principal, "TRANSPORTER_CREATE", $"Created transporter {name}");
     return Results.Ok(row);
-}).RequireAuthorization(AdminOnly());
+}).RequireAuthorization(SuperAdminOnly());
 
 app.MapDelete("/api/admin/transporters/{id:int}", async (
     int id,
@@ -2131,13 +3335,14 @@ app.MapDelete("/api/admin/transporters/{id:int}", async (
     await db.SaveChangesAsync();
     await Audit(db, principal, "TRANSPORTER_DELETE", $"Deleted transporter {row.Name}; {vehicles.Count} vehicle(s) became unassigned");
     return Results.Ok();
-}).RequireAuthorization(AdminOnly());
+}).RequireAuthorization(SuperAdminOnly());
 
 app.MapPost("/api/admin/vehicles", async (
     AdminVehicleRequest req,
     ClaimsPrincipal principal,
     AppDbContext db) =>
 {
+    if (!CanManageTerminal(principal, req.TerminalId)) return Results.Forbid();
     var idText = req.VehicleId.Trim().ToUpperInvariant();
     if (string.IsNullOrWhiteSpace(idText))
         return Results.BadRequest(new { message = "Vehicle ID is required." });
@@ -2173,6 +3378,7 @@ app.MapPut("/api/admin/vehicles/{id:int}/transporter", async (
 {
     var row = await db.Vehicles.FindAsync(id);
     if (row is null) return Results.NotFound();
+    if (!CanManageTerminal(principal, row.TerminalId)) return Results.Forbid();
 
     if (!await db.Transporters.AnyAsync(x => x.Id == req.TransporterId && x.Active))
         return Results.BadRequest(new { message = "Transporter not found." });
@@ -2191,6 +3397,7 @@ app.MapPut("/api/admin/vehicles/{id:int}/schedule", async (
 {
     var row = await db.Vehicles.FindAsync(id);
     if (row is null) return Results.NotFound();
+    if (!CanManageTerminal(principal, row.TerminalId)) return Results.Forbid();
 
     var days = (req.Days ?? [])
         .Distinct()
@@ -2213,6 +3420,7 @@ app.MapDelete("/api/admin/vehicles/{id:int}", async (
 {
     var row = await db.Vehicles.FindAsync(id);
     if (row is null) return Results.NotFound();
+    if (!CanManageTerminal(principal, row.TerminalId)) return Results.Forbid();
 
     var name = row.VehicleId;
     db.Vehicles.Remove(row);
@@ -2226,6 +3434,7 @@ app.MapPost("/api/admin/drivers", async (
     ClaimsPrincipal principal,
     AppDbContext db) =>
 {
+    if (!CanManageTerminal(principal, req.TerminalId)) return Results.Forbid();
     var name = req.Name.Trim();
     if (string.IsNullOrWhiteSpace(name))
         return Results.BadRequest(new { message = "Driver name is required." });
@@ -2257,6 +3466,7 @@ app.MapDelete("/api/admin/drivers/{id:int}", async (
 {
     var row = await db.Drivers.FindAsync(id);
     if (row is null) return Results.NotFound();
+    if (!CanManageTerminal(principal, row.TerminalId)) return Results.Forbid();
 
     // Driver names are soft-deleted. This removes the name from future registration
     // while preserving DriverId links and all historical statistics.
@@ -2274,6 +3484,7 @@ app.MapPut("/api/admin/drivers/{id:int}/active", async (
 {
     var row = await db.Drivers.FindAsync(id);
     if (row is null) return Results.NotFound();
+    if (!CanManageTerminal(principal, row.TerminalId)) return Results.Forbid();
     row.Active = req.Active;
     await db.SaveChangesAsync();
     await Audit(db, principal, req.Active ? "DRIVER_RESTORE" : "DRIVER_DEACTIVATE",
@@ -2297,7 +3508,7 @@ app.MapPost("/api/admin/pallet-types", async (
     await db.SaveChangesAsync();
     await Audit(db, principal, "PALLET_TYPE_CREATE", $"Created pallet type {name}");
     return Results.Ok(row);
-}).RequireAuthorization(AdminOnly());
+}).RequireAuthorization(SuperAdminOnly());
 
 app.MapPut("/api/admin/pallet-types/{id:int}", async (
     int id,
@@ -2312,7 +3523,7 @@ app.MapPut("/api/admin/pallet-types/{id:int}", async (
     await db.SaveChangesAsync();
     await Audit(db, principal, "PALLET_TYPE_UPDATE", $"Updated pallet type {row.Name}");
     return Results.Ok();
-}).RequireAuthorization(AdminOnly());
+}).RequireAuthorization(SuperAdminOnly());
 
 app.MapPost("/api/admin/users", async (
     AdminUserRequest req,
@@ -2322,10 +3533,10 @@ app.MapPost("/api/admin/users", async (
     var username = req.Username.Trim().ToLowerInvariant();
     if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(req.Password))
         return Results.BadRequest(new { message = "Username and password are required." });
-    if (!ValidRole(req.Role))
-        return Results.BadRequest(new { message = "Invalid role." });
-    if (await db.Users.AnyAsync(x => x.Username == username))
-        return Results.BadRequest(new { message = "Username already exists." });
+    if (!ValidRole(req.Role)) return Results.BadRequest(new { message = "Invalid role." });
+    if (!CanManageTerminal(principal, req.TerminalId)) return Results.Forbid();
+    if (!IsSuperAdmin(principal) && req.Role == Roles.SuperAdmin) return Results.Forbid();
+    if (await db.Users.AnyAsync(x => x.Username == username)) return Results.BadRequest(new { message = "Username already exists." });
 
     var row = new AppUser
     {
@@ -2333,12 +3544,16 @@ app.MapPost("/api/admin/users", async (
         DisplayName = req.DisplayName.Trim(),
         Role = req.Role,
         TerminalId = req.TerminalId,
-        Active = true
+        Active = true,
+        HasInternalPalletAccounting = req.HasInternalPalletAccounting,
+        HasLinehaul = req.HasLinehaul,
+        HasReceivedControl = req.HasReceivedControl,
+        ShowDriverStatisticsTab = req.ShowDriverStatisticsTab,
+        ShowDailyCheckTab = req.ShowDailyCheckTab
     };
     row.PasswordHash = new PasswordHasher<AppUser>().HashPassword(row, req.Password);
-    db.Users.Add(row);
-    await db.SaveChangesAsync();
-    await Audit(db, principal, "USER_CREATE", $"Created user {username} ({req.Role})");
+    db.Users.Add(row); await db.SaveChangesAsync();
+    await Audit(db, principal, "USER_CREATE", $"Created user {username} ({req.Role}) modules internal={row.HasInternalPalletAccounting}, linehaul={row.HasLinehaul}, received={row.HasReceivedControl}");
     return Results.Ok();
 }).RequireAuthorization(AdminOnly());
 
@@ -2350,13 +3565,19 @@ app.MapPut("/api/admin/users/{id:int}", async (
 {
     var row = await db.Users.FindAsync(id);
     if (row is null) return Results.NotFound();
-    if (!ValidRole(req.Role))
-        return Results.BadRequest(new { message = "Invalid role." });
+    if (!ValidRole(req.Role)) return Results.BadRequest(new { message = "Invalid role." });
+    if (!CanManageTerminal(principal, row.TerminalId) || !CanManageTerminal(principal, req.TerminalId)) return Results.Forbid();
+    if (!IsSuperAdmin(principal) && (row.Role == Roles.SuperAdmin || row.Role == Roles.LegacyAdmin || req.Role == Roles.SuperAdmin)) return Results.Forbid();
 
     row.DisplayName = req.DisplayName.Trim();
     row.Role = req.Role;
     row.TerminalId = req.TerminalId;
     row.Active = req.Active;
+    row.HasInternalPalletAccounting = req.HasInternalPalletAccounting;
+    row.HasLinehaul = req.HasLinehaul;
+    row.HasReceivedControl = req.HasReceivedControl;
+    row.ShowDriverStatisticsTab = req.ShowDriverStatisticsTab;
+    row.ShowDailyCheckTab = req.ShowDailyCheckTab;
     await db.SaveChangesAsync();
     await Audit(db, principal, "USER_UPDATE", $"Updated user {row.Username}");
     return Results.Ok();
@@ -2370,6 +3591,8 @@ app.MapPut("/api/admin/users/{id:int}/tab-access", async (
 {
     var row = await db.Users.FindAsync(id);
     if (row is null) return Results.NotFound();
+    if (!CanManageTerminal(principal, row.TerminalId)) return Results.Forbid();
+    if (!IsSuperAdmin(principal) && (row.Role == Roles.SuperAdmin || row.Role == Roles.LegacyAdmin)) return Results.Forbid();
 
     row.ShowDriverStatisticsTab = req.ShowDriverStatisticsTab;
     row.ShowDailyCheckTab = req.ShowDailyCheckTab;
@@ -2390,6 +3613,8 @@ app.MapPost("/api/admin/users/{id:int}/password", async (
 
     var row = await db.Users.FindAsync(id);
     if (row is null) return Results.NotFound();
+    if (!CanManageTerminal(principal, row.TerminalId)) return Results.Forbid();
+    if (!IsSuperAdmin(principal) && (row.Role == Roles.SuperAdmin || row.Role == Roles.LegacyAdmin)) return Results.Forbid();
     row.PasswordHash = new PasswordHasher<AppUser>().HashPassword(row, req.Password);
     await db.SaveChangesAsync();
     await Audit(db, principal, "USER_PASSWORD", $"Reset password for {row.Username}");
@@ -2436,14 +3661,14 @@ app.MapPut("/api/admin/settings", async (
     await db.SaveChangesAsync();
     await Audit(db, principal, "SETTINGS_UPDATE", "Updated warning and notification settings");
     return Results.Ok(s);
-}).RequireAuthorization(AdminOnly());
+}).RequireAuthorization(SuperAdminOnly());
 
 app.Run("http://0.0.0.0:5000");
 
 // ---------------- HELPERS ----------------
 
-static AuthorizeAttribute AdminOnly() => new() { Roles = Roles.Admin };
-static AuthorizeAttribute AdminOrSuperuser() => new() { Roles = $"{Roles.Admin},{Roles.Superuser}" };
+static AuthorizeAttribute AdminOnly() => new() { Roles = $"{Roles.SuperAdmin},{Roles.TerminalAdmin},{Roles.LegacyAdmin}" };
+static AuthorizeAttribute SuperAdminOnly() => new() { Roles = $"{Roles.SuperAdmin},{Roles.LegacyAdmin}" };
 
 static int UserId(ClaimsPrincipal principal) =>
     int.Parse(principal.FindFirstValue(ClaimTypes.NameIdentifier)
@@ -2456,7 +3681,12 @@ static int TerminalId(ClaimsPrincipal principal) =>
 static string Role(ClaimsPrincipal principal) =>
     principal.FindFirstValue(ClaimTypes.Role) ?? Roles.User;
 
-static bool ValidRole(string role) => role is Roles.Admin or Roles.Superuser or Roles.User;
+static bool ValidRole(string role) => role is Roles.SuperAdmin or Roles.TerminalAdmin or Roles.Superuser or Roles.User or Roles.LegacyAdmin;
+
+static bool IsSuperAdmin(ClaimsPrincipal principal) => Role(principal) is Roles.SuperAdmin or Roles.LegacyAdmin;
+static bool IsTerminalAdmin(ClaimsPrincipal principal) => Role(principal) == Roles.TerminalAdmin;
+static bool CanManageTerminal(ClaimsPrincipal principal, int terminalId) => IsSuperAdmin(principal) || (IsTerminalAdmin(principal) && TerminalId(principal) == terminalId);
+static int ResolveAdminTerminal(ClaimsPrincipal principal, int? requestedTerminalId) => IsSuperAdmin(principal) ? (requestedTerminalId ?? TerminalId(principal)) : TerminalId(principal);
 
 static List<int> ParseIds(string? value) =>
     string.IsNullOrWhiteSpace(value)
@@ -2535,6 +3765,51 @@ static void EnsureCompatibilitySchema(AppDbContext db)
             cmd.ExecuteNonQuery();
         }
 
+
+        if (!userColumns.Contains("HasInternalPalletAccounting"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"Users\" ADD COLUMN \"HasInternalPalletAccounting\" INTEGER NOT NULL DEFAULT 1;";
+            cmd.ExecuteNonQuery();
+        }
+        if (!userColumns.Contains("HasLinehaul"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"Users\" ADD COLUMN \"HasLinehaul\" INTEGER NOT NULL DEFAULT 0;";
+            cmd.ExecuteNonQuery();
+        }
+        if (!userColumns.Contains("HasReceivedControl"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"Users\" ADD COLUMN \"HasReceivedControl\" INTEGER NOT NULL DEFAULT 0;";
+            cmd.ExecuteNonQuery();
+        }
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = "UPDATE \"Users\" SET \"Role\"='SuperAdmin' WHERE \"Role\"='Admin';";
+            cmd.ExecuteNonQuery();
+        }
+
+        var terminalColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA table_info('Terminals');";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read()) terminalColumns.Add(reader.GetString(1));
+        }
+        if (!terminalColumns.Contains("Active"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"Terminals\" ADD COLUMN \"Active\" INTEGER NOT NULL DEFAULT 1;";
+            cmd.ExecuteNonQuery();
+        }
+        if (!terminalColumns.Contains("Aliases"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"Terminals\" ADD COLUMN \"Aliases\" TEXT NOT NULL DEFAULT '';";
+            cmd.ExecuteNonQuery();
+        }
+
         var settingsColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         using (var cmd = connection.CreateCommand())
         {
@@ -2563,12 +3838,459 @@ CREATE UNIQUE INDEX IF NOT EXISTS "IX_Holidays_Date" ON "Holidays" ("Date");
 """;
             cmd.ExecuteNonQuery();
         }
+
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = """
+CREATE TABLE IF NOT EXISTS "TerminalSettings" (
+    "Id" INTEGER NOT NULL CONSTRAINT "PK_TerminalSettings" PRIMARY KEY AUTOINCREMENT,
+    "TerminalId" INTEGER NOT NULL,
+    "AllowUsersAddDrivers" INTEGER NOT NULL DEFAULT 1,
+    "LargeInEnabled" INTEGER NOT NULL DEFAULT 1, "LargeInThreshold" INTEGER NOT NULL DEFAULT 20,
+    "LargeOutEnabled" INTEGER NOT NULL DEFAULT 1, "LargeOutThreshold" INTEGER NOT NULL DEFAULT 20,
+    "RecentVehicleEnabled" INTEGER NOT NULL DEFAULT 1, "RecentVehicleMinutes" INTEGER NOT NULL DEFAULT 5,
+    "RecentDriverEnabled" INTEGER NOT NULL DEFAULT 1, "RecentDriverMinutes" INTEGER NOT NULL DEFAULT 5,
+    "DuplicateEnabled" INTEGER NOT NULL DEFAULT 1, "DuplicateMinutes" INTEGER NOT NULL DEFAULT 5,
+    "RapidSubmissionsEnabled" INTEGER NOT NULL DEFAULT 1, "RapidSubmissionCount" INTEGER NOT NULL DEFAULT 3, "RapidSubmissionMinutes" INTEGER NOT NULL DEFAULT 10,
+    "DailyTotalEnabled" INTEGER NOT NULL DEFAULT 1, "DailyTotalThreshold" INTEGER NOT NULL DEFAULT 60,
+    "CancellationWarningEnabled" INTEGER NOT NULL DEFAULT 1, "CancellationReversedWarningEnabled" INTEGER NOT NULL DEFAULT 1,
+    "MilestoneNotificationsEnabled" INTEGER NOT NULL DEFAULT 1, "MonthlyMilestoneStep" INTEGER NOT NULL DEFAULT 100,
+    "LeaderboardNotificationsEnabled" INTEGER NOT NULL DEFAULT 1, "BalanceNotificationsEnabled" INTEGER NOT NULL DEFAULT 1,
+    "DriverUnmatchedInDeduction" INTEGER NOT NULL DEFAULT 15,
+    CONSTRAINT "FK_TerminalSettings_Terminals_TerminalId" FOREIGN KEY ("TerminalId") REFERENCES "Terminals" ("Id") ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS "IX_TerminalSettings_TerminalId" ON "TerminalSettings" ("TerminalId");
+
+CREATE TABLE IF NOT EXISTS "LinehaulCommentOptions" (
+    "Id" INTEGER NOT NULL CONSTRAINT "PK_LinehaulCommentOptions" PRIMARY KEY AUTOINCREMENT,
+    "TerminalId" INTEGER NOT NULL, "Text" TEXT NOT NULL, "Active" INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS "IX_LinehaulCommentOptions_TerminalId" ON "LinehaulCommentOptions" ("TerminalId");
+
+CREATE TABLE IF NOT EXISTS "LinehaulReceipts" (
+    "Id" INTEGER NOT NULL CONSTRAINT "PK_LinehaulReceipts" PRIMARY KEY AUTOINCREMENT,
+    "ReceiptNumber" TEXT NOT NULL, "OwnerTerminalId" INTEGER NOT NULL,
+    "FromTerminalId" INTEGER NOT NULL, "ToTerminalId" INTEGER NOT NULL,
+    "FromTerminalSnapshot" TEXT NOT NULL, "ToTerminalSnapshot" TEXT NOT NULL,
+    "UnitReference" TEXT NOT NULL, "PalletReceiptNumber" TEXT NOT NULL DEFAULT '', "PalletCount" INTEGER NOT NULL,
+    "CommentOptionSnapshot" TEXT NOT NULL, "FreeComment" TEXT NOT NULL,
+    "BusinessDate" TEXT NOT NULL, "SubmittedAtUtc" TEXT NOT NULL, "SubmittedByUserId" INTEGER NOT NULL,
+    "Status" TEXT NOT NULL DEFAULT 'ACTIVE', "CancelledAtUtc" TEXT NULL, "CancelledByUserId" INTEGER NULL, "CancelReason" TEXT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS "IX_LinehaulReceipts_ReceiptNumber" ON "LinehaulReceipts" ("ReceiptNumber");
+CREATE INDEX IF NOT EXISTS "IX_LinehaulReceipts_FromToDate" ON "LinehaulReceipts" ("FromTerminalId", "ToTerminalId", "BusinessDate");
+
+CREATE TABLE IF NOT EXISTS "ReceivedControlEntries" (
+    "Id" INTEGER NOT NULL CONSTRAINT "PK_ReceivedControlEntries" PRIMARY KEY AUTOINCREMENT,
+    "ControlNumber" TEXT NOT NULL, "TerminalId" INTEGER NOT NULL, "FromTerminalId" INTEGER NOT NULL DEFAULT 0,
+    "FromTerminalSnapshot" TEXT NOT NULL DEFAULT '', "UnitReference" TEXT NOT NULL, "Comment" TEXT NOT NULL DEFAULT '',
+    "PalletReceiptReceived" INTEGER NOT NULL, "ReceiptPalletCount" INTEGER NULL, "ActualPalletCount" INTEGER NOT NULL,
+    "Result" TEXT NOT NULL, "BusinessDate" TEXT NOT NULL, "SubmittedAtUtc" TEXT NOT NULL, "SubmittedByUserId" INTEGER NOT NULL,
+    "Status" TEXT NOT NULL DEFAULT 'ACTIVE', "CancelledAtUtc" TEXT NULL, "CancelledByUserId" INTEGER NULL, "CancelReason" TEXT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS "IX_ReceivedControlEntries_ControlNumber" ON "ReceivedControlEntries" ("ControlNumber");
+CREATE INDEX IF NOT EXISTS "IX_ReceivedControlEntries_TerminalDate" ON "ReceivedControlEntries" ("TerminalId", "BusinessDate");
+
+CREATE TABLE IF NOT EXISTS "ReceivedControlWarnings" (
+    "Id" INTEGER NOT NULL CONSTRAINT "PK_ReceivedControlWarnings" PRIMARY KEY AUTOINCREMENT,
+    "TerminalId" INTEGER NOT NULL, "EntryId" INTEGER NOT NULL, "Message" TEXT NOT NULL,
+    "CreatedAtUtc" TEXT NOT NULL, "AcknowledgedAtUtc" TEXT NULL, "AcknowledgedByUserId" INTEGER NULL
+);
+CREATE INDEX IF NOT EXISTS "IX_ReceivedControlWarnings_TerminalAck" ON "ReceivedControlWarnings" ("TerminalId", "AcknowledgedAtUtc", "CreatedAtUtc");
+""";
+            cmd.ExecuteNonQuery();
+        }
+
+        var linehaulColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA table_info(\"LinehaulReceipts\");";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read()) linehaulColumns.Add(reader.GetString(1));
+        }
+        if (!linehaulColumns.Contains("PalletReceiptNumber"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"LinehaulReceipts\" ADD COLUMN \"PalletReceiptNumber\" TEXT NOT NULL DEFAULT '';";
+            cmd.ExecuteNonQuery();
+        }
+        if (!linehaulColumns.Contains("Status"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"LinehaulReceipts\" ADD COLUMN \"Status\" TEXT NOT NULL DEFAULT 'ACTIVE';";
+            cmd.ExecuteNonQuery();
+        }
+        if (!linehaulColumns.Contains("CancelledAtUtc"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"LinehaulReceipts\" ADD COLUMN \"CancelledAtUtc\" TEXT NULL;";
+            cmd.ExecuteNonQuery();
+        }
+        if (!linehaulColumns.Contains("CancelledByUserId"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"LinehaulReceipts\" ADD COLUMN \"CancelledByUserId\" INTEGER NULL;";
+            cmd.ExecuteNonQuery();
+        }
+        if (!linehaulColumns.Contains("CancelReason"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"LinehaulReceipts\" ADD COLUMN \"CancelReason\" TEXT NULL;";
+            cmd.ExecuteNonQuery();
+        }
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = "CREATE INDEX IF NOT EXISTS \"IX_LinehaulReceipts_PalletReceiptNumber\" ON \"LinehaulReceipts\" (\"PalletReceiptNumber\");";
+            cmd.ExecuteNonQuery();
+        }
+        // Enforce unique non-blank pallet receipt numbers at database level as well as API validation.
+        // If a legacy database already contains duplicate non-blank values, keep running and let Admin clean them up.
+        try
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "CREATE UNIQUE INDEX IF NOT EXISTS \"UX_LinehaulReceipts_PalletReceiptNumber_NotBlank\" ON \"LinehaulReceipts\" (\"PalletReceiptNumber\") WHERE \"PalletReceiptNumber\" <> '';";
+            cmd.ExecuteNonQuery();
+        }
+        catch (SqliteException) { }
+
+        var receivedColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA table_info(\"ReceivedControlEntries\");";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read()) receivedColumns.Add(reader.GetString(1));
+        }
+        if (!receivedColumns.Contains("FromTerminalId"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"ReceivedControlEntries\" ADD COLUMN \"FromTerminalId\" INTEGER NOT NULL DEFAULT 0;";
+            cmd.ExecuteNonQuery();
+        }
+        if (!receivedColumns.Contains("FromTerminalSnapshot"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"ReceivedControlEntries\" ADD COLUMN \"FromTerminalSnapshot\" TEXT NOT NULL DEFAULT '';";
+            cmd.ExecuteNonQuery();
+        }
+        if (!receivedColumns.Contains("Comment"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"ReceivedControlEntries\" ADD COLUMN \"Comment\" TEXT NOT NULL DEFAULT '';";
+            cmd.ExecuteNonQuery();
+        }
+        if (!receivedColumns.Contains("Status"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"ReceivedControlEntries\" ADD COLUMN \"Status\" TEXT NOT NULL DEFAULT 'ACTIVE';";
+            cmd.ExecuteNonQuery();
+        }
+        if (!receivedColumns.Contains("CancelledAtUtc"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"ReceivedControlEntries\" ADD COLUMN \"CancelledAtUtc\" TEXT NULL;";
+            cmd.ExecuteNonQuery();
+        }
+        if (!receivedColumns.Contains("CancelledByUserId"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"ReceivedControlEntries\" ADD COLUMN \"CancelledByUserId\" INTEGER NULL;";
+            cmd.ExecuteNonQuery();
+        }
+        if (!receivedColumns.Contains("CancelReason"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"ReceivedControlEntries\" ADD COLUMN \"CancelReason\" TEXT NULL;";
+            cmd.ExecuteNonQuery();
+        }
+
     }
     finally
     {
         if (shouldClose) connection.Close();
     }
 }
+
+
+static async Task<TerminalSettings> GetTerminalSettings(AppDbContext db, int terminalId, bool tracking = false)
+{
+    var query = tracking ? db.TerminalSettings.AsQueryable() : db.TerminalSettings.AsNoTracking();
+    var existing = await query.FirstOrDefaultAsync(x => x.TerminalId == terminalId);
+    if (existing != null) return existing;
+    await EnsureTerminalSettings(db, terminalId);
+    return tracking
+        ? await db.TerminalSettings.SingleAsync(x => x.TerminalId == terminalId)
+        : await db.TerminalSettings.AsNoTracking().SingleAsync(x => x.TerminalId == terminalId);
+}
+
+static async Task EnsureTerminalSettings(AppDbContext db, int terminalId)
+{
+    if (await db.TerminalSettings.AnyAsync(x => x.TerminalId == terminalId)) return;
+    var g = await db.Settings.AsNoTracking().SingleAsync();
+    db.TerminalSettings.Add(TerminalSettings.FromGlobal(terminalId, g));
+    await db.SaveChangesAsync();
+}
+
+static void ApplySettings(TerminalSettings s, AdminSettingsRequest req)
+{
+    s.AllowUsersAddDrivers = req.AllowUsersAddDrivers;
+    s.LargeInEnabled = req.LargeInEnabled;
+    s.LargeInThreshold = Math.Max(1, req.LargeInThreshold);
+    s.LargeOutEnabled = req.LargeOutEnabled;
+    s.LargeOutThreshold = Math.Max(1, req.LargeOutThreshold);
+    s.RecentVehicleEnabled = req.RecentVehicleEnabled;
+    s.RecentVehicleMinutes = Math.Clamp(req.RecentVehicleMinutes, 1, 1440);
+    s.RecentDriverEnabled = req.RecentDriverEnabled;
+    s.RecentDriverMinutes = Math.Clamp(req.RecentDriverMinutes, 1, 1440);
+    s.DuplicateEnabled = req.DuplicateEnabled;
+    s.DuplicateMinutes = Math.Clamp(req.DuplicateMinutes, 1, 1440);
+    s.RapidSubmissionsEnabled = req.RapidSubmissionsEnabled;
+    s.RapidSubmissionCount = Math.Clamp(req.RapidSubmissionCount, 2, 50);
+    s.RapidSubmissionMinutes = Math.Clamp(req.RapidSubmissionMinutes, 1, 1440);
+    s.DailyTotalEnabled = req.DailyTotalEnabled;
+    s.DailyTotalThreshold = Math.Max(1, req.DailyTotalThreshold);
+    s.CancellationWarningEnabled = req.CancellationWarningEnabled;
+    s.CancellationReversedWarningEnabled = req.CancellationReversedWarningEnabled;
+    s.MilestoneNotificationsEnabled = req.MilestoneNotificationsEnabled;
+    s.MonthlyMilestoneStep = Math.Max(1, req.MonthlyMilestoneStep);
+    s.LeaderboardNotificationsEnabled = req.LeaderboardNotificationsEnabled;
+    s.BalanceNotificationsEnabled = req.BalanceNotificationsEnabled;
+    s.DriverUnmatchedInDeduction = Math.Clamp(req.DriverUnmatchedInDeduction ?? s.DriverUnmatchedInDeduction, 0, 5000);
+}
+
+static object ToLinehaulDto(LinehaulReceipt x) => new
+{
+    x.Id, x.ReceiptNumber, x.BusinessDate, x.SubmittedAtUtc, x.UnitReference, x.PalletReceiptNumber, x.PalletCount,
+    x.FromTerminalId, x.ToTerminalId, fromTerminal = x.FromTerminalSnapshot, toTerminal = x.ToTerminalSnapshot,
+    standardComment = x.CommentOptionSnapshot, x.FreeComment, x.Status, x.CancelledAtUtc, x.CancelReason
+};
+
+static object ToReceivedControlDto(ReceivedControlEntry x) => new
+{
+    x.Id, x.ControlNumber, x.BusinessDate, x.SubmittedAtUtc, x.FromTerminalId, x.FromTerminalSnapshot, x.UnitReference, x.Comment,
+    x.PalletReceiptReceived, x.ReceiptPalletCount, x.ActualPalletCount, x.Result, x.Status, x.CancelledAtUtc, x.CancelReason,
+    difference = x.PalletReceiptReceived ? x.ActualPalletCount - (x.ReceiptPalletCount ?? 0) : (int?)null
+};
+
+static List<string> ParseTerminalAliases(string? value) =>
+    string.IsNullOrWhiteSpace(value)
+        ? []
+        : value.Split([',', ';', '|', '\n', '\r'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(x => !string.IsNullOrWhiteSpace(x))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+static string NormalizeTerminalLabel(string value) =>
+    new(value.Trim().Where(char.IsLetterOrDigit).Select(char.ToUpperInvariant).ToArray());
+
+static Dictionary<string, Terminal> BuildTerminalLookup(IEnumerable<Terminal> terminals)
+{
+    var result = new Dictionary<string, Terminal>(StringComparer.OrdinalIgnoreCase);
+    foreach (var terminal in terminals)
+    {
+        var labels = new List<string> { terminal.Code, terminal.Name };
+        labels.AddRange(ParseTerminalAliases(terminal.Aliases));
+        foreach (var label in labels.Where(x => !string.IsNullOrWhiteSpace(x)))
+        {
+            var normalized = NormalizeTerminalLabel(label);
+            if (normalized.Length > 0 && !result.ContainsKey(normalized)) result[normalized] = terminal;
+        }
+    }
+    return result;
+}
+
+static Terminal? ResolveImportTerminal(string value, IReadOnlyDictionary<string, Terminal> lookup, IReadOnlyList<Terminal> terminals)
+{
+    var normalized = NormalizeTerminalLabel(value);
+    if (normalized.Length == 0) return null;
+    if (lookup.TryGetValue(normalized, out var exact)) return exact;
+
+    // Common legacy convention: SRD123 / ARE01 / KRS7 where the numeric suffix was local.
+    var matches = terminals
+        .Where(t =>
+        {
+            var code = NormalizeTerminalLabel(t.Code);
+            if (code.Length == 0 || !normalized.StartsWith(code, StringComparison.OrdinalIgnoreCase)) return false;
+            var suffix = normalized[code.Length..];
+            return suffix.Length > 0 && suffix.All(char.IsDigit);
+        })
+        .ToList();
+    return matches.Count == 1 ? matches[0] : null;
+}
+
+static string NormalizeImportHeader(string value) =>
+    new(value.Trim().Trim('\uFEFF').Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
+
+static bool HasImportHeader(ImportGrid grid, params string[] aliases)
+{
+    var headers = grid.Headers.ToHashSet(StringComparer.OrdinalIgnoreCase);
+    return aliases.Select(NormalizeImportHeader).Any(headers.Contains);
+}
+
+static string ImportValue(ImportDataRow row, params string[] aliases)
+{
+    foreach (var alias in aliases)
+        if (row.Values.TryGetValue(NormalizeImportHeader(alias), out var value)) return value ?? "";
+    return "";
+}
+
+static async Task<ImportGrid> ReadImportGrid(IFormFile file)
+{
+    var extension = Path.GetExtension(file.FileName).ToLowerInvariant();
+    if (extension is not ".xlsx" and not ".csv")
+        throw new InvalidOperationException("Only .xlsx and .csv files are supported. Save old .xls files as .xlsx or CSV first.");
+
+    if (extension == ".xlsx")
+    {
+        await using var stream = file.OpenReadStream();
+        using var workbook = new XLWorkbook(stream);
+        var sheet = workbook.Worksheets.FirstOrDefault() ?? throw new InvalidOperationException("Excel workbook has no worksheet.");
+        var firstRow = sheet.FirstRowUsed() ?? throw new InvalidOperationException("Excel sheet is empty.");
+        var lastCell = firstRow.LastCellUsed() ?? throw new InvalidOperationException("Excel header row is empty.");
+        var firstRowNumber = firstRow.RowNumber();
+        var lastColumn = lastCell.Address.ColumnNumber;
+        var headers = new List<string>();
+        for (var col = 1; col <= lastColumn; col++)
+            headers.Add(NormalizeImportHeader(sheet.Cell(firstRowNumber, col).GetFormattedString()));
+
+        var rows = new List<ImportDataRow>();
+        var lastRow = sheet.LastRowUsed()?.RowNumber() ?? firstRowNumber;
+        for (var rowNumber = firstRowNumber + 1; rowNumber <= lastRow; rowNumber++)
+        {
+            var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            var hasValue = false;
+            for (var col = 1; col <= lastColumn; col++)
+            {
+                var header = headers[col - 1];
+                if (string.IsNullOrWhiteSpace(header)) continue;
+                var value = sheet.Cell(rowNumber, col).GetFormattedString().Trim();
+                if (!string.IsNullOrWhiteSpace(value)) hasValue = true;
+                values[header] = value;
+            }
+            if (hasValue) rows.Add(new ImportDataRow(rowNumber, values));
+        }
+        return new ImportGrid(headers.Where(x => !string.IsNullOrWhiteSpace(x)).ToList(), rows);
+    }
+
+    string text;
+    await using (var stream = file.OpenReadStream())
+    using (var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true))
+        text = await reader.ReadToEndAsync();
+
+    var delimiter = DetectCsvDelimiter(text);
+    var parsed = ParseCsvText(text, delimiter).Where(r => r.Any(v => !string.IsNullOrWhiteSpace(v))).ToList();
+    if (parsed.Count == 0) throw new InvalidOperationException("CSV file is empty.");
+    var csvHeaders = parsed[0].Select(NormalizeImportHeader).ToList();
+    var csvRows = new List<ImportDataRow>();
+    for (var i = 1; i < parsed.Count; i++)
+    {
+        var values = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        for (var col = 0; col < csvHeaders.Count; col++)
+        {
+            var header = csvHeaders[col];
+            if (string.IsNullOrWhiteSpace(header)) continue;
+            values[header] = col < parsed[i].Count ? parsed[i][col].Trim() : "";
+        }
+        csvRows.Add(new ImportDataRow(i + 1, values));
+    }
+    return new ImportGrid(csvHeaders.Where(x => !string.IsNullOrWhiteSpace(x)).ToList(), csvRows);
+}
+
+static char DetectCsvDelimiter(string text)
+{
+    var firstLine = text.Replace("\r\n", "\n").Split('\n').FirstOrDefault(x => !string.IsNullOrWhiteSpace(x)) ?? "";
+    var comma = 0; var semicolon = 0; var quoted = false;
+    for (var i = 0; i < firstLine.Length; i++)
+    {
+        if (firstLine[i] == '"')
+        {
+            if (quoted && i + 1 < firstLine.Length && firstLine[i + 1] == '"') { i++; continue; }
+            quoted = !quoted;
+        }
+        else if (!quoted && firstLine[i] == ',') comma++;
+        else if (!quoted && firstLine[i] == ';') semicolon++;
+    }
+    return semicolon > comma ? ';' : ',';
+}
+
+static List<List<string>> ParseCsvText(string text, char delimiter)
+{
+    var rows = new List<List<string>>();
+    var row = new List<string>();
+    var field = new StringBuilder();
+    var quoted = false;
+    for (var i = 0; i < text.Length; i++)
+    {
+        var c = text[i];
+        if (c == '"')
+        {
+            if (quoted && i + 1 < text.Length && text[i + 1] == '"') { field.Append('"'); i++; }
+            else quoted = !quoted;
+            continue;
+        }
+        if (!quoted && c == delimiter)
+        {
+            row.Add(field.ToString()); field.Clear(); continue;
+        }
+        if (!quoted && (c == '\r' || c == '\n'))
+        {
+            if (c == '\r' && i + 1 < text.Length && text[i + 1] == '\n') i++;
+            row.Add(field.ToString()); field.Clear();
+            if (row.Any(x => !string.IsNullOrWhiteSpace(x))) rows.Add(row);
+            row = new List<string>();
+            continue;
+        }
+        field.Append(c);
+    }
+    if (field.Length > 0 || row.Count > 0)
+    {
+        row.Add(field.ToString());
+        if (row.Any(x => !string.IsNullOrWhiteSpace(x))) rows.Add(row);
+    }
+    return rows;
+}
+
+static bool TryParseImportDate(string value, out DateOnly date)
+{
+    date = default;
+    var text = (value ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(text)) return false;
+    foreach (var format in new[] { "yyyy-MM-dd", "dd.MM.yyyy", "d.M.yyyy", "dd/MM/yyyy", "d/M/yyyy", "MM/dd/yyyy", "M/d/yyyy" })
+        if (DateOnly.TryParseExact(text, format, CultureInfo.InvariantCulture, DateTimeStyles.None, out date)) return true;
+    if (DateTime.TryParse(text, CultureInfo.GetCultureInfo("nb-NO"), DateTimeStyles.AllowWhiteSpaces, out var nbDate))
+    { date = DateOnly.FromDateTime(nbDate); return true; }
+    if (DateTime.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.AllowWhiteSpaces, out var invariantDate))
+    { date = DateOnly.FromDateTime(invariantDate); return true; }
+    if (double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var oa) && oa > 1 && oa < 100000)
+    { date = DateOnly.FromDateTime(DateTime.FromOADate(oa)); return true; }
+    return false;
+}
+
+static bool TryParseImportInt(string value, out int result)
+{
+    result = 0;
+    var text = (value ?? "").Trim();
+    if (int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out result)) return true;
+    if (int.TryParse(text, NumberStyles.Integer, CultureInfo.GetCultureInfo("nb-NO"), out result)) return true;
+    if (decimal.TryParse(text, NumberStyles.Number, CultureInfo.InvariantCulture, out var dec) && dec == decimal.Truncate(dec) && dec >= int.MinValue && dec <= int.MaxValue)
+    { result = (int)dec; return true; }
+    if (decimal.TryParse(text, NumberStyles.Number, CultureInfo.GetCultureInfo("nb-NO"), out dec) && dec == decimal.Truncate(dec) && dec >= int.MinValue && dec <= int.MaxValue)
+    { result = (int)dec; return true; }
+    return false;
+}
+
+static bool TryParseImportBool(string value, out bool result)
+{
+    var text = NormalizeImportHeader(value ?? "");
+    if (text is "yes" or "ja" or "true" or "1" or "y" or "j" or "received" or "mottatt") { result = true; return true; }
+    if (text is "no" or "nei" or "false" or "0" or "n" or "notreceived" or "ikkemottatt") { result = false; return true; }
+    result = false; return false;
+}
+
+static string LinehaulImportKey(DateOnly date, int fromId, int toId, string reference, string palletReceiptNumber, int pallets) =>
+    $"{date:yyyy-MM-dd}|{fromId}|{toId}|{reference.Trim().ToUpperInvariant()}|{palletReceiptNumber.Trim().ToUpperInvariant()}|{pallets}";
+
+static string ReceivedControlImportKey(DateOnly date, int fromTerminalId, string reference, bool received, int? receiptPallets, int actualPallets, string comment) =>
+    $"{date:yyyy-MM-dd}|{fromTerminalId}|{reference.Trim().ToUpperInvariant()}|{received}|{receiptPallets?.ToString(CultureInfo.InvariantCulture) ?? ""}|{actualPallets}|{comment.Trim().ToUpperInvariant()}";
 
 static string Csv(string value) => $"\"{value.Replace("\"", "\"\"")}\"";
 
@@ -2716,7 +4438,7 @@ static async Task<List<SubmissionWarningDto>> EvaluateSubmissionWarnings(
     List<ReceiptItemRequest> items,
     AppDbContext db)
 {
-    var settings = await db.Settings.AsNoTracking().SingleAsync();
+    var settings = await GetTerminalSettings(db, vehicle.TerminalId);
     var now = DateTime.UtcNow;
     var total = items.Sum(x => x.Quantity);
     var direction = req.Direction.Trim().ToUpperInvariant();
@@ -2827,7 +4549,7 @@ static async Task<List<string>> BuildSubmitNotifications(
     ClaimsPrincipal principal,
     AppDbContext db)
 {
-    var settings = await db.Settings.AsNoTracking().SingleAsync();
+    var settings = await GetTerminalSettings(db, receipt.TerminalId);
     var currentUserId = UserId(principal);
     var user = await db.Users.AsNoTracking().SingleAsync(x => x.Id == currentUserId);
     var notifications = new List<string>();
@@ -3019,21 +4741,26 @@ static void Seed(AppDbContext db)
         db.SaveChanges();
     }
 
+    foreach (var terminalId in db.Terminals.Select(x => x.Id).ToList())
+        EnsureTerminalSettings(db, terminalId).GetAwaiter().GetResult();
+
     if (!isFreshDatabase)
     {
         // v5.4.3 adds ARE as a real terminal. Add it once to existing databases
         // without recreating any master data that an Admin intentionally deleted.
         if (!db.Terminals.Any(x => x.Code == "ARE"))
         {
-            db.Terminals.Add(new Terminal { Code = "ARE", Name = "Arendal" });
+            db.Terminals.Add(new Terminal { Code = "ARE", Name = "Arendal", Active = true });
             db.SaveChanges();
         }
+        foreach (var terminalId in db.Terminals.Select(x => x.Id).ToList())
+            EnsureTerminalSettings(db, terminalId).GetAwaiter().GetResult();
         return;
     }
 
-    var srd = new Terminal { Code = "SRD", Name = "Sandefjord" };
-    var krs = new Terminal { Code = "KRS", Name = "Kristiansand" };
-    var are = new Terminal { Code = "ARE", Name = "Arendal" };
+    var srd = new Terminal { Code = "SRD", Name = "Sandefjord", Active = true };
+    var krs = new Terminal { Code = "KRS", Name = "Kristiansand", Active = true };
+    var are = new Terminal { Code = "ARE", Name = "Arendal", Active = true };
     db.Terminals.AddRange(srd, krs, are);
 
     db.PalletTypes.AddRange(
@@ -3046,6 +4773,9 @@ static void Seed(AppDbContext db)
     db.Transporters.AddRange(telemark, frode);
 
     db.SaveChanges();
+    EnsureTerminalSettings(db, srd.Id).GetAwaiter().GetResult();
+    EnsureTerminalSettings(db, krs.Id).GetAwaiter().GetResult();
+    EnsureTerminalSettings(db, are.Id).GetAwaiter().GetResult();
 
     db.Vehicles.AddRange(
         new Vehicle { VehicleId = "VTM3241", TerminalId = srd.Id, TransporterId = telemark.Id, Active = true },
@@ -3057,7 +4787,7 @@ static void Seed(AppDbContext db)
         new Driver { Name = "Test Driver", TerminalId = srd.Id, Active = true },
         new Driver { Name = "John Smith", TerminalId = srd.Id, Active = true });
 
-    AddUser("admin", "Administrator", Roles.Admin, "admin123");
+    AddUser("admin", "Administrator", Roles.SuperAdmin, "admin123");
     AddUser("super", "Super User", Roles.Superuser, "super123");
     AddUser("user", "Terminal User", Roles.User, "user123");
 
@@ -3230,9 +4960,11 @@ public sealed record ExportTable(string Name, List<string> Headers, List<List<ob
 
 public static class Roles
 {
-    public const string Admin = "Admin";
+    public const string SuperAdmin = "SuperAdmin";
+    public const string TerminalAdmin = "TerminalAdmin";
     public const string Superuser = "Superuser";
     public const string User = "User";
+    public const string LegacyAdmin = "Admin";
 }
 
 public static class ReceiptStatus
@@ -3255,7 +4987,12 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     public DbSet<WarningEvent> WarningEvents => Set<WarningEvent>();
     public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
     public DbSet<AppSettings> Settings => Set<AppSettings>();
+    public DbSet<TerminalSettings> TerminalSettings => Set<TerminalSettings>();
     public DbSet<Holiday> Holidays => Set<Holiday>();
+    public DbSet<LinehaulReceipt> LinehaulReceipts => Set<LinehaulReceipt>();
+    public DbSet<LinehaulCommentOption> LinehaulCommentOptions => Set<LinehaulCommentOption>();
+    public DbSet<ReceivedControlEntry> ReceivedControlEntries => Set<ReceivedControlEntry>();
+    public DbSet<ReceivedControlWarning> ReceivedControlWarnings => Set<ReceivedControlWarning>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -3267,6 +5004,14 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         b.Entity<PalletReceipt>().HasIndex(x => x.IdempotencyKey).IsUnique();
         b.Entity<WarningEvent>().HasIndex(x => new { x.TerminalId, x.AcknowledgedAtUtc, x.CreatedAtUtc });
         b.Entity<Holiday>().HasIndex(x => x.Date).IsUnique();
+        b.Entity<TerminalSettings>().HasIndex(x => x.TerminalId).IsUnique();
+        b.Entity<LinehaulReceipt>().HasIndex(x => x.ReceiptNumber).IsUnique();
+        b.Entity<LinehaulReceipt>().HasIndex(x => x.PalletReceiptNumber);
+        b.Entity<LinehaulReceipt>().HasIndex(x => new { x.FromTerminalId, x.ToTerminalId, x.BusinessDate });
+        b.Entity<LinehaulCommentOption>().HasIndex(x => x.TerminalId);
+        b.Entity<ReceivedControlEntry>().HasIndex(x => x.ControlNumber).IsUnique();
+        b.Entity<ReceivedControlEntry>().HasIndex(x => new { x.TerminalId, x.FromTerminalId, x.BusinessDate });
+        b.Entity<ReceivedControlWarning>().HasIndex(x => new { x.TerminalId, x.AcknowledgedAtUtc, x.CreatedAtUtc });
         b.Entity<Vehicle>().Property(x => x.OperatingDays).HasDefaultValue("1,2,3,4,5");
 
         b.Entity<Vehicle>()
@@ -3343,6 +5088,11 @@ public class AppUser
     public bool ShowDriverStatisticsTab { get; set; } = true;
     public bool ShowDailyCheckTab { get; set; } = true;
 
+    // Operational modules can be combined freely on one user.
+    public bool HasInternalPalletAccounting { get; set; } = true;
+    public bool HasLinehaul { get; set; } = false;
+    public bool HasReceivedControl { get; set; } = false;
+
     [JsonIgnore] public Terminal? Terminal { get; set; }
 }
 
@@ -3351,6 +5101,8 @@ public class Terminal
     public int Id { get; set; }
     public string Code { get; set; } = "";
     public string Name { get; set; } = "";
+    public string Aliases { get; set; } = "";
+    public bool Active { get; set; } = true;
 }
 
 public class Transporter
@@ -3482,6 +5234,132 @@ public class AuditLog
     public DateTime CreatedAtUtc { get; set; }
 }
 
+
+public class TerminalSettings
+{
+    public int Id { get; set; }
+    public int TerminalId { get; set; }
+    public bool AllowUsersAddDrivers { get; set; } = true;
+    public bool LargeInEnabled { get; set; } = true;
+    public int LargeInThreshold { get; set; } = 20;
+    public bool LargeOutEnabled { get; set; } = true;
+    public int LargeOutThreshold { get; set; } = 20;
+    public bool RecentVehicleEnabled { get; set; } = true;
+    public int RecentVehicleMinutes { get; set; } = 5;
+    public bool RecentDriverEnabled { get; set; } = true;
+    public int RecentDriverMinutes { get; set; } = 5;
+    public bool DuplicateEnabled { get; set; } = true;
+    public int DuplicateMinutes { get; set; } = 5;
+    public bool RapidSubmissionsEnabled { get; set; } = true;
+    public int RapidSubmissionCount { get; set; } = 3;
+    public int RapidSubmissionMinutes { get; set; } = 10;
+    public bool DailyTotalEnabled { get; set; } = true;
+    public int DailyTotalThreshold { get; set; } = 60;
+    public bool CancellationWarningEnabled { get; set; } = true;
+    public bool CancellationReversedWarningEnabled { get; set; } = true;
+    public bool MilestoneNotificationsEnabled { get; set; } = true;
+    public int MonthlyMilestoneStep { get; set; } = 100;
+    public bool LeaderboardNotificationsEnabled { get; set; } = true;
+    public bool BalanceNotificationsEnabled { get; set; } = true;
+    public int DriverUnmatchedInDeduction { get; set; } = 15;
+
+    public static TerminalSettings FromGlobal(int terminalId, AppSettings g) => new()
+    {
+        TerminalId = terminalId,
+        AllowUsersAddDrivers = g.AllowUsersAddDrivers,
+        LargeInEnabled = g.LargeInEnabled, LargeInThreshold = g.LargeInThreshold,
+        LargeOutEnabled = g.LargeOutEnabled, LargeOutThreshold = g.LargeOutThreshold,
+        RecentVehicleEnabled = g.RecentVehicleEnabled, RecentVehicleMinutes = g.RecentVehicleMinutes,
+        RecentDriverEnabled = g.RecentDriverEnabled, RecentDriverMinutes = g.RecentDriverMinutes,
+        DuplicateEnabled = g.DuplicateEnabled, DuplicateMinutes = g.DuplicateMinutes,
+        RapidSubmissionsEnabled = g.RapidSubmissionsEnabled, RapidSubmissionCount = g.RapidSubmissionCount, RapidSubmissionMinutes = g.RapidSubmissionMinutes,
+        DailyTotalEnabled = g.DailyTotalEnabled, DailyTotalThreshold = g.DailyTotalThreshold,
+        CancellationWarningEnabled = g.CancellationWarningEnabled, CancellationReversedWarningEnabled = g.CancellationReversedWarningEnabled,
+        MilestoneNotificationsEnabled = g.MilestoneNotificationsEnabled, MonthlyMilestoneStep = g.MonthlyMilestoneStep,
+        LeaderboardNotificationsEnabled = g.LeaderboardNotificationsEnabled, BalanceNotificationsEnabled = g.BalanceNotificationsEnabled,
+        DriverUnmatchedInDeduction = g.DriverUnmatchedInDeduction
+    };
+}
+
+public class LinehaulCommentOption
+{
+    public int Id { get; set; }
+    public int TerminalId { get; set; }
+    public string Text { get; set; } = "";
+    public bool Active { get; set; } = true;
+}
+
+public class LinehaulReceipt
+{
+    public int Id { get; set; }
+    public string ReceiptNumber { get; set; } = "";
+    public int OwnerTerminalId { get; set; }
+    public int FromTerminalId { get; set; }
+    public int ToTerminalId { get; set; }
+    public string FromTerminalSnapshot { get; set; } = "";
+    public string ToTerminalSnapshot { get; set; } = "";
+    public string UnitReference { get; set; } = "";
+    public string PalletReceiptNumber { get; set; } = "";
+    public int PalletCount { get; set; }
+    public string CommentOptionSnapshot { get; set; } = "";
+    public string FreeComment { get; set; } = "";
+    public DateOnly BusinessDate { get; set; }
+    public DateTime SubmittedAtUtc { get; set; }
+    public int SubmittedByUserId { get; set; }
+    public string Status { get; set; } = ReceiptStatus.Active;
+    public DateTime? CancelledAtUtc { get; set; }
+    public int? CancelledByUserId { get; set; }
+    public string? CancelReason { get; set; }
+}
+
+public static class ReceivedControlStatus
+{
+    public const string NoReceipt = "NO_RECEIPT";
+    public const string ReceiptHigher = "RECEIPT_HIGHER";
+    public const string ReceiptLower = "RECEIPT_LOWER";
+    public const string Exact = "EXACT";
+    public static string Resolve(bool received, int? receiptQty, int actualQty)
+    {
+        if (!received) return NoReceipt;
+        if ((receiptQty ?? 0) > actualQty) return ReceiptHigher;
+        if ((receiptQty ?? 0) < actualQty) return ReceiptLower;
+        return Exact;
+    }
+}
+
+public class ReceivedControlEntry
+{
+    public int Id { get; set; }
+    public string ControlNumber { get; set; } = "";
+    public int TerminalId { get; set; }
+    public int FromTerminalId { get; set; }
+    public string FromTerminalSnapshot { get; set; } = "";
+    public string UnitReference { get; set; } = "";
+    public string Comment { get; set; } = "";
+    public bool PalletReceiptReceived { get; set; }
+    public int? ReceiptPalletCount { get; set; }
+    public int ActualPalletCount { get; set; }
+    public string Result { get; set; } = ReceivedControlStatus.NoReceipt;
+    public DateOnly BusinessDate { get; set; }
+    public DateTime SubmittedAtUtc { get; set; }
+    public int SubmittedByUserId { get; set; }
+    public string Status { get; set; } = ReceiptStatus.Active;
+    public DateTime? CancelledAtUtc { get; set; }
+    public int? CancelledByUserId { get; set; }
+    public string? CancelReason { get; set; }
+}
+
+public class ReceivedControlWarning
+{
+    public int Id { get; set; }
+    public int TerminalId { get; set; }
+    public int EntryId { get; set; }
+    public string Message { get; set; } = "";
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime? AcknowledgedAtUtc { get; set; }
+    public int? AcknowledgedByUserId { get; set; }
+}
+
 public class AppSettings
 {
     public int Id { get; set; } = 1;
@@ -3594,7 +5472,7 @@ public record ReceiptValidation(string? Error, Vehicle? Vehicle, Driver? Driver,
 }
 
 public record LoginRequest(string Username, string Password);
-public record LoginResponse(string Token, string Username, string DisplayName, string Role, int TerminalId, string TerminalCode, bool ShowDriverStatisticsTab, bool ShowDailyCheckTab);
+public record LoginResponse(string Token, string Username, string DisplayName, string Role, int TerminalId, string TerminalCode, bool ShowDriverStatisticsTab, bool ShowDailyCheckTab, bool HasInternalPalletAccounting, bool HasLinehaul, bool HasReceivedControl);
 public record QuickDriverRequest(string Name);
 public record ReceiptItemRequest(int PalletTypeId, int Quantity);
 public record CreateReceiptRequest(string IdempotencyKey, int VehicleId, int DriverId, string Direction, List<ReceiptItemRequest> Items, bool ConfirmWarnings = false, DateOnly? BusinessDate = null);
@@ -3610,8 +5488,8 @@ public record AdminHolidayRequest(DateOnly Date, string? Name);
 public record AdminDriverRequest(string Name, int TerminalId);
 public record AdminPalletTypeRequest(string Name, bool UserSelectable);
 public record AdminPalletTypeUpdate(bool Active, bool UserSelectable);
-public record AdminUserRequest(string Username, string DisplayName, string Password, string Role, int TerminalId);
-public record AdminUserUpdateRequest(string DisplayName, string Role, int TerminalId, bool Active);
+public record AdminUserRequest(string Username, string DisplayName, string Password, string Role, int TerminalId, bool HasInternalPalletAccounting, bool HasLinehaul, bool HasReceivedControl, bool ShowDriverStatisticsTab = true, bool ShowDailyCheckTab = true);
+public record AdminUserUpdateRequest(string DisplayName, string Role, int TerminalId, bool Active, bool HasInternalPalletAccounting, bool HasLinehaul, bool HasReceivedControl, bool ShowDriverStatisticsTab = true, bool ShowDailyCheckTab = true);
 public record AdminPasswordRequest(string Password);
 public record AdminTabAccessRequest(bool ShowDriverStatisticsTab, bool ShowDailyCheckTab);
 public record AdminActiveRequest(bool Active);
@@ -3639,5 +5517,17 @@ public record AdminSettingsRequest(
     bool LeaderboardNotificationsEnabled,
     bool BalanceNotificationsEnabled,
     int? DriverUnmatchedInDeduction);
+
+
+public record AdminTerminalRequest(string? Code, string? Name, string? Aliases);
+public record AdminTerminalUpdateRequest(string? Code, string? Name, string? Aliases, bool Active);
+public record AdminLinehaulCommentRequest(int? TerminalId, string? Text);
+public record CreateLinehaulReceiptRequest(string? UnitReference, string? PalletReceiptNumber, int PalletCount, int FromTerminalId, int ToTerminalId, int? CommentOptionId, string? FreeComment, DateOnly? BusinessDate);
+public record CreateReceivedControlRequest(int FromTerminalId, string? UnitReference, string? Comment, bool PalletReceiptReceived, int? ReceiptPalletCount, int ActualPalletCount, DateOnly? BusinessDate);
+public sealed record ImportIssue(int Row, string Message);
+public sealed record ImportDataRow(int RowNumber, Dictionary<string, string> Values);
+public sealed record ImportGrid(List<string> Headers, List<ImportDataRow> Rows);
+public sealed record PendingLinehaulImport(int RowNumber, DateOnly BusinessDate, string UnitReference, string PalletReceiptNumber, int PalletCount, int FromTerminalId, int ToTerminalId, string FromTerminalCode, string ToTerminalCode, string StandardComment, string FreeComment, string DuplicateKey);
+public sealed record PendingReceivedControlImport(int RowNumber, DateOnly BusinessDate, int FromTerminalId, string FromTerminalCode, string UnitReference, bool PalletReceiptReceived, int? ReceiptPalletCount, int ActualPalletCount, string Comment, string DuplicateKey);
 
 public partial class Program { }

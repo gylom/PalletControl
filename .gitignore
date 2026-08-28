@@ -1,8 +1,21 @@
+# .NET build output
 **/bin/
 **/obj/
+
+# Frontend
 frontend/node_modules/
 frontend/dist/
+
+# PalletControl SQLite data / backups
 *.db
 *.db-shm
 *.db-wal
+**/Backups/
+
+# Local secrets
 .env
+
+# Rider / IDE user-specific files
+.idea/
+*.DotSettings.user
+.vs/

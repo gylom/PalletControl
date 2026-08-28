@@ -3,10 +3,10 @@ import { createRoot } from 'react-dom/client'
 import './styles.css'
 
 const API = '/api'
-const BUILD_VERSION = '5.7.4'
+const BUILD_VERSION = '5.8.5'
 const BUILD_CREDIT = 'Developed by Gytis Lukosevicius'
 
-console.info(`PalletControl frontend v${BUILD_VERSION} - settings driver management, password help and build footer enabled`)
+console.info(`PalletControl frontend v${BUILD_VERSION} - multi-module terminal accounting with historical import enabled`)
 
 class ApiError extends Error {
   constructor(message, status, data) {
@@ -100,6 +100,29 @@ async function api(path, opts = {}) {
     throw new ApiError(message, res.status, data)
   }
   return data
+}
+
+async function downloadApiFile(path, fallbackName) {
+  const token = localStorage.getItem('token')
+  const res = await fetch(API + path, { headers: token ? { Authorization: `Bearer ${token}` } : {} })
+  if (!res.ok) {
+    let message = `Download failed (${res.status})`
+    try { const data = await res.json(); message = data?.message || message } catch {}
+    throw new Error(message)
+  }
+  const blob = await res.blob()
+  const disposition = res.headers.get('content-disposition') || ''
+  const match = disposition.match(/filename\*?=(?:UTF-8''|")?([^";]+)/i)
+  const name = match ? decodeURIComponent(match[1].replace(/"/g, '')) : fallbackName
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a'); a.href = url; a.download = name; a.click(); URL.revokeObjectURL(url)
+}
+
+function firstAllowedTab(me) {
+  if (me?.hasInternalPalletAccounting) return 'register'
+  if (me?.hasLinehaul) return 'linehaulRegister'
+  if (me?.hasReceivedControl) return 'receivedRegister'
+  return 'settings'
 }
 
 function App() {
@@ -210,18 +233,30 @@ function Login({ onLogin }) {
 }
 
 function Shell({ me, logout }) {
-  const [tab, setTab] = useState('register')
-  const elevated = me.role === 'Admin' || me.role === 'Superuser'
+  const [tab, setTab] = useState(() => firstAllowedTab(me))
+  const isSuperAdmin = me.role === 'SuperAdmin' || me.role === 'Admin'
+  const isTerminalAdmin = me.role === 'TerminalAdmin'
+  const adminAccess = isSuperAdmin || isTerminalAdmin
+  const elevated = adminAccess || me.role === 'Superuser'
+  const hasInternal = me.hasInternalPalletAccounting === true
+  const hasLinehaul = me.hasLinehaul === true
+  const hasReceivedControl = me.hasReceivedControl === true
   const showDriverStatisticsTab = me.showDriverStatisticsTab !== false
   const showDailyCheckTab = me.showDailyCheckTab !== false
   const terminalKey = `${me.terminalId}-${me.terminalCode}`
 
   useEffect(() => {
-    if (tab === 'admin' && me.role !== 'Admin') setTab('register')
+    const internalTabs = ['register', 'stats', 'driverStats', 'dailyCheck', 'receipts', 'warnings', 'export']
+    const linehaulTabs = ['linehaulRegister', 'linehaulReceipts', 'linehaulStats', 'linehaulExport', 'linehaulImport']
+    const receivedTabs = ['receivedRegister', 'receivedStats', 'receivedWarnings', 'receivedExport', 'receivedImport']
+    if (internalTabs.includes(tab) && !hasInternal) setTab(firstAllowedTab(me))
+    if (linehaulTabs.includes(tab) && !hasLinehaul) setTab(firstAllowedTab(me))
+    if (receivedTabs.includes(tab) && !hasReceivedControl) setTab(firstAllowedTab(me))
+    if (tab === 'admin' && !adminAccess) setTab(firstAllowedTab(me))
     if ((tab === 'warnings' || tab === 'export') && !elevated) setTab('register')
     if (tab === 'driverStats' && !showDriverStatisticsTab) setTab('register')
     if (tab === 'dailyCheck' && !showDailyCheckTab) setTab('register')
-  }, [tab, me.role, elevated, showDriverStatisticsTab, showDailyCheckTab])
+  }, [tab, me, hasInternal, hasLinehaul, hasReceivedControl, adminAccess, elevated, showDriverStatisticsTab, showDailyCheckTab])
 
   return <div>
     <header>
@@ -229,30 +264,76 @@ function Shell({ me, logout }) {
       <div className="userline">{me.displayName} · {me.role}<button className="linkbtn" onClick={logout}>Log out</button></div>
     </header>
 
-    <nav>
-      <NavButton id="register" tab={tab} setTab={setTab}>Register</NavButton>
-      <NavButton id="stats" tab={tab} setTab={setTab}>Statistics</NavButton>
-      {showDriverStatisticsTab && <NavButton id="driverStats" tab={tab} setTab={setTab}>Statistics Driver</NavButton>}
-      {showDailyCheckTab && <NavButton id="dailyCheck" tab={tab} setTab={setTab}>Daily Check</NavButton>}
-      <NavButton id="receipts" tab={tab} setTab={setTab}>Receipts</NavButton>
-      {elevated && <NavButton id="warnings" tab={tab} setTab={setTab}>Warnings</NavButton>}
-      {elevated && <NavButton id="export" tab={tab} setTab={setTab}>Export</NavButton>}
-      <NavButton id="settings" tab={tab} setTab={setTab}>Settings</NavButton>
-      {me.role === 'Admin' && <NavButton id="admin" tab={tab} setTab={setTab}>Admin</NavButton>}
+    <nav className="moduleNav">
+      {hasInternal && <div className="navGroup navInternal">
+        <span className="navGroupTitle">InternPalleregnskap</span>
+        <div className="navGroupButtons">
+          <NavButton id="register" tab={tab} setTab={setTab}>Register</NavButton>
+          <NavButton id="stats" tab={tab} setTab={setTab}>Statistics</NavButton>
+          {showDriverStatisticsTab && <NavButton id="driverStats" tab={tab} setTab={setTab}>Statistics Driver</NavButton>}
+          {showDailyCheckTab && <NavButton id="dailyCheck" tab={tab} setTab={setTab}>Daily Check</NavButton>}
+          <NavButton id="receipts" tab={tab} setTab={setTab}>Receipts</NavButton>
+          {elevated && <NavButton id="warnings" tab={tab} setTab={setTab}>Warnings</NavButton>}
+          {elevated && <NavButton id="export" tab={tab} setTab={setTab}>Export</NavButton>}
+        </div>
+      </div>}
+
+      {hasLinehaul && <div className="navGroup navLinehaul">
+        <span className="navGroupTitle">Linehaul</span>
+        <div className="navGroupButtons">
+          <NavButton id="linehaulRegister" tab={tab} setTab={setTab}>Register</NavButton>
+          <NavButton id="linehaulReceipts" tab={tab} setTab={setTab}>Receipts</NavButton>
+          <NavButton id="linehaulStats" tab={tab} setTab={setTab}>Statistics</NavButton>
+          <NavButton id="linehaulExport" tab={tab} setTab={setTab}>Export</NavButton>
+          {adminAccess && <NavButton id="linehaulImport" tab={tab} setTab={setTab}>Import</NavButton>}
+        </div>
+      </div>}
+
+      {hasReceivedControl && <div className="navGroup navReceived">
+        <span className="navGroupTitle">MottattKontroll</span>
+        <div className="navGroupButtons">
+          <NavButton id="receivedRegister" tab={tab} setTab={setTab}>Register</NavButton>
+          <NavButton id="receivedStats" tab={tab} setTab={setTab}>Statistics</NavButton>
+          <NavButton id="receivedWarnings" tab={tab} setTab={setTab}>Warnings</NavButton>
+          <NavButton id="receivedExport" tab={tab} setTab={setTab}>Export</NavButton>
+          {adminAccess && <NavButton id="receivedImport" tab={tab} setTab={setTab}>Import</NavButton>}
+        </div>
+      </div>}
+
+      <div className="navGroup navUtility">
+        <span className="navGroupTitle">Account</span>
+        <div className="navGroupButtons">
+          <NavButton id="settings" tab={tab} setTab={setTab}>Settings</NavButton>
+          {adminAccess && <NavButton id="admin" tab={tab} setTab={setTab}>Admin</NavButton>}
+        </div>
+      </div>
     </nav>
 
     <div className="healthBarWrap"><HealthCheck /></div>
 
     <main>
-      {tab === 'register' && <Register key={`register-${terminalKey}`} me={me} />}
-      {tab === 'stats' && <Stats key={`stats-${terminalKey}`} me={me} />}
-      {tab === 'driverStats' && showDriverStatisticsTab && <DriverStats key={`driver-stats-${terminalKey}`} me={me} />}
-      {tab === 'dailyCheck' && showDailyCheckTab && <DailyVehicleCheck key={`daily-check-${terminalKey}`} me={me} />}
-      {tab === 'receipts' && <Receipts key={`receipts-${terminalKey}`} me={me} />}
-      {tab === 'warnings' && elevated && <Warnings key={`warnings-${terminalKey}`} me={me} />}
-      {tab === 'export' && elevated && <Export key={`export-${terminalKey}`} me={me} />}
+      {tab === 'register' && hasInternal && <Register key={`register-${terminalKey}`} me={me} />}
+      {tab === 'stats' && hasInternal && <Stats key={`stats-${terminalKey}`} me={me} />}
+      {tab === 'driverStats' && hasInternal && showDriverStatisticsTab && <DriverStats key={`driver-stats-${terminalKey}`} me={me} />}
+      {tab === 'dailyCheck' && hasInternal && showDailyCheckTab && <DailyVehicleCheck key={`daily-check-${terminalKey}`} me={me} />}
+      {tab === 'receipts' && hasInternal && <Receipts key={`receipts-${terminalKey}`} me={me} />}
+      {tab === 'warnings' && hasInternal && elevated && <Warnings key={`warnings-${terminalKey}`} me={me} />}
+      {tab === 'export' && hasInternal && elevated && <Export key={`export-${terminalKey}`} me={me} />}
+
+      {tab === 'linehaulRegister' && hasLinehaul && <LinehaulRegister key={`lh-reg-${terminalKey}`} me={me} />}
+      {tab === 'linehaulReceipts' && hasLinehaul && <LinehaulReceipts key={`lh-rec-${terminalKey}`} me={me} />}
+      {tab === 'linehaulStats' && hasLinehaul && <LinehaulStats key={`lh-stats-${terminalKey}`} me={me} />}
+      {tab === 'linehaulExport' && hasLinehaul && <LinehaulExport key={`lh-exp-${terminalKey}`} me={me} />}
+      {tab === 'linehaulImport' && hasLinehaul && adminAccess && <LinehaulImport key={`lh-imp-${terminalKey}`} me={me} />}
+
+      {tab === 'receivedRegister' && hasReceivedControl && <ReceivedControlRegister key={`rc-reg-${terminalKey}`} me={me} />}
+      {tab === 'receivedStats' && hasReceivedControl && <ReceivedControlStats key={`rc-stats-${terminalKey}`} me={me} />}
+      {tab === 'receivedWarnings' && hasReceivedControl && <ReceivedControlWarnings key={`rc-warn-${terminalKey}`} me={me} />}
+      {tab === 'receivedExport' && hasReceivedControl && <ReceivedControlExport key={`rc-exp-${terminalKey}`} me={me} />}
+      {tab === 'receivedImport' && hasReceivedControl && adminAccess && <ReceivedControlImport key={`rc-imp-${terminalKey}`} me={me} />}
+
       {tab === 'settings' && <UserSettings me={me} />}
-      {tab === 'admin' && me.role === 'Admin' && <Admin />}
+      {tab === 'admin' && adminAccess && <Admin me={me} />}
     </main>
   </div>
 }
@@ -327,7 +408,7 @@ function HealthDot({ label, value }) {
 }
 
 function Register({ me }) {
-  const elevated = me.role === 'Admin' || me.role === 'Superuser'
+  const elevated = ['SuperAdmin', 'TerminalAdmin', 'Admin', 'Superuser'].includes(me.role)
   const [data, setData] = useState(null)
   const [vehicle, setVehicle] = useState('')
   const [driver, setDriver] = useState('')
@@ -1097,7 +1178,7 @@ function MultiSelect({
 function StatCard({ label, value, cls = '' }) { return <div className="statCard"><span>{label}</span><strong className={cls}>{value}</strong></div> }
 
 function Receipts({ me }) {
-  const elevated = me.role === 'Admin' || me.role === 'Superuser'
+  const elevated = ['SuperAdmin', 'TerminalAdmin', 'Admin', 'Superuser'].includes(me.role)
   const [date, setDate] = useState(dateInput())
   const [limit, setLimit] = useState('25')
   const [sort, setSort] = useState('desc')
@@ -1252,6 +1333,322 @@ function Warnings({ me }) {
   </section>
 }
 
+
+function PeriodFilter({ preset, setPreset, from, setFrom, to, setTo }) {
+  function change(value) {
+    setPreset(value)
+    if (value !== 'custom') { const d = periodDates(value); setFrom(d.from); setTo(d.to) }
+  }
+  return <div className="periodBar">
+    <select value={preset} onChange={e => change(e.target.value)}>
+      <option value="today">Today</option><option value="yesterday">Yesterday</option><option value="thisWeek">This week</option>
+      <option value="previousWeek">Last week</option><option value="thisMonth">This month</option><option value="lastMonth">Last month</option>
+      <option value="thisYear">This year</option><option value="lastYear">Last year</option><option value="custom">Custom</option>
+    </select>
+    <input type="date" value={from} onChange={e => { setPreset('custom'); setFrom(e.target.value) }} />
+    <span>→</span>
+    <input type="date" value={to} onChange={e => { setPreset('custom'); setTo(e.target.value) }} />
+  </div>
+}
+
+function LinehaulRegister({ me }) {
+  const [setup, setSetup] = useState(null)
+  const [unitReference, setUnitReference] = useState('')
+  const [palletReceiptNumber, setPalletReceiptNumber] = useState('')
+  const [palletCount, setPalletCount] = useState('')
+  const [fromTerminalId, setFromTerminalId] = useState(String(me.terminalId))
+  const [toTerminalId, setToTerminalId] = useState('')
+  const [commentOptionId, setCommentOptionId] = useState('')
+  const [freeComment, setFreeComment] = useState('')
+  const [businessDate, setBusinessDate] = useState(dateInput())
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const [success, setSuccess] = useState(null)
+
+  useEffect(() => {
+    api('/linehaul/setup').then(r => {
+      setSetup(r)
+      const other = r.terminals.find(t => Number(t.id) !== Number(me.terminalId))
+      if (other) setToTerminalId(String(other.id))
+    }).catch(e => setError(e.message))
+  }, [me.terminalId])
+
+  async function submit() {
+    setError(''); setSuccess(null)
+    if (!palletReceiptNumber.trim()) return setError('Enter pallet receipt number.')
+    if (palletCount === '' || Number(palletCount) < 0) return setError('Enter number of pallets. 0 is allowed.')
+    if (!fromTerminalId || !toTerminalId) return setError('Choose From and To terminal.')
+    if (fromTerminalId === toTerminalId) return setError('From and To terminal must be different.')
+    if (Number(fromTerminalId) !== Number(me.terminalId) && Number(toTerminalId) !== Number(me.terminalId)) return setError(`One side must be your terminal ${me.terminalCode}.`)
+    setBusy(true)
+    try {
+      const result = await api('/linehaul/receipts', {
+        method: 'POST',
+        body: JSON.stringify({
+          unitReference, palletReceiptNumber, palletCount: Number(palletCount),
+          fromTerminalId: Number(fromTerminalId), toTerminalId: Number(toTerminalId),
+          commentOptionId: commentOptionId ? Number(commentOptionId) : null,
+          freeComment, businessDate
+        })
+      })
+      setSuccess(result)
+      setUnitReference(''); setPalletReceiptNumber(''); setPalletCount(''); setCommentOptionId(''); setFreeComment('')
+    } catch (e) { setError(e.message) } finally { setBusy(false) }
+  }
+
+  if (!setup) return <Loading />
+  return <section>
+    <div className="pageTitle"><div><h1>Linehaul · Register</h1><p>Register pallets moved between terminals. Manual registrations must involve {me.terminalCode}.</p></div></div>
+    {error && <div className="error">{error}</div>}
+    {success && <div className="success"><b>{success.receiptNumber}</b> registered: {success.fromTerminal} → {success.toTerminal}, {success.palletCount} pallets · Pallekvittering {success.palletReceiptNumber}.</div>}
+    <div className="card moduleFormCard"><div className="formGrid linehaulForm">
+      <label>Container / trailer no. or text <span className="muted small">(optional)</span><input value={unitReference} onChange={e => setUnitReference(e.target.value)} placeholder="Optional – e.g. TTR12345" /></label>
+      <label>Pallekvitteringsnummer <span className="requiredMark">*</span><input value={palletReceiptNumber} onChange={e => setPalletReceiptNumber(e.target.value)} placeholder="Must be unique, e.g. PK-123456" /></label>
+      <label>Number of pallets<input type="number" min="0" value={palletCount} onChange={e => setPalletCount(e.target.value)} /></label>
+      <label>From terminal<select value={fromTerminalId} onChange={e => setFromTerminalId(e.target.value)}>{setup.terminals.map(t => <option key={t.id} value={t.id}>{t.code} — {t.name}</option>)}</select></label>
+      <label>To terminal<select value={toTerminalId} onChange={e => setToTerminalId(e.target.value)}>{setup.terminals.map(t => <option key={t.id} value={t.id}>{t.code} — {t.name}</option>)}</select></label>
+      <label>Date<input type="date" value={businessDate} onChange={e => setBusinessDate(e.target.value)} /></label>
+      <label>Selectable comment<select value={commentOptionId} onChange={e => setCommentOptionId(e.target.value)}><option value="">No standard comment</option>{setup.comments.map(c => <option key={c.id} value={c.id}>{c.text}</option>)}</select><small className="muted">Options belong to {me.terminalCode} and do not depend on From/To.</small></label>
+      <label className="fullSpan">Free comment<textarea value={freeComment} onChange={e => setFreeComment(e.target.value)} placeholder="Optional comment" /></label>
+      <div className="fullSpan"><button className="primary big" disabled={busy} onClick={submit}>{busy ? 'Registering…' : 'Register linehaul receipt'}</button></div>
+    </div></div>
+  </section>
+}
+
+function LinehaulReceipts({ me }) {
+  const initial = periodDates('thisMonth')
+  const [setup, setSetup] = useState(null), [rows, setRows] = useState([])
+  const [preset, setPreset] = useState('thisMonth'), [from, setFrom] = useState(initial.from), [to, setTo] = useState(initial.to)
+  const [direction, setDirection] = useState('all'), [recordStatus, setRecordStatus] = useState('all')
+  const [fromTerminalId, setFromTerminalId] = useState(''), [toTerminalId, setToTerminalId] = useState(''), [search, setSearch] = useState('')
+  const [error, setError] = useState(''), [message, setMessage] = useState('')
+
+  async function load() {
+    setError('')
+    try {
+      const qs = new URLSearchParams({ from, to, direction, status: recordStatus })
+      if (fromTerminalId) qs.set('fromTerminalId', fromTerminalId)
+      if (toTerminalId) qs.set('toTerminalId', toTerminalId)
+      if (search.trim()) qs.set('search', search.trim())
+      const r = await api(`/linehaul/receipts?${qs}`)
+      setRows(r.rows || [])
+    } catch (e) { setError(e.message) }
+  }
+
+  async function cancelRow(row) {
+    const reason = window.prompt(`Cancel ${row.receiptNumber}?\nReason:`, '')
+    if (reason === null) return
+    setError(''); setMessage('')
+    try {
+      await api(`/linehaul/receipts/${row.id}/cancel`, { method: 'POST', body: JSON.stringify({ reason }) })
+      setMessage(`${row.receiptNumber} cancelled. Cancelled receipts are excluded from statistics.`)
+      await load()
+    } catch (e) { setError(e.message) }
+  }
+
+  async function deleteRow(row) {
+    if (!window.confirm(`PERMANENTLY DELETE ${row.receiptNumber}?\n\nThis cannot be undone and will remove the record from the database.`)) return
+    setError(''); setMessage('')
+    try {
+      await api(`/linehaul/receipts/${row.id}`, { method: 'DELETE' })
+      setMessage(`${row.receiptNumber} permanently deleted.`)
+      await load()
+    } catch (e) { setError(e.message) }
+  }
+
+  useEffect(() => { api('/linehaul/setup').then(setSetup).catch(e => setError(e.message)) }, [])
+  useEffect(() => { if (setup) load() }, [setup, from, to, direction, recordStatus, fromTerminalId, toTerminalId])
+  if (!setup) return <Loading />
+
+  return <section><div className="pageTitle"><div><h1>Linehaul · Receipts · {me.terminalCode}</h1><p>Linehaul records visible to {me.terminalCode}. Cancelled records remain visible but do not count in statistics.</p></div></div>
+    {message && <div className="success">{message}</div>}{error && <div className="error">{error}</div>}
+    <div className="card filterCard"><PeriodFilter {...{preset,setPreset,from,setFrom,to,setTo}} /><div className="filterRow">
+      <select value={direction} onChange={e => setDirection(e.target.value)}><option value="all">All directions</option><option value="sent">Sent from {me.terminalCode}</option><option value="received">Received by {me.terminalCode}</option></select>
+      <select value={recordStatus} onChange={e => setRecordStatus(e.target.value)}><option value="all">Active + cancelled</option><option value="active">Active only</option><option value="cancelled">Cancelled only</option></select>
+      <select value={fromTerminalId} onChange={e => setFromTerminalId(e.target.value)}><option value="">All From terminals</option>{setup.terminals.map(t => <option key={t.id} value={t.id}>{t.code}</option>)}</select>
+      <select value={toTerminalId} onChange={e => setToTerminalId(e.target.value)}><option value="">All To terminals</option>{setup.terminals.map(t => <option key={t.id} value={t.id}>{t.code}</option>)}</select>
+      <input placeholder="Search container, pallekvittering or comment" value={search} onChange={e => setSearch(e.target.value)} onKeyDown={e => e.key === 'Enter' && load()} /><button onClick={load}>Search</button>
+    </div></div>
+    <div className="card tableCard"><div className="tableWrap"><table><thead><tr><th>Date</th><th>Receipt</th><th>Container / trailer</th><th>Pallekvittering no.</th><th>From</th><th>To</th><th>Pallets</th><th>Standard comment</th><th>Comment</th><th>Status</th><th>Submitted by</th><th></th></tr></thead><tbody>
+    {rows.map(r => <tr key={r.id} className={r.status === 'CANCELLED' ? 'cancelledTableRow' : ''}><td>{formatDate(r.businessDate)}</td><td><b>{r.receiptNumber}</b></td><td>{r.unitReference || '—'}</td><td>{r.palletReceiptNumber || '—'}</td><td>{r.fromTerminal}</td><td>{r.toTerminal}</td><td><b>{r.palletCount}</b></td><td>{r.standardComment || '—'}</td><td>{r.freeComment || '—'}</td><td>{r.status === 'CANCELLED' ? <><span className="badge red">CANCELLED</span>{r.cancelReason && <div className="muted small">{r.cancelReason}</div>}</> : <span className="badge green">ACTIVE</span>}</td><td>{r.submittedBy}</td><td>{r.canManage && <div className="tableActions">{r.status !== 'CANCELLED' && <button className="dangerGhost" onClick={() => cancelRow(r)}>Cancel</button>}<button className="dangerGhost" onClick={() => deleteRow(r)}>Delete permanently</button></div>}</td></tr>)}
+    </tbody></table></div>{rows.length === 0 && <Empty text="No linehaul receipts in this period." />}</div>
+  </section>
+}
+
+function LinehaulStats({ me }) {
+  const initial = periodDates('thisMonth')
+  const [preset,setPreset]=useState('thisMonth'), [from,setFrom]=useState(initial.from), [to,setTo]=useState(initial.to), [data,setData]=useState(null), [error,setError]=useState('')
+  useEffect(() => { setError(''); api(`/linehaul/statistics?from=${from}&to=${to}`).then(setData).catch(e => setError(e.message)) }, [from,to])
+  return <section><div className="pageTitle"><div><h1>Linehaul · Statistics · {me.terminalCode}</h1><p>Positive balance means {me.terminalCode} has sent more pallets than it has received and is therefore in plus.</p></div></div>
+    {error && <div className="error">{error}</div>}<div className="card filterCard"><PeriodFilter {...{preset,setPreset,from,setFrom,to,setTo}} /></div>
+    {!data ? <Loading /> : <><div className="statsCards"><StatCard label="Sent pallets" value={data.totalSentPallets}/><StatCard label="Received pallets" value={data.totalReceivedPallets}/><StatCard label={`${me.terminalCode} global balance`} value={signed(data.globalBalance)} cls={data.globalBalance >= 0 ? 'positive':'negative'}/><StatCard label="Linehaul movements" value={data.totalSentLoads + data.totalReceivedLoads}/></div>
+      <div className="card tableCard"><div className="tableWrap"><table><thead><tr><th>Other terminal</th><th>Sent loads</th><th>Received loads</th><th>Sent pallets</th><th>Received pallets</th><th>{me.terminalCode} balance</th></tr></thead><tbody>{data.rows.map(r => <tr key={r.terminalId}><td><b>{r.terminal}</b></td><td>{r.sentLoads}</td><td>{r.receivedLoads}</td><td>{r.sentPallets}</td><td>{r.receivedPallets}</td><td className={r.balance >= 0 ? 'positive':'negative'}><b>{signed(r.balance)}</b></td></tr>)}</tbody></table></div>{data.rows.length===0 && <Empty text="No linehaul activity in this period."/>}</div></>}
+  </section>
+}
+
+function LinehaulExport({ me }) {
+  const initial=periodDates('thisMonth'); const [preset,setPreset]=useState('thisMonth'), [from,setFrom]=useState(initial.from), [to,setTo]=useState(initial.to), [type,setType]=useState('complete'), [format,setFormat]=useState('xlsx'), [busy,setBusy]=useState(false), [error,setError]=useState('')
+  async function download(){ setBusy(true);setError('');try{const actualFormat=type==='complete'?'xlsx':format;await downloadApiFile(`/linehaul/export?from=${from}&to=${to}&type=${type}&format=${actualFormat}`,`Linehaul_${me.terminalCode}.${actualFormat}`)}catch(e){setError(e.message)}finally{setBusy(false)}}
+  return <section><div className="pageTitle"><div><h1>Linehaul · Export</h1><p>Export terminal-to-terminal pallet movements for {me.terminalCode}.</p></div></div>{error&&<div className="error">{error}</div>}<div className="card exportCard moduleExport"><PeriodFilter {...{preset,setPreset,from,setFrom,to,setTo}}/><label>Export<select value={type} onChange={e=>setType(e.target.value)}><option value="complete">Complete Excel report</option><option value="receipts">Receipt details</option><option value="summary">Terminal summary</option></select></label>{type!=='complete'&&<label>Format<select value={format} onChange={e=>setFormat(e.target.value)}><option value="xlsx">Excel (.xlsx)</option><option value="csv">CSV</option></select></label>}<button className="primary" disabled={busy} onClick={download}>{busy?'Preparing…':'Download export'}</button></div></section>
+}
+
+function importValue(value) {
+  if (value === null || value === undefined || value === '') return '—'
+  if (typeof value === 'boolean') return value ? 'Yes' : 'No'
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}/.test(value)) return formatDate(value.slice(0, 10))
+  return String(value)
+}
+
+function ImportRowsTable({ title, rows, truncated }) {
+  if (!rows?.length) return null
+  const labels = {
+    row: 'Excel/CSV row', receiptNumber: 'Receipt', controlNumber: 'Control', date: 'Date', fromTerminal: 'From terminal', toTerminal: 'To terminal',
+    containerTrailer: 'Container / trailer', palletReceiptNumber: 'Pallekvittering no.', pallets: 'Pallets', standardComment: 'Selectable comment', comment: 'Comment',
+    palletReceiptReceived: 'Pallet receipt received', receiptPallets: 'Receipt pallets', actualPallets: 'Actual pallets', result: 'Result'
+  }
+  const keys = Object.keys(rows[0] || {})
+  return <div className="importRowsBlock">
+    <h3>{title}</h3>
+    <div className="tableWrap"><table className="importPreviewTable"><thead><tr>{keys.map(k => <th key={k}>{labels[k] || k}</th>)}</tr></thead><tbody>
+    {rows.map((r, i) => <tr key={`${r.row || r.receiptNumber || r.controlNumber || i}-${i}`}>{keys.map(k => <td key={k}>{k === 'result' ? receivedStatusLabel(r[k]) : importValue(r[k])}</td>)}</tr>)}
+    </tbody></table></div>
+    {truncated && <p className="muted small">Only the first 500 rows are displayed here. All validated rows will still be imported after confirmation.</p>}
+  </div>
+}
+
+function ImportResult({ result }) {
+  if (!result) return null
+  const preview = result.preview === true
+  return <div className="card importResult">
+    <div className="statsCards compactStats">
+      <StatCard label="Rows read" value={result.rowsRead || 0}/>
+      {preview ? <StatCard label="Ready to import" value={result.readyToImport || 0} cls="positive"/> : <StatCard label="Imported" value={result.imported || 0} cls="positive"/>}
+      <StatCard label="Rows not imported" value={result.rejected || 0} cls={(result.rejected || 0) ? 'negative' : ''}/>
+      {!preview && result.redWarningsCreated !== undefined && <StatCard label="Red warnings created" value={result.redWarningsCreated || 0} cls={(result.redWarningsCreated || 0) ? 'negative' : ''}/>}
+    </div>
+    {preview && <ImportRowsTable title="Rows that will be imported" rows={result.previewRows} truncated={result.previewRowsTruncated}/>}
+    {!preview && <ImportRowsTable title="Imported rows" rows={result.importedRows} truncated={result.importedRowsTruncated}/>}
+    {result.skippedDuplicates > 0 && <div className="warningInline">{result.skippedDuplicates} matching existing row(s) were skipped as duplicates.</div>}
+    {result.warnings?.length > 0 && <div className="importIssues"><h3>Accepted with warnings</h3>{result.warnings.map((x,i)=><div key={`w-${i}`} className="importIssue warningInline"><b>Row {x.row}:</b> {x.message}</div>)}</div>}
+    {result.issues?.length > 0 && <div className="importIssues"><h3>Rows not imported</h3>{result.issues.map((x,i)=><div key={`e-${i}`} className="importIssue error"><b>Row {x.row}:</b> {x.message}</div>)}{result.issueListTruncated&&<p className="muted">Only the first 200 issues are shown.</p>}</div>}
+  </div>
+}
+
+function ImportSchema({ rows }) {
+  return <div className="tableWrap"><table className="importSchema"><thead><tr><th>Column</th><th>Required</th><th>Example</th><th>Meaning</th></tr></thead><tbody>{rows.map(r=><tr key={r[0]}><td><code>{r[0]}</code></td><td>{r[1]}</td><td>{r[2]}</td><td>{r[3]}</td></tr>)}</tbody></table></div>
+}
+
+function HistoricalImport({ me, title, endpoint, templateBase, schema, note }) {
+  const [file,setFile]=useState(null),[busy,setBusy]=useState(false),[error,setError]=useState(''),[result,setResult]=useState(null)
+
+  async function send(confirm) {
+    if(!file) return setError('Choose an .xlsx or .csv file first.')
+    setBusy(true);setError('')
+    if(!confirm) setResult(null)
+    try {
+      const body=new FormData(); body.append('file',file); body.append('confirm', confirm ? 'true' : 'false')
+      setResult(await api(endpoint,{method:'POST',body}))
+    } catch(e) { setError(e.message) } finally { setBusy(false) }
+  }
+
+  function chooseFile(e) {
+    setFile(e.target.files?.[0]||null); setResult(null); setError('')
+  }
+
+  return <section><div className="pageTitle"><div><h1>{title} · Import · {me.terminalCode}</h1><p>Nothing is written to the database until you review the preview and explicitly confirm the import.</p></div></div>{error&&<div className="error">{error}</div>}
+    <div className="card importCard"><h2>Import format</h2><p className="muted">Excel (.xlsx) and CSV are supported; CSV may use comma or semicolon separators. {note}</p><ImportSchema rows={schema}/>
+      <div className="templateButtons"><button onClick={()=>downloadApiFile(`${templateBase}?format=xlsx`,`${title}_Import_Template.xlsx`)}>Download Excel template</button><button onClick={()=>downloadApiFile(`${templateBase}?format=csv`,`${title}_Import_Template.csv`)}>Download CSV template</button></div>
+    </div>
+    <div className="card importCard"><h2>1. Select and preview old data</h2><input className="fileInput" type="file" accept=".xlsx,.csv,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={chooseFile}/>{file&&<p className="muted small">Selected: {file.name}</p>}
+      <button className="primary" disabled={busy||!file} onClick={()=>send(false)}>{busy?'Checking…':'Preview import'}</button>
+      <p className="muted small">Preview validates terminals, duplicates, dates and quantities. It does not save anything.</p>
+    </div>
+    <ImportResult result={result}/>
+    {result?.preview && <div className="card importConfirmCard"><h2>2. Confirm import</h2><p><b>{result.readyToImport || 0}</b> row(s) will be written to the database. <b>{result.rejected || 0}</b> row(s) will not be imported.</p><button className="primary big" disabled={busy || !(result.readyToImport > 0)} onClick={()=>send(true)}>{busy?'Importing…':`Yes, import ${result.readyToImport || 0} row(s)`}</button><p className="muted small">Pressing this button is the final confirmation.</p></div>}
+  </section>
+}
+
+function LinehaulImport({ me }) {
+  const schema=[
+    ['Date','Yes','2026-08-28','Business date'],
+    ['ContainerTrailer','No','TTR12345','Optional container/trailer number or text'],
+    ['PalletReceiptNumber','Legacy: optional','PK-123456','If supplied it must be unique in the Linehaul database'],
+    ['Pallets','Yes','33','Number of pallets'],
+    ['FromTerminal','At least From or To','SRD / SRD123 / Sandefjord','Existing terminal Code, Name or Alias; blank side is inferred as your terminal'],
+    ['ToTerminal','At least From or To','ARE','Existing terminal Code, Name or Alias; blank side is inferred as your terminal'],
+    ['StandardComment','No','Night linehaul','Historical selectable comment text'],
+    ['Comment','No','Old Excel import','Free text']
+  ]
+  return <HistoricalImport me={me} title="Linehaul" endpoint="/linehaul/import" templateBase="/linehaul/import-template" schema={schema} note={`Terminal matching accepts Code, Name and aliases. Values such as SRD123 can resolve to SRD. Import rows may reference any terminals in the Admin terminal list. Blank PalletReceiptNumber is accepted only for legacy history.`}/>
+}
+
+function ReceivedControlImport({ me }) {
+  const schema=[
+    ['Date','Yes','2026-08-28','Business date'],
+    ['FromTerminal','Yes','ARE / ARE123 / Arendal','Existing terminal Code, Name or Alias'],
+    ['ContainerTrailer','Yes','TTR12345','Container/trailer number or text'],
+    ['PalletReceiptReceived','Yes','Yes','Yes/No, Ja/Nei, true/false or 1/0'],
+    ['ReceiptPallets','If received','33','Pallet quantity written on receipt'],
+    ['ActualPallets','Yes','31','Actual pallets physically received'],
+    ['Comment','No','Damaged seal','Optional free text']
+  ]
+  return <HistoricalImport me={me} title="MottattKontroll" endpoint="/received-control/import" templateBase="/received-control/import-template" schema={schema} note={`Imported controls belong to receiving terminal ${me.terminalCode}. FromTerminal accepts Code, Name and configured aliases. Red shortages automatically create acknowledgement warnings.`}/>
+}
+
+function receivedStatusLabel(value) {
+  if (value === 'NO_RECEIPT') return 'No pallet receipt'
+  if (value === 'RECEIPT_HIGHER') return 'Receipt amount higher than actual'
+  if (value === 'RECEIPT_LOWER') return 'Receipt amount lower than actual'
+  if (value === 'EXACT') return 'Exact'
+  return value
+}
+function receivedRowClass(value, colours=true){ if(!colours)return ''; return value==='NO_RECEIPT'?'rcBlue':value==='RECEIPT_HIGHER'?'rcRed':value==='RECEIPT_LOWER'?'rcOrange':value==='EXACT'?'rcGreen':'' }
+
+function ReceivedControlRegister({ me }) {
+  const [setup,setSetup]=useState(null),[fromTerminalId,setFromTerminalId]=useState(''),[unitReference,setUnitReference]=useState(''),[comment,setComment]=useState(''),[received,setReceived]=useState(true),[receiptQty,setReceiptQty]=useState(''),[actualQty,setActualQty]=useState(''),[businessDate,setBusinessDate]=useState(dateInput()),[busy,setBusy]=useState(false),[error,setError]=useState(''),[success,setSuccess]=useState(null)
+  useEffect(()=>{api('/received-control/setup').then(r=>{setSetup(r);const other=r.terminals.find(t=>Number(t.id)!==Number(me.terminalId));if(other)setFromTerminalId(String(other.id))}).catch(e=>setError(e.message))},[me.terminalId])
+  async function submit(){setError('');setSuccess(null);if(!fromTerminalId)return setError('Choose From terminal.');if(actualQty===''||Number(actualQty)<0)return setError('Enter actual number of pallets.');if(received&&(receiptQty===''||Number(receiptQty)<0))return setError('Enter the quantity written on the pallet receipt.');setBusy(true);try{const r=await api('/received-control/entries',{method:'POST',body:JSON.stringify({fromTerminalId:Number(fromTerminalId),unitReference,comment,palletReceiptReceived:received,receiptPalletCount:received?Number(receiptQty):null,actualPalletCount:Number(actualQty),businessDate})});setSuccess(r);setUnitReference('');setComment('');setReceiptQty('');setActualQty('')}catch(e){setError(e.message)}finally{setBusy(false)}}
+  if(!setup)return <Loading/>
+  return <section><div className="pageTitle"><div><h1>MottattKontroll · Register · {me.terminalCode}</h1><p>Register which terminal the load came from and compare the pallet receipt with the pallets physically received.</p></div></div>{error&&<div className="error">{error}</div>}{success&&<div className={`success receivedSuccess ${receivedRowClass(success.result)}`}><b>{success.controlNumber}</b> registered · {receivedStatusLabel(success.result)}</div>}
+    <div className="card moduleFormCard"><div className="formGrid receivedForm">
+      <label>From terminal<select value={fromTerminalId} onChange={e=>setFromTerminalId(e.target.value)}><option value="">Choose terminal</option>{setup.terminals.filter(t=>Number(t.id)!==Number(me.terminalId)).map(t=><option key={t.id} value={t.id}>{t.code} — {t.name}</option>)}</select></label>
+      <label>Container / trailer no.<input value={unitReference} onChange={e=>setUnitReference(e.target.value)} placeholder="Container/trailer reference"/></label>
+      <label>Date<input type="date" value={businessDate} onChange={e=>setBusinessDate(e.target.value)}/></label>
+      <label className="fullSpan">Comment <span className="muted small">(optional)</span><textarea value={comment} onChange={e=>setComment(e.target.value)} placeholder="Optional comment"/></label>
+      <label className="checkCard fullSpan"><input type="checkbox" checked={received} onChange={e=>{setReceived(e.target.checked);if(!e.target.checked)setReceiptQty('')}}/><span><b>Pallet receipt received</b><small>Uncheck when no pallet receipt was received with the container/trailer.</small></span></label>
+      {received&&<label>Pallets written on receipt<input type="number" min="0" value={receiptQty} onChange={e=>setReceiptQty(e.target.value)}/></label>}<label>Actual pallets received<input type="number" min="0" value={actualQty} onChange={e=>setActualQty(e.target.value)}/></label>
+      <div className="fullSpan rcLegend"><span className="legendBlue">Blue: no receipt</span><span className="legendRed">Red: receipt &gt; actual</span><span className="legendOrange">Orange: receipt &lt; actual</span><span className="legendGreen">Green: exact</span></div>
+      <div className="fullSpan"><button className="primary big" disabled={busy} onClick={submit}>{busy?'Registering…':'Register received control'}</button></div></div></div>
+  </section>
+}
+
+function ReceivedControlStats({ me }) {
+  const initial=periodDates('thisMonth')
+  const[preset,setPreset]=useState('thisMonth'),[from,setFrom]=useState(initial.from),[to,setTo]=useState(initial.to),[status,setStatus]=useState('all'),[recordStatus,setRecordStatus]=useState('all'),[search,setSearch]=useState(''),[colours,setColours]=useState(true),[data,setData]=useState(null),[error,setError]=useState(''),[message,setMessage]=useState('')
+  async function load(){setError('');try{const qs=new URLSearchParams({from,to,status,recordStatus});if(search.trim())qs.set('search',search.trim());setData(await api(`/received-control/statistics?${qs}`))}catch(e){setError(e.message)}}
+  async function cancelRow(row){const reason=window.prompt(`Cancel ${row.controlNumber}?\nReason:`,'');if(reason===null)return;setError('');setMessage('');try{await api(`/received-control/entries/${row.id}/cancel`,{method:'POST',body:JSON.stringify({reason})});setMessage(`${row.controlNumber} cancelled. It no longer counts in statistics or warnings.`);await load()}catch(e){setError(e.message)}}
+  async function deleteRow(row){if(!window.confirm(`PERMANENTLY DELETE ${row.controlNumber}?\n\nThis also removes warnings connected to this control and cannot be undone.`))return;setError('');setMessage('');try{await api(`/received-control/entries/${row.id}`,{method:'DELETE'});setMessage(`${row.controlNumber} permanently deleted.`);await load()}catch(e){setError(e.message)}}
+  useEffect(()=>{load()},[from,to,status,recordStatus])
+  return <section><div className="pageTitle"><div><h1>MottattKontroll · Statistics · {me.terminalCode}</h1><p>Terminal names are resolved from the current Admin terminal list, so renaming a terminal keeps historical rows together.</p></div><label className="colourToggle"><input type="checkbox" checked={colours} onChange={e=>setColours(e.target.checked)}/> Enable colours</label></div>{message&&<div className="success">{message}</div>}{error&&<div className="error">{error}</div>}
+    <div className="card filterCard"><PeriodFilter {...{preset,setPreset,from,setFrom,to,setTo}}/><div className="filterRow"><select value={status} onChange={e=>setStatus(e.target.value)}><option value="all">All results</option><option value="NO_RECEIPT">Blue · No receipt</option><option value="RECEIPT_HIGHER">Red · Receipt higher</option><option value="RECEIPT_LOWER">Orange · Receipt lower</option><option value="EXACT">Green · Exact</option></select><select value={recordStatus} onChange={e=>setRecordStatus(e.target.value)}><option value="all">Active + cancelled</option><option value="active">Active only</option><option value="cancelled">Cancelled only</option></select><input placeholder="Search from terminal, container or comment" value={search} onChange={e=>setSearch(e.target.value)} onKeyDown={e=>e.key==='Enter'&&load()}/><button onClick={load}>Search</button></div></div>
+    {!data?<Loading/>:<><div className="statsCards"><StatCard label="Active controls" value={data.total}/><StatCard label="No receipt" value={data.noReceipt}/><StatCard label="Red shortages" value={data.receiptHigher} cls="negative"/><StatCard label="Exact" value={data.exact} cls="positive"/></div><div className="card tableCard"><div className="tableWrap"><table><thead><tr><th>Date</th><th>Control</th><th>From terminal</th><th>Container / trailer</th><th>Comment</th><th>Pallet receipt</th><th>Receipt qty</th><th>Actual qty</th><th>Difference</th><th>Result</th><th>Status</th><th>Submitted by</th><th></th></tr></thead><tbody>{data.rows.map(r=><tr key={r.id} className={r.status==='CANCELLED'?'cancelledTableRow':receivedRowClass(r.result,colours)}><td>{formatDate(r.businessDate)}</td><td><b>{r.controlNumber}</b></td><td><b>{r.fromTerminal || '—'}</b></td><td>{r.unitReference || '—'}</td><td>{r.comment || '—'}</td><td>{r.palletReceiptReceived?'Yes':'No'}</td><td>{r.receiptPalletCount??'—'}</td><td><b>{r.actualPalletCount}</b></td><td>{r.difference??'—'}</td><td><b>{receivedStatusLabel(r.result)}</b></td><td>{r.status==='CANCELLED'?<><span className="badge red">CANCELLED</span>{r.cancelReason&&<div className="muted small">{r.cancelReason}</div>}</>:<span className="badge green">ACTIVE</span>}</td><td>{r.submittedBy}</td><td>{r.canManage&&<div className="tableActions">{r.status!=='CANCELLED'&&<button className="dangerGhost" onClick={()=>cancelRow(r)}>Cancel</button>}<button className="dangerGhost" onClick={()=>deleteRow(r)}>Delete permanently</button></div>}</td></tr>)}</tbody></table></div>{data.rows.length===0&&<Empty text="No controls in this period."/>}</div></>}
+  </section>
+}
+
+function ReceivedControlWarnings({ me }) {
+  const[unack,setUnack]=useState(true),[rows,setRows]=useState([]),[error,setError]=useState('')
+  async function load(){setError('');try{const r=await api(`/received-control/warnings?unacknowledgedOnly=${unack}`);setRows(r.warnings||[])}catch(e){setError(e.message)}}
+  useEffect(()=>{load()},[unack])
+  async function ack(id){try{await api(`/received-control/warnings/${id}/acknowledge`,{method:'POST',body:'{}'});await load()}catch(e){setError(e.message)}}
+  return <section><div className="pageTitle"><div><h1>MottattKontroll · Warnings · {me.terminalCode}</h1><p>Red quantity shortages require acknowledgement.</p></div><label className="miniCheck"><input type="checkbox" checked={unack} onChange={e=>setUnack(e.target.checked)}/> Unacknowledged only</label></div>{error&&<div className="error">{error}</div>}<div className="warningList">{rows.map(w=><div className="card warningCard rcRed" key={w.id}><div className="warningHead"><div><span className="badge red">SHORTAGE</span><b>{[w.entry?.fromTerminal,w.entry?.unitReference].filter(Boolean).join(' · ')}</b></div><span>{formatTimestamp(w.createdAtUtc)}</span></div><p>{w.message}</p><div className="warningMeta">{w.entry?.controlNumber} · {formatDate(w.entry?.businessDate)}{w.entry?.comment?` · ${w.entry.comment}`:''}{w.acknowledgedAtUtc?` · Acknowledged by ${w.acknowledgedBy}`:''}</div>{!w.acknowledgedAtUtc&&<button onClick={()=>ack(w.id)}>✓ Acknowledge</button>}</div>)}</div>{rows.length===0&&<Empty text="No received-control warnings."/>}</section>
+}
+
+function ReceivedControlExport({ me }) {
+  const initial=periodDates('thisMonth');const[preset,setPreset]=useState('thisMonth'),[from,setFrom]=useState(initial.from),[to,setTo]=useState(initial.to),[format,setFormat]=useState('xlsx'),[busy,setBusy]=useState(false),[error,setError]=useState('')
+  async function download(){setBusy(true);setError('');try{await downloadApiFile(`/received-control/export?from=${from}&to=${to}&format=${format}`,`ReceivedControl_${me.terminalCode}.${format}`)}catch(e){setError(e.message)}finally{setBusy(false)}}
+  return <section><div className="pageTitle"><div><h1>MottattKontroll · Export</h1><p>Excel includes both detailed controls and a summary sheet.</p></div></div>{error&&<div className="error">{error}</div>}<div className="card exportCard moduleExport"><PeriodFilter {...{preset,setPreset,from,setFrom,to,setTo}}/><label>Format<select value={format} onChange={e=>setFormat(e.target.value)}><option value="xlsx">Excel (.xlsx)</option><option value="csv">CSV details</option></select></label><button className="primary" disabled={busy} onClick={download}>{busy?'Preparing…':'Download export'}</button></div></section>
+}
+
 function UserSettings({ me }) {
   const [s, setS] = useState(null)
   const [message, setMessage] = useState('')
@@ -1306,7 +1703,7 @@ function UserSettings({ me }) {
         <input placeholder="Driver name" value={newDriver} onChange={e => setNewDriver(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addDriver() } }} />
         <button type="button" className="primary" disabled={addingDriver || !newDriver.trim()} onClick={addDriver}>{addingDriver ? 'Adding…' : 'Add driver'}</button>
       </div> : <div className="settingsDisabledNotice">Adding new driver names is currently disabled by the administrator.</div>}
-      {me.role === 'Admin' && <p className="muted small settingsAdminHint">Administrator: this option can be enabled or disabled under Admin → Notifications & general.</p>}
+      {['SuperAdmin', 'TerminalAdmin', 'Admin'].includes(me.role) && <p className="muted small settingsAdminHint">Administrator: this option is controlled under Admin → Terminal settings.</p>}
     </div>
 
     {me.role === 'Superuser' && <div className="card noteCard"><b>Superuser access</b><p>You can view/acknowledge warnings, manage cancellations and export data. Warning thresholds remain Admin-only.</p></div>}
@@ -1457,250 +1854,127 @@ function Export({ me }) {
   </section>
 }
 
-function Admin() {
-  const [category, setCategory] = useState('')
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
-  const [message, setMessage] = useState('')
-  const [transporterName, setTransporterName] = useState('')
-  const [vehicleForm, setVehicleForm] = useState({ vehicleId: '', terminalId: '', transporterId: '' })
-  const [driverForm, setDriverForm] = useState({ name: '', terminalId: '' })
-  const [userForm, setUserForm] = useState({ username: '', displayName: '', password: '', role: 'User', terminalId: '' })
-  const [palletName, setPalletName] = useState('')
-  const [holidayForm, setHolidayForm] = useState({ date: dateInput(), name: '' })
-  // Each category load gets a sequence number. If the user jumps to another
-  // category before the previous request finishes, the stale response is ignored.
-  const adminLoadSequence = useRef(0)
-  // Keep the selected category in a ref as well as state. Async requests/actions can
-  // then verify that they still belong to the category currently on screen.
-  const activeCategoryRef = useRef('')
+function Admin({ me }) {
+  const superAdmin = me.role === 'SuperAdmin' || me.role === 'Admin'
+  const [category,setCategory]=useState(''),[data,setData]=useState(null),[loadedCategory,setLoadedCategory]=useState(''),[loading,setLoading]=useState(false),[error,setError]=useState(''),[message,setMessage]=useState('')
+  const activeCategoryRef=useRef('')
+  const adminLoadSequence=useRef(0)
+  const [targetTerminalId,setTargetTerminalId]=useState(String(me.terminalId))
+  const [transporterName,setTransporterName]=useState(''),[palletName,setPalletName]=useState(''),[linehaulComment,setLinehaulComment]=useState('')
+  const [terminalForm,setTerminalForm]=useState({code:'',name:'',aliases:''})
+  const [vehicleForm,setVehicleForm]=useState({vehicleId:'',terminalId:String(me.terminalId),transporterId:''})
+  const [driverForm,setDriverForm]=useState({name:'',terminalId:String(me.terminalId)})
+  const [userForm,setUserForm]=useState({username:'',displayName:'',password:'',role:'User',terminalId:String(me.terminalId),hasInternalPalletAccounting:true,hasLinehaul:false,hasReceivedControl:false,showDriverStatisticsTab:true,showDailyCheckTab:true})
+  const [holidayForm,setHolidayForm]=useState({date:dateInput(),name:''})
 
-  const categories = [
-    { id: 'users', icon: '👤', title: 'Users', description: 'Accounts, roles, terminals and passwords.' },
-    { id: 'vehicles', icon: '🚚', title: 'Vehicles', description: 'Vehicles, transporter assignments and expected operating days.' },
-    { id: 'holidays', icon: '📅', title: 'Holidays / non-working days', description: 'Exclude red days and other closed days from receipt tracking.' },
-    { id: 'drivers', icon: '🪪', title: 'Driver names', description: 'Add or remove selectable driver names.' },
-    { id: 'transporters', icon: '🏢', title: 'Transporters', description: 'Manage transport companies.' },
-    { id: 'pallets', icon: '📦', title: 'Pallet types', description: 'Available pallet types and user visibility.' },
-    { id: 'warnings', icon: '⚠️', title: 'Warning rules', description: 'Thresholds, duplicates and activity warnings.' },
-    { id: 'notifications', icon: '🔔', title: 'Notifications & general', description: 'Submit messages and general user options.' },
-    { id: 'driverStats', icon: '📊', title: 'Driver statistics', description: 'Configure the unmatched IN receipt deduction used by adjusted driver statistics.' },
-    { id: 'tabAccess', icon: '🔐', title: 'Tab access', description: 'Choose which users can see Statistics Driver and Daily Check.' },
-    { id: 'database', icon: '🗄️', title: 'Database & backup', description: 'See the real SQLite file and create a backup.' }
+  const categories=[
+    {id:'users',icon:'👤',title:'Users & access',description:'Security role, terminal and operational modules.'},
+    {id:'vehicles',icon:'🚚',title:'Vehicles',description:'Vehicles for the terminal and operating days.'},
+    {id:'drivers',icon:'🪪',title:'Driver names',description:'Selectable driver names for the terminal.'},
+    {id:'terminalSettings',icon:'⚙️',title:'Terminal settings',description:'Warnings, driver adjustment and registration settings for one terminal.'},
+    {id:'linehaulComments',icon:'💬',title:'Linehaul comments',description:'Selectable standard comments for Linehaul registration.'},
+    ...(superAdmin?[
+      {id:'terminals',icon:'🏭',title:'Terminals',description:'Create and activate/deactivate PalletControl terminals.'},
+      {id:'transporters',icon:'🏢',title:'Transporters',description:'Global transport company master list.'},
+      {id:'pallets',icon:'📦',title:'Pallet types',description:'Global pallet type master list.'},
+      {id:'holidays',icon:'📅',title:'Global holidays',description:'Non-working days applied across terminals.'},
+      {id:'globalSettings',icon:'🌐',title:'Global defaults',description:'SuperAdmin-only defaults used when new terminal settings are created.'},
+      {id:'database',icon:'🗄️',title:'Database & backup',description:'Database status and consistent SQLite backups.'}
+    ]:[])
   ]
 
-  function endpointFor(cat) {
-    return {
-      users: '/admin/users',
-      vehicles: '/admin/vehicles',
-      holidays: '/admin/holidays',
-      drivers: '/admin/drivers',
-      transporters: '/admin/transporters',
-      pallets: '/admin/pallet-types',
-      warnings: '/admin/settings',
-      notifications: '/admin/settings',
-      driverStats: '/admin/settings',
-      tabAccess: '/admin/users',
-      database: '/admin/database/status'
-    }[cat]
+  function endpoint(cat, terminalId=targetTerminalId){const q=`?terminalId=${terminalId}`;return {users:'/admin/users',vehicles:'/admin/vehicles',drivers:'/admin/drivers',terminalSettings:'/admin/terminal-settings'+q,linehaulComments:'/admin/linehaul-comments'+q,terminals:'/admin/terminals',transporters:'/admin/transporters',pallets:'/admin/pallet-types',holidays:'/admin/holidays',globalSettings:'/admin/settings',database:'/admin/database/status'}[cat]}
+  async function load(cat=activeCategoryRef.current||category, terminalId=targetTerminalId){
+    if(!cat)return
+    const seq=++adminLoadSequence.current
+    const requestedCategory=cat
+    setLoading(true);setError('')
+    try{
+      const url=endpoint(requestedCategory,terminalId)
+      if(!url) throw new Error(`Unknown Admin category: ${requestedCategory}`)
+      const r=await api(url)
+      if(seq!==adminLoadSequence.current||activeCategoryRef.current!==requestedCategory)return
+      setData(r);setLoadedCategory(requestedCategory)
+      if(requestedCategory==='vehicles'&&r.transporters?.length&&!vehicleForm.transporterId)setVehicleForm(f=>({...f,terminalId:String(r.terminals?.[0]?.id||me.terminalId),transporterId:String(r.transporters.find(t=>t.active)?.id||'')}))
+      if(requestedCategory==='users'&&r.terminals?.[0])setUserForm(f=>({...f,terminalId:String(r.terminals[0].id)}))
+      if(requestedCategory==='drivers'&&r.terminals?.[0])setDriverForm(f=>({...f,terminalId:String(r.terminals[0].id)}))
+    }catch(e){if(seq===adminLoadSequence.current&&activeCategoryRef.current===requestedCategory)setError(e.message)}finally{if(seq===adminLoadSequence.current&&activeCategoryRef.current===requestedCategory)setLoading(false)}
   }
-
-  async function load(cat = activeCategoryRef.current) {
-    if (!cat) return
-    const requestSequence = ++adminLoadSequence.current
-    setLoading(true)
-    setError('')
-    try {
-      const result = await api(endpointFor(cat))
-
-      // The user may already have selected another category. Never put an old
-      // category response into the currently rendered category.
-      if (requestSequence !== adminLoadSequence.current || activeCategoryRef.current !== cat) return
-
-      const next = (cat === 'warnings' || cat === 'notifications' || cat === 'driverStats') ? { settings: result } : result
-      setData(next)
-
-      if (cat === 'vehicles' && next.terminals?.[0] && !vehicleForm.terminalId) {
-        setVehicleForm(f => ({
-          ...f,
-          terminalId: String(next.terminals[0].id),
-          transporterId: String(next.transporters?.find(t => t.active)?.id || '')
-        }))
-      }
-      if (cat === 'drivers' && next.terminals?.[0] && !driverForm.terminalId) {
-        setDriverForm(f => ({ ...f, terminalId: String(next.terminals[0].id) }))
-      }
-      if (cat === 'users' && next.terminals?.[0] && !userForm.terminalId) {
-        setUserForm(f => ({ ...f, terminalId: String(next.terminals[0].id) }))
-      }
-    } catch (e) {
-      if (requestSequence === adminLoadSequence.current && activeCategoryRef.current === cat) throw e
-    } finally {
-      if (requestSequence === adminLoadSequence.current && activeCategoryRef.current === cat) setLoading(false)
-    }
-  }
-
-  useEffect(() => {
-    // Clear the previous category before the new one can render. This is what
-    // prevents e.g. the Users view from trying to read a Vehicles response.
-    activeCategoryRef.current = category
-    setData(null)
-    setMessage('')
-    setError('')
-    if (category) load(category).catch(e => {
-      if (activeCategoryRef.current === category) setError(e.message)
-    })
-    else {
-      adminLoadSequence.current += 1
-      setLoading(false)
-    }
-  }, [category])
-
-  async function action(fn, ok = 'Saved.') {
-    const actionCategory = activeCategoryRef.current
-    setError('')
-    setMessage('')
-    try {
+  useEffect(()=>{
+    activeCategoryRef.current=category
+    adminLoadSequence.current+=1
+    setData(null);setLoadedCategory('');setMessage('');setError('')
+    if(category)load(category,targetTerminalId);else setLoading(false)
+  },[category,targetTerminalId])
+  async function action(fn,ok='Saved.'){
+    const actionCategory=activeCategoryRef.current
+    const actionTerminal=targetTerminalId
+    setError('');setMessage('')
+    try{
       await fn()
-      // If the user moved to another category while the save/delete request was
-      // running, do not reload the old category into the new category's view.
-      if (activeCategoryRef.current !== actionCategory) return
-      await load(actionCategory)
-      if (activeCategoryRef.current === actionCategory) setMessage(ok)
-    } catch (e) {
-      if (activeCategoryRef.current === actionCategory) setError(e.message)
-    }
+      if(activeCategoryRef.current===actionCategory){await load(actionCategory,actionTerminal);if(activeCategoryRef.current===actionCategory)setMessage(ok)}
+    }catch(e){if(activeCategoryRef.current===actionCategory)setError(e.message)}
   }
-
-  async function del(kind, row, display) {
-    if (!window.confirm(`Delete ${display}? Historical receipts will keep their snapshot information.`)) return
-    await action(() => api(`/admin/${kind}/${row.id}`, { method: 'DELETE' }), `${display} deleted.`)
-  }
-
-  function chooseCategory(id) {
-    if (id === activeCategoryRef.current) return
-
-    // Update the ref immediately, before React renders the next category. This
-    // invalidates both in-flight loads and in-flight save/delete refreshes.
-    activeCategoryRef.current = id
-    adminLoadSequence.current += 1
-    setData(null)
-    setLoading(true)
-    setMessage('')
-    setError('')
+  function choose(id){
+    activeCategoryRef.current=id
+    adminLoadSequence.current+=1
+    setData(null);setLoadedCategory('');setLoading(true);setError('');setMessage('')
     setCategory(id)
   }
+  const activeTransporters=data?.transporters?.filter(t=>t.active)||[]
+  const roleOptions=superAdmin?['User','Superuser','TerminalAdmin','SuperAdmin']:['User','Superuser','TerminalAdmin']
 
-  function closeCategory() {
-    activeCategoryRef.current = ''
-    adminLoadSequence.current += 1
-    setData(null)
-    setLoading(false)
-    setMessage('')
-    setError('')
-    setCategory('')
-  }
+  function closeCategory(){activeCategoryRef.current='';adminLoadSequence.current+=1;setData(null);setLoadedCategory('');setLoading(false);setError('');setMessage('');setCategory('')}
 
-  const activeTransporters = data?.transporters?.filter(t => t.active) || []
-  const normalizedVehicleId = vehicleForm.vehicleId.trim().toUpperCase()
-  const vehicleAlreadyExists = Boolean(
-      normalizedVehicleId && data?.vehicles?.some(v => v.vehicleId.toUpperCase() === normalizedVehicleId)
-  )
-
-  return <section>
-    <div className="pageTitle">
-      <div>
-        <h1>Admin</h1>
-        <p>Choose what you want to manage. Only the selected category is loaded.</p>
-      </div>
-      {category && <button onClick={closeCategory}>Close category</button>}
-    </div>
-
-    <div className="adminCategoryGrid">
-      {categories.map(c => <button
-          key={c.id}
-          className={`adminCategoryCard ${category === c.id ? 'active' : ''}`}
-          onClick={() => chooseCategory(c.id)}
-      >
-        <span className="adminCategoryIcon">{c.icon}</span>
-        <span className="adminCategoryText"><b>{c.title}</b><small>{c.description}</small></span>
-        <span className="adminCategoryArrow">›</span>
-      </button>)}
-    </div>
-
-    {message && <div className="success adminFeedback">{message}</div>}
-    {error && <div className="error adminFeedback">{error}</div>}
-
-    {!category && <div className="card adminWelcome">
-      <b>Select an Admin category above</b>
-      <p className="muted">Nothing else is loaded until you choose a category.</p>
-    </div>}
-
-    {category && loading && <Loading />}
-
-    {category && !loading && data && <div className="adminCategoryContent">
-      {category === 'transporters' && <AdminSection title="Transporters" subtitle="Deleting a transporter unassigns its vehicles; old receipts keep the transporter snapshot.">
-        <div className="inlineForm"><input placeholder="Transporter name" value={transporterName} onChange={e => setTransporterName(e.target.value)} /><button className="primary" onClick={() => action(async () => { await api('/admin/transporters', { method: 'POST', body: JSON.stringify({ name: transporterName }) }); setTransporterName('') }, 'Transporter added.')}>Add transporter</button></div>
-        <div className="adminRows">{data.transporters.map(t => <div className="adminRow" key={t.id}><b>{t.name}</b><span>{t.active ? 'Active' : 'Inactive'}</span><button className="dangerGhost" onClick={() => del('transporters', t, t.name)}>Delete</button></div>)}</div>
-      </AdminSection>}
-
-      {category === 'vehicles' && <AdminSection title="Vehicles" subtitle="Operating days only control when a vehicle is expected to have at least one IN and one OUT receipt. A vehicle can still submit receipts on any other day. New vehicles default to Monday–Friday.">
-        <div className="inlineForm three"><input placeholder="Vehicle ID" value={vehicleForm.vehicleId} onChange={e => setVehicleForm({ ...vehicleForm, vehicleId: e.target.value })} /><select value={vehicleForm.terminalId} onChange={e => setVehicleForm({ ...vehicleForm, terminalId: e.target.value })}>{data.terminals.map(t => <option key={t.id} value={t.id}>{t.code}</option>)}</select><select value={vehicleForm.transporterId} onChange={e => setVehicleForm({ ...vehicleForm, transporterId: e.target.value })}><option value="">Choose transporter</option>{activeTransporters.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}</select><button className="primary" disabled={!normalizedVehicleId || !vehicleForm.terminalId || !vehicleForm.transporterId || vehicleAlreadyExists} onClick={() => action(async () => { await api('/admin/vehicles', { method: 'POST', body: JSON.stringify({ vehicleId: normalizedVehicleId, terminalId: Number(vehicleForm.terminalId), transporterId: Number(vehicleForm.transporterId) }) }); setVehicleForm({ ...vehicleForm, vehicleId: '' }) }, 'Vehicle added.')}>Add vehicle</button></div>
-        {vehicleAlreadyExists && <div className="warningInline">Vehicle {normalizedVehicleId} already exists.</div>}
-        <div className="adminRows">{data.vehicles.map(v => <VehicleAdminRow key={v.id} row={v} transporters={data.transporters} saveTransporter={transporterId => action(() => api(`/admin/vehicles/${v.id}/transporter`, { method: 'PUT', body: JSON.stringify({ transporterId }) }), 'Transporter changed.')} saveSchedule={days => action(() => api(`/admin/vehicles/${v.id}/schedule`, { method: 'PUT', body: JSON.stringify({ days }) }), 'Operating days saved.')} remove={() => del('vehicles', v, v.vehicleId)} />)}</div>
-      </AdminSection>}
-
-      {category === 'holidays' && <AdminSection title="Holidays / non-working days" subtitle="These dates are excluded from the vehicle IN/OUT compliance check for every terminal. Receipts can still be submitted on a holiday if needed.">
-        <div className="inlineForm three"><input type="date" value={holidayForm.date} onChange={e => setHolidayForm({ ...holidayForm, date: e.target.value })} /><input placeholder="Name, e.g. Christmas Day" value={holidayForm.name} onChange={e => setHolidayForm({ ...holidayForm, name: e.target.value })} /><button className="primary" disabled={!holidayForm.date} onClick={() => action(async () => { await api('/admin/holidays', { method: 'POST', body: JSON.stringify(holidayForm) }); setHolidayForm({ date: dateInput(), name: '' }) }, 'Holiday added.')}>Add non-working day</button></div>
-        <div className="adminRows">{data.holidays.map(h => <div className="adminRow" key={h.id}><b>{formatDate(h.date)}</b><span>{h.name}</span><button className="dangerGhost" onClick={() => { if (window.confirm(`Remove ${formatDate(h.date)} ${h.name} from non-working days?`)) action(() => api(`/admin/holidays/${h.id}`, { method: 'DELETE' }), 'Holiday removed.') }}>Delete</button></div>)}</div>
-        {data.holidays.length === 0 && <Empty text="No holidays/non-working days registered yet." />}
-      </AdminSection>}
-
-      {category === 'drivers' && <AdminSection title="Driver names" subtitle="Removing a driver only removes the name from future selection. Historical receipts and driver statistics are preserved.">
-        <div className="warningInline" style={{ marginBottom: 14 }}><b>Admin warning:</b> Do not remove a driver to correct statistics. The name will disappear from future registration, but all old receipts remain and continue to count in historical statistics. Removed names can be restored later.</div>
-        <div className="inlineForm"><input placeholder="Driver name" value={driverForm.name} onChange={e => setDriverForm({ ...driverForm, name: e.target.value })} /><select value={driverForm.terminalId} onChange={e => setDriverForm({ ...driverForm, terminalId: e.target.value })}>{data.terminals.map(t => <option key={t.id} value={t.id}>{t.code}</option>)}</select><button className="primary" onClick={() => action(async () => { await api('/admin/drivers', { method: 'POST', body: JSON.stringify({ name: driverForm.name, terminalId: Number(driverForm.terminalId) }) }); setDriverForm({ ...driverForm, name: '' }) }, 'Driver added/restored.')}>Add driver</button></div>
-        <div className="adminRows">{data.drivers.map(d => <div className="adminRow driverAdmin" key={d.id}><b>{d.name}</b><span>{d.terminal}</span><span className={d.active ? 'positive' : 'muted'}><b>{d.active ? 'Active' : 'Removed'}</b></span>{d.active
-            ? <button className="dangerGhost" onClick={() => {
-              if (!window.confirm(`Remove ${d.name} from future selection?\n\nHistorical receipts and statistics will NOT be deleted. The driver can be restored later.`)) return
-              action(() => api(`/admin/drivers/${d.id}`, { method: 'DELETE' }), `${d.name} removed from future selection.`)
-            }}>Remove</button>
-            : <button onClick={() => action(() => api(`/admin/drivers/${d.id}/active`, { method: 'PUT', body: JSON.stringify({ active: true }) }), `${d.name} restored.`)}>Restore</button>}</div>)}</div>
-      </AdminSection>}
-
-      {category === 'pallets' && <AdminSection title="Pallet types">
-        <div className="inlineForm"><input placeholder="New pallet type" value={palletName} onChange={e => setPalletName(e.target.value)} /><button className="primary" onClick={() => action(async () => { await api('/admin/pallet-types', { method: 'POST', body: JSON.stringify({ name: palletName, userSelectable: true }) }); setPalletName('') }, 'Pallet type added.')}>Add pallet type</button></div>
-        <div className="adminRows">{data.palletTypes.map(p => <PalletAdminRow key={p.id} row={p} save={(next) => action(() => api(`/admin/pallet-types/${p.id}`, { method: 'PUT', body: JSON.stringify(next) }))} />)}</div>
-      </AdminSection>}
-
-      {category === 'users' && <AdminSection title="Users" subtitle="Create accounts or change display name, role, terminal, active status and password.">
-        <div className="inlineForm userAdd"><input placeholder="Username" value={userForm.username} onChange={e => setUserForm({ ...userForm, username: e.target.value })} /><input placeholder="Display name" value={userForm.displayName} onChange={e => setUserForm({ ...userForm, displayName: e.target.value })} /><input type="password" placeholder="Password" value={userForm.password} onChange={e => setUserForm({ ...userForm, password: e.target.value })} /><select value={userForm.role} onChange={e => setUserForm({ ...userForm, role: e.target.value })}><option>User</option><option>Superuser</option><option>Admin</option></select><select value={userForm.terminalId} onChange={e => setUserForm({ ...userForm, terminalId: e.target.value })}>{data.terminals.map(t => <option key={t.id} value={t.id}>{t.code}</option>)}</select><button className="primary" onClick={() => action(async () => { await api('/admin/users', { method: 'POST', body: JSON.stringify({ ...userForm, terminalId: Number(userForm.terminalId) }) }); setUserForm({ ...userForm, username: '', displayName: '', password: '' }) }, 'User created.')}>Create user</button></div>
-        <div className="adminRows">{data.users.map(u => <UserAdminRow key={u.id} row={u} terminals={data.terminals} save={(next) => action(() => api(`/admin/users/${u.id}`, { method: 'PUT', body: JSON.stringify(next) }), 'User updated.')} resetPassword={() => { const password = window.prompt(`New password for ${u.username}:`); if (password) action(() => api(`/admin/users/${u.id}/password`, { method: 'POST', body: JSON.stringify({ password }) }), 'Password changed.') }} />)}</div>
-      </AdminSection>}
-
-      {category === 'warnings' && <AdminWarningSettings settings={data.settings} save={next => action(() => api('/admin/settings', { method: 'PUT', body: JSON.stringify(next) }), 'Warning rules saved.')} />}
-
-      {category === 'notifications' && <AdminNotificationSettings settings={data.settings} save={next => action(() => api('/admin/settings', { method: 'PUT', body: JSON.stringify(next) }), 'Notification and general settings saved.')} />}
-
-      {category === 'driverStats' && <AdminDriverStatsSettings settings={data.settings} save={next => action(() => api('/admin/settings', { method: 'PUT', body: JSON.stringify(next) }), 'Driver statistics setting saved.')} />}
-
-      {category === 'tabAccess' && <AdminTabAccess users={data.users} save={(user, next) => action(() => api(`/admin/users/${user.id}/tab-access`, { method: 'PUT', body: JSON.stringify(next) }), `Tab access saved for ${user.username}.`)} />}
-
-      {category === 'database' && <AdminSection title="Database & backup" subtitle="This shows the actual SQLite file used by the running API. Backups are consistent SQLite snapshots, not normal file copies.">
-        <div className="detailGrid">
-          <span><small>Database file</small><b>{data.databasePath}</b></span>
-          <span><small>Database size</small>{Math.round(Number(data.databaseSizeBytes || 0) / 1024)} KB</span>
-          <span><small>Backup folder</small><b>{data.backupDirectory}</b></span>
-          <span><small>Automatic backup</small>Every {data.backupIntervalHours} hour(s)</span>
-          <span><small>Retention</small>{data.backupRetentionDays} days</span>
-          <span><small>Backup count</small>{data.backupCount}</span>
-          <span><small>Latest backup</small>{data.latestBackupUtc ? formatTimestamp(data.latestBackupUtc) : 'No backup yet'}</span>
-          <span><small>Latest backup file</small>{data.latestBackupPath || '—'}</span>
-        </div>
-        <button className="primary" onClick={() => action(() => api('/admin/database/backup', { method: 'POST', body: '{}' }), 'Database backup created.')}>Create backup now</button>
-      </AdminSection>}
+  return <section><div className="pageTitle"><div><h1>{superAdmin?'SuperAdmin':'Terminal Admin'} · {me.terminalCode}</h1><p>{superAdmin?'Global administration plus every terminal.':'Administration is restricted to your assigned terminal.'}</p></div>{category&&<button onClick={closeCategory}>Close category</button>}</div>
+    <div className="adminCategoryGrid">{categories.map(c=><button key={c.id} className={`adminCategoryCard ${category===c.id?'active':''}`} onClick={()=>choose(c.id)}><span className="adminCategoryIcon">{c.icon}</span><span className="adminCategoryText"><b>{c.title}</b><small>{c.description}</small></span><span className="adminCategoryArrow">›</span></button>)}</div>
+    {message&&<div className="success adminFeedback">{message}</div>}{error&&<div className="error adminFeedback">{error}</div>}
+    {!category&&<div className="card adminWelcome"><b>Select an Admin category above</b><p className="muted">TerminalAdmin cannot modify global configuration or another terminal.</p></div>}{category&&loading&&<Loading/>}
+    {category&&!loading&&data&&loadedCategory===category&&<div key={category} className="adminCategoryContent">
+      {category==='terminals'&&<AdminSection title="Terminals, display names & import aliases" subtitle="Code is the name shown in Linehaul/MottattKontroll statistics. Imports also match the full Name and Aliases. Renaming a code keeps historical Linehaul rows on the same terminal ID."><div className="inlineForm terminalCreate"><input placeholder="Code, e.g. SRD" value={terminalForm.code} onChange={e=>setTerminalForm({...terminalForm,code:e.target.value})}/><input placeholder="Terminal name, e.g. Sandefjord" value={terminalForm.name} onChange={e=>setTerminalForm({...terminalForm,name:e.target.value})}/><input placeholder="Aliases, e.g. SRD123; Sandefjord TS" value={terminalForm.aliases} onChange={e=>setTerminalForm({...terminalForm,aliases:e.target.value})}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/terminals',{method:'POST',body:JSON.stringify(terminalForm)});setTerminalForm({code:'',name:'',aliases:''})},'Terminal added.')}>Add terminal</button></div><div className="adminRows terminalAdminRows">{data.terminals.map(t=><TerminalAdminRow key={t.id} row={t} save={next=>action(()=>api(`/admin/terminals/${t.id}`,{method:'PUT',body:JSON.stringify(next)}),`Terminal ${next.code} updated.`)}/>)}</div></AdminSection>}
+      {category==='transporters'&&<AdminSection title="Global transporters"><div className="inlineForm"><input placeholder="Transporter name" value={transporterName} onChange={e=>setTransporterName(e.target.value)}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/transporters',{method:'POST',body:JSON.stringify({name:transporterName})});setTransporterName('')},'Transporter added.')}>Add transporter</button></div><div className="adminRows">{data.transporters.map(t=><div className="adminRow" key={t.id}><b>{t.name}</b><span>{t.active?'Active':'Inactive'}</span><button className="dangerGhost" onClick={()=>{if(window.confirm(`Delete ${t.name}?`))action(()=>api(`/admin/transporters/${t.id}`,{method:'DELETE'}),'Transporter deleted.')}}>Delete</button></div>)}</div></AdminSection>}
+      {category==='pallets'&&<AdminSection title="Global pallet types"><div className="inlineForm"><input placeholder="New pallet type" value={palletName} onChange={e=>setPalletName(e.target.value)}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/pallet-types',{method:'POST',body:JSON.stringify({name:palletName,userSelectable:true})});setPalletName('')},'Pallet type added.')}>Add pallet type</button></div><div className="adminRows">{data.palletTypes.map(p=><PalletAdminRow key={p.id} row={p} save={next=>action(()=>api(`/admin/pallet-types/${p.id}`,{method:'PUT',body:JSON.stringify(next)}))}/>)}</div></AdminSection>}
+      {category==='holidays'&&<AdminSection title="Global holidays / non-working days" subtitle="These remain global and can only be changed by SuperAdmin."><div className="inlineForm three"><input type="date" value={holidayForm.date} onChange={e=>setHolidayForm({...holidayForm,date:e.target.value})}/><input placeholder="Name" value={holidayForm.name} onChange={e=>setHolidayForm({...holidayForm,name:e.target.value})}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/holidays',{method:'POST',body:JSON.stringify(holidayForm)});setHolidayForm({date:dateInput(),name:''})},'Holiday added.')}>Add</button></div><div className="adminRows">{data.holidays.map(h=><div className="adminRow" key={h.id}><b>{formatDate(h.date)}</b><span>{h.name}</span><button className="dangerGhost" onClick={()=>action(()=>api(`/admin/holidays/${h.id}`,{method:'DELETE'}),'Holiday removed.')}>Delete</button></div>)}</div></AdminSection>}
+      {category==='vehicles'&&<AdminSection title={`Vehicles · ${data.terminals?.[0]?.code||me.terminalCode}`} subtitle={superAdmin?'SuperAdmin can assign vehicles to any terminal. TerminalAdmin only sees and changes its own terminal.':'Only vehicles belonging to your terminal are shown.'}><div className="inlineForm three"><input placeholder="Vehicle ID" value={vehicleForm.vehicleId} onChange={e=>setVehicleForm({...vehicleForm,vehicleId:e.target.value.toUpperCase()})}/><select value={vehicleForm.terminalId} onChange={e=>setVehicleForm({...vehicleForm,terminalId:e.target.value})}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select><select value={vehicleForm.transporterId} onChange={e=>setVehicleForm({...vehicleForm,transporterId:e.target.value})}><option value="">Choose transporter</option>{activeTransporters.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select><button className="primary" onClick={()=>action(async()=>{await api('/admin/vehicles',{method:'POST',body:JSON.stringify({vehicleId:vehicleForm.vehicleId,terminalId:Number(vehicleForm.terminalId),transporterId:Number(vehicleForm.transporterId)})});setVehicleForm({...vehicleForm,vehicleId:''})},'Vehicle added.')}>Add vehicle</button></div><div className="adminRows">{data.vehicles.map(v=><VehicleAdminRow key={v.id} row={v} transporters={data.transporters} saveTransporter={transporterId=>action(()=>api(`/admin/vehicles/${v.id}/transporter`,{method:'PUT',body:JSON.stringify({transporterId})}),'Transporter changed.')} saveSchedule={days=>action(()=>api(`/admin/vehicles/${v.id}/schedule`,{method:'PUT',body:JSON.stringify({days})}),'Operating days saved.')} remove={()=>{if(window.confirm(`Delete ${v.vehicleId}? Historical receipts keep snapshots.`))action(()=>api(`/admin/vehicles/${v.id}`,{method:'DELETE'}),'Vehicle deleted.')}}/>)}</div></AdminSection>}
+      {category==='drivers'&&<AdminSection title="Driver names" subtitle="Remove only hides a name from future registration; historical statistics remain."><div className="inlineForm"><input placeholder="Driver name" value={driverForm.name} onChange={e=>setDriverForm({...driverForm,name:e.target.value})}/><select value={driverForm.terminalId} onChange={e=>setDriverForm({...driverForm,terminalId:e.target.value})}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select><button className="primary" onClick={()=>action(async()=>{await api('/admin/drivers',{method:'POST',body:JSON.stringify({name:driverForm.name,terminalId:Number(driverForm.terminalId)})});setDriverForm({...driverForm,name:''})},'Driver added/restored.')}>Add driver</button></div><div className="adminRows">{data.drivers.map(d=><div className="adminRow driverAdmin" key={d.id}><b>{d.name}</b><span>{d.terminal}</span><span>{d.active?'Active':'Removed'}</span>{d.active?<button className="dangerGhost" onClick={()=>{if(window.confirm(`Remove ${d.name} from future selection? Historical receipts stay.`))action(()=>api(`/admin/drivers/${d.id}`,{method:'DELETE'}),'Driver removed.')}}>Remove</button>:<button onClick={()=>action(()=>api(`/admin/drivers/${d.id}/active`,{method:'PUT',body:JSON.stringify({active:true})}),'Driver restored.')}>Restore</button>}</div>)}</div></AdminSection>}
+      {category==='users'&&<AdminSection title="Users & module access" subtitle="Security role controls administration; module access controls which pallet-accounting tab groups the account can use."><div className="userCreateCard"><div className="inlineForm userAdd"><input placeholder="Username" value={userForm.username} onChange={e=>setUserForm({...userForm,username:e.target.value})}/><input placeholder="Display name" value={userForm.displayName} onChange={e=>setUserForm({...userForm,displayName:e.target.value})}/><input type="password" placeholder="Password" value={userForm.password} onChange={e=>setUserForm({...userForm,password:e.target.value})}/><select value={userForm.role} onChange={e=>setUserForm({...userForm,role:e.target.value})}>{roleOptions.map(r=><option key={r}>{r}</option>)}</select><select value={userForm.terminalId} onChange={e=>setUserForm({...userForm,terminalId:e.target.value})}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select></div><ModuleChecks value={userForm} setValue={setUserForm}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/users',{method:'POST',body:JSON.stringify({...userForm,terminalId:Number(userForm.terminalId)})});setUserForm({...userForm,username:'',displayName:'',password:''})},'User created.')}>Create user</button></div><div className="adminRows">{data.users.map(u=><UserAdminRow key={u.id} row={u} terminals={data.terminals} roles={roleOptions} save={next=>action(()=>api(`/admin/users/${u.id}`,{method:'PUT',body:JSON.stringify(next)}),'User updated.')} resetPassword={()=>{const password=window.prompt(`New password for ${u.username}:`);if(password)action(()=>api(`/admin/users/${u.id}/password`,{method:'POST',body:JSON.stringify({password})}),'Password changed.')}}/>)}</div></AdminSection>}
+      {category==='terminalSettings'&&<AdminSettingsScope title="Terminal settings" data={data} targetTerminalId={targetTerminalId} setTargetTerminalId={setTargetTerminalId} showTerminalSelect={superAdmin} save={next=>action(()=>api(`/admin/terminal-settings?terminalId=${targetTerminalId}`,{method:'PUT',body:JSON.stringify(next)}),'Terminal settings saved.')}/>}
+      {category==='globalSettings'&&<AdminOperationalSettings title="Global defaults" subtitle="SuperAdmin only. These values are copied when a new terminal gets its own settings; existing terminal settings remain independent." settings={data} save={next=>action(()=>api('/admin/settings',{method:'PUT',body:JSON.stringify(next)}),'Global defaults saved.')}/>}
+      {category==='linehaulComments'&&<AdminSection title={`Linehaul selectable comments · ${data.terminalCode}`} subtitle="These texts belong to the selected user terminal and appear regardless of which From/To terminal is chosen on Linehaul registration.">{superAdmin&&<label className="adminTerminalPicker">Terminal<select value={targetTerminalId} onChange={e=>setTargetTerminalId(e.target.value)}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code} — {t.name}</option>)}</select></label>}<div className="inlineForm"><input placeholder="Selectable comment" value={linehaulComment} onChange={e=>setLinehaulComment(e.target.value)}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/linehaul-comments',{method:'POST',body:JSON.stringify({terminalId:Number(targetTerminalId),text:linehaulComment})});setLinehaulComment('')},'Linehaul comment added.')}>Add comment</button></div><div className="adminRows">{data.comments.map(c=><div className="adminRow" key={c.id}><b>{c.text}</b><span>{c.active?'Active':'Inactive'}</span><button onClick={()=>action(()=>api(`/admin/linehaul-comments/${c.id}/active`,{method:'PUT',body:JSON.stringify({active:!c.active})}),c.active?'Comment disabled.':'Comment enabled.')}>{c.active?'Disable':'Enable'}</button></div>)}</div></AdminSection>}
+      {category==='database'&&<AdminSection title="Database & backup" subtitle="All modules use this same SQLite database, so Linehaul and MottattKontroll are included in every backup."><div className="detailGrid"><span><small>Database file</small><b>{data.databasePath}</b></span><span><small>Database size</small>{Math.round(Number(data.databaseSizeBytes||0)/1024)} KB</span><span><small>Backup folder</small><b>{data.backupDirectory}</b></span><span><small>Automatic backup</small>Every {data.backupIntervalHours} hour(s)</span><span><small>Retention</small>{data.backupRetentionDays} days</span><span><small>Backup count</small>{data.backupCount}</span><span><small>Latest backup</small>{data.latestBackupUtc?formatTimestamp(data.latestBackupUtc):'No backup yet'}</span></div><button className="primary" onClick={()=>action(()=>api('/admin/database/backup',{method:'POST',body:'{}'}),'Database backup created.')}>Create backup now</button></AdminSection>}
     </div>}
   </section>
+}
+
+function TerminalAdminRow({ row, save }) {
+  const [v,setV]=useState({code:row.code||'',name:row.name||'',aliases:row.aliases||'',active:row.active!==false})
+  useEffect(()=>setV({code:row.code||'',name:row.name||'',aliases:row.aliases||'',active:row.active!==false}),[row])
+  return <div className="adminRow terminalAdminRow">
+    <label><small>Code shown in statistics</small><input value={v.code} onChange={e=>setV({...v,code:e.target.value.toUpperCase()})}/></label>
+    <label><small>Name</small><input value={v.name} onChange={e=>setV({...v,name:e.target.value})}/></label>
+    <label><small>Import aliases</small><input value={v.aliases} onChange={e=>setV({...v,aliases:e.target.value})} placeholder="SRD123; Sandefjord"/></label>
+    <label className="miniCheck"><input type="checkbox" checked={v.active} onChange={e=>setV({...v,active:e.target.checked})}/> Active</label>
+    <button onClick={()=>save(v)}>Save</button>
+  </div>
+}
+
+function ModuleChecks({ value, setValue }) {
+  return <div className="moduleChecks"><label className="miniCheck"><input type="checkbox" checked={!!value.hasInternalPalletAccounting} onChange={e=>setValue(v=>({...v,hasInternalPalletAccounting:e.target.checked}))}/> InternPalleregnskap</label><label className="miniCheck"><input type="checkbox" checked={!!value.hasLinehaul} onChange={e=>setValue(v=>({...v,hasLinehaul:e.target.checked}))}/> Linehaul</label><label className="miniCheck"><input type="checkbox" checked={!!value.hasReceivedControl} onChange={e=>setValue(v=>({...v,hasReceivedControl:e.target.checked}))}/> MottattKontroll</label></div>
+}
+
+function AdminSettingsScope({ title, data, targetTerminalId, setTargetTerminalId, showTerminalSelect, save }) {
+  return <div>{showTerminalSelect&&<label className="adminTerminalPicker">Terminal<select value={targetTerminalId} onChange={e=>setTargetTerminalId(e.target.value)}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code} — {t.name}</option>)}</select></label>}<AdminOperationalSettings title={`${title} · ${data.terminalCode}`} subtitle="These values apply only to this terminal." settings={data.settings} save={save}/></div>
+}
+
+function AdminOperationalSettings({ title, subtitle, settings, save }) {
+  const [s,setS]=useState({...settings})
+  useEffect(()=>setS({...settings}),[settings])
+  const set=(k,v)=>setS(old=>({...old,[k]:v}))
+  return <div className="card adminSection"><h2>{title}</h2><p className="muted">{subtitle}</p><div className="settingsGroups adminSettingsTwoCol">
+    <SettingsGroup title="Submission warnings"><Rule label="Large IN" enabled={s.largeInEnabled} setEnabled={v=>set('largeInEnabled',v)} value={s.largeInThreshold} setValue={v=>set('largeInThreshold',v)} suffix="pallets"/><Rule label="Large OUT" enabled={s.largeOutEnabled} setEnabled={v=>set('largeOutEnabled',v)} value={s.largeOutThreshold} setValue={v=>set('largeOutThreshold',v)} suffix="pallets"/><Rule label="Recent vehicle submission" enabled={s.recentVehicleEnabled} setEnabled={v=>set('recentVehicleEnabled',v)} value={s.recentVehicleMinutes} setValue={v=>set('recentVehicleMinutes',v)} suffix="minutes"/><Rule label="Recent driver submission" enabled={s.recentDriverEnabled} setEnabled={v=>set('recentDriverEnabled',v)} value={s.recentDriverMinutes} setValue={v=>set('recentDriverMinutes',v)} suffix="minutes"/><Rule label="Possible exact duplicate" enabled={s.duplicateEnabled} setEnabled={v=>set('duplicateEnabled',v)} value={s.duplicateMinutes} setValue={v=>set('duplicateMinutes',v)} suffix="minutes"/><Rule label="Rapid submissions" enabled={s.rapidSubmissionsEnabled} setEnabled={v=>set('rapidSubmissionsEnabled',v)} value={s.rapidSubmissionCount} setValue={v=>set('rapidSubmissionCount',v)} suffix="submissions"/><Rule label="High vehicle daily total" enabled={s.dailyTotalEnabled} setEnabled={v=>set('dailyTotalEnabled',v)} value={s.dailyTotalThreshold} setValue={v=>set('dailyTotalThreshold',v)} suffix="pallets"/></SettingsGroup>
+    <SettingsGroup title="Receipt & driver rules"><SimpleRule label="Warning when receipt is cancelled" enabled={s.cancellationWarningEnabled} setEnabled={v=>set('cancellationWarningEnabled',v)}/><SimpleRule label="Warning when cancellation is reversed" enabled={s.cancellationReversedWarningEnabled} setEnabled={v=>set('cancellationReversedWarningEnabled',v)}/><SimpleRule label="Allow users to add driver names from Settings" enabled={s.allowUsersAddDrivers} setEnabled={v=>set('allowUsersAddDrivers',v)}/><div className="ruleRow"><label><b>Deduction per unmatched driver IN receipt</b></label><input className="smallNumber" type="number" min="0" max="5000" value={s.driverUnmatchedInDeduction??15} onChange={e=>set('driverUnmatchedInDeduction',Number(e.target.value))}/><span>pallets</span></div></SettingsGroup>
+    <SettingsGroup title="Submit notifications"><Rule label="Monthly milestones" enabled={s.milestoneNotificationsEnabled} setEnabled={v=>set('milestoneNotificationsEnabled',v)} value={s.monthlyMilestoneStep} setValue={v=>set('monthlyMilestoneStep',v)} suffix="pallet step"/><SimpleRule label="Leaderboard messages" enabled={s.leaderboardNotificationsEnabled} setEnabled={v=>set('leaderboardNotificationsEnabled',v)}/><SimpleRule label="Current monthly balance" enabled={s.balanceNotificationsEnabled} setEnabled={v=>set('balanceNotificationsEnabled',v)}/></SettingsGroup>
+  </div><button className="primary" onClick={()=>save(s)}>Save settings</button></div>
 }
 
 function VehicleAdminRow({ row, transporters, saveTransporter, saveSchedule, remove }) {
@@ -1734,12 +2008,10 @@ function PalletAdminRow({ row, save }) {
   return <div className="adminRow"><b>{row.name}</b><label className="miniCheck"><input type="checkbox" checked={active} onChange={e => setActive(e.target.checked)} /> Active</label><label className="miniCheck"><input type="checkbox" checked={selectable} onChange={e => setSelectable(e.target.checked)} /> User selectable</label><button onClick={() => save({ active, userSelectable: selectable })}>Save</button></div>
 }
 
-function UserAdminRow({ row, terminals, save, resetPassword }) {
-  const [displayName, setDisplayName] = useState(row.displayName)
-  const [role, setRole] = useState(row.role)
-  const [terminalId, setTerminalId] = useState(String(row.terminalId))
-  const [active, setActive] = useState(row.active)
-  return <div className="adminRow userAdmin"><b>{row.username}</b><input value={displayName} onChange={e => setDisplayName(e.target.value)} /><select value={role} onChange={e => setRole(e.target.value)}><option>User</option><option>Superuser</option><option>Admin</option></select><select value={terminalId} onChange={e => setTerminalId(e.target.value)}>{terminals.map(t => <option key={t.id} value={t.id}>{t.code}</option>)}</select><label className="miniCheck"><input type="checkbox" checked={active} onChange={e => setActive(e.target.checked)} /> Active</label><button onClick={() => save({ displayName, role, terminalId: Number(terminalId), active })}>Save</button><button onClick={resetPassword}>Password</button></div>
+function UserAdminRow({ row, terminals, roles, save, resetPassword }) {
+  const [v,setV]=useState({displayName:row.displayName,role:row.role,terminalId:String(row.terminalId),active:row.active,hasInternalPalletAccounting:row.hasInternalPalletAccounting!==false,hasLinehaul:!!row.hasLinehaul,hasReceivedControl:!!row.hasReceivedControl,showDriverStatisticsTab:row.showDriverStatisticsTab!==false,showDailyCheckTab:row.showDailyCheckTab!==false})
+  useEffect(()=>setV({displayName:row.displayName,role:row.role,terminalId:String(row.terminalId),active:row.active,hasInternalPalletAccounting:row.hasInternalPalletAccounting!==false,hasLinehaul:!!row.hasLinehaul,hasReceivedControl:!!row.hasReceivedControl,showDriverStatisticsTab:row.showDriverStatisticsTab!==false,showDailyCheckTab:row.showDailyCheckTab!==false}),[row])
+  return <div className="adminRow userAdmin userAdminExpanded"><div className="userIdentity"><b>{row.username}</b><small>{row.terminal}</small></div><input value={v.displayName} onChange={e=>setV({...v,displayName:e.target.value})}/><select value={v.role} onChange={e=>setV({...v,role:e.target.value})}>{roles.map(r=><option key={r}>{r}</option>)}</select><select value={v.terminalId} onChange={e=>setV({...v,terminalId:e.target.value})}>{terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select><label className="miniCheck"><input type="checkbox" checked={v.active} onChange={e=>setV({...v,active:e.target.checked})}/> Active</label><ModuleChecks value={v} setValue={setV}/>{v.hasInternalPalletAccounting&&<div className="moduleChecks subAccess"><label className="miniCheck"><input type="checkbox" checked={v.showDriverStatisticsTab} onChange={e=>setV({...v,showDriverStatisticsTab:e.target.checked})}/> Driver statistics</label><label className="miniCheck"><input type="checkbox" checked={v.showDailyCheckTab} onChange={e=>setV({...v,showDailyCheckTab:e.target.checked})}/> Daily Check</label></div>}<div className="userAdminActions"><button onClick={()=>save({...v,terminalId:Number(v.terminalId)})}>Save</button><button onClick={resetPassword}>Password</button></div></div>
 }
 
 function AdminWarningSettings({ settings, save }) {

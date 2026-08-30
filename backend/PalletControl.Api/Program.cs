@@ -153,15 +153,15 @@ builder.Services.AddAuthorization(options =>
     options.AddPolicy("InternalModule", policy => policy.RequireClaim("moduleInternal", "1"));
     options.AddPolicy("InternalElevated", policy => policy.RequireAssertion(ctx =>
         ctx.User.FindFirstValue("moduleInternal") == "1" &&
-        (ctx.User.IsInRole(Roles.SuperAdmin) || ctx.User.IsInRole(Roles.TerminalAdmin) || ctx.User.IsInRole(Roles.LegacyAdmin) || ctx.User.IsInRole(Roles.Superuser))));
+        (ctx.User.IsInRole(Roles.SuperAdmin) || ctx.User.IsInRole(Roles.Admin) || ctx.User.IsInRole(Roles.LegacyTerminalAdmin) || ctx.User.IsInRole(Roles.Superuser))));
     options.AddPolicy("LinehaulModule", policy => policy.RequireClaim("moduleLinehaul", "1"));
     options.AddPolicy("LinehaulAdmin", policy => policy.RequireAssertion(ctx =>
         ctx.User.FindFirstValue("moduleLinehaul") == "1" &&
-        (ctx.User.IsInRole(Roles.SuperAdmin) || ctx.User.IsInRole(Roles.TerminalAdmin) || ctx.User.IsInRole(Roles.LegacyAdmin))));
+        (ctx.User.IsInRole(Roles.SuperAdmin) || ctx.User.IsInRole(Roles.Admin) || ctx.User.IsInRole(Roles.LegacyTerminalAdmin))));
     options.AddPolicy("ReceivedControlModule", policy => policy.RequireClaim("moduleReceivedControl", "1"));
     options.AddPolicy("ReceivedControlAdmin", policy => policy.RequireAssertion(ctx =>
         ctx.User.FindFirstValue("moduleReceivedControl") == "1" &&
-        (ctx.User.IsInRole(Roles.SuperAdmin) || ctx.User.IsInRole(Roles.TerminalAdmin) || ctx.User.IsInRole(Roles.LegacyAdmin))));
+        (ctx.User.IsInRole(Roles.SuperAdmin) || ctx.User.IsInRole(Roles.Admin) || ctx.User.IsInRole(Roles.LegacyTerminalAdmin))));
 });
 
 var app = builder.Build();
@@ -176,13 +176,15 @@ using (var scope = app.Services.CreateScope())
     EnsureCompatibilitySchema(db);
     Seed(db);
     MigrateLegacyLinehaulLocations(db);
+    MigrateLegacyTransporters(db);
+    EnsureUserSettingsRows(db);
 }
 
 app.MapGet("/", () => Results.Ok(new
 {
     name = "Pallet Control API",
     status = "running",
-    version = "5.8.6"
+    version = "5.8.7"
 }));
 
 // Public health endpoint. This performs a real SQLite connection, real table read,
@@ -304,6 +306,7 @@ app.MapPost("/api/auth/login", async (LoginRequest req, AppDbContext db) =>
         expires: DateTime.UtcNow.AddHours(12),
         signingCredentials: creds);
 
+    var userSettings = await GetUserSettings(db, user.Id);
     return Results.Ok(new LoginResponse(
         new JwtSecurityTokenHandler().WriteToken(token),
         user.Username,
@@ -315,13 +318,15 @@ app.MapPost("/api/auth/login", async (LoginRequest req, AppDbContext db) =>
         user.ShowDailyCheckTab,
         user.HasInternalPalletAccounting,
         user.HasLinehaul,
-        user.HasReceivedControl));
+        user.HasReceivedControl,
+        userSettings.Theme));
 });
 
 app.MapGet("/api/me", async (ClaimsPrincipal principal, AppDbContext db) =>
 {
     var id = UserId(principal);
     var user = await db.Users.Include(x => x.Terminal).SingleAsync(x => x.Id == id);
+    var userSettings = await GetUserSettings(db, id);
     return Results.Ok(new
     {
         user.Id,
@@ -334,7 +339,8 @@ app.MapGet("/api/me", async (ClaimsPrincipal principal, AppDbContext db) =>
         user.ShowDailyCheckTab,
         user.HasInternalPalletAccounting,
         user.HasLinehaul,
-        user.HasReceivedControl
+        user.HasReceivedControl,
+        theme = userSettings.Theme
     });
 }).RequireAuthorization();
 
@@ -342,14 +348,16 @@ app.MapGet("/api/me/settings", async (ClaimsPrincipal principal, AppDbContext db
 {
     var user = await db.Users.FindAsync(UserId(principal));
     if (user is null) return Results.NotFound();
-    var settings = await GetTerminalSettings(db, user.TerminalId);
+    var terminalSettings = await GetTerminalSettings(db, user.TerminalId);
+    var userSettings = await GetUserSettings(db, user.Id);
 
     return Results.Ok(new
     {
-        user.ShowMilestoneNotifications,
-        user.ShowLeaderboardNotifications,
-        user.ShowBalanceNotifications,
-        settings.AllowUsersAddDrivers
+        userSettings.ShowMilestoneNotifications,
+        userSettings.ShowLeaderboardNotifications,
+        userSettings.ShowBalanceNotifications,
+        userSettings.Theme,
+        terminalSettings.AllowUsersAddDrivers
     });
 }).RequireAuthorization();
 
@@ -360,19 +368,30 @@ app.MapPut("/api/me/settings", async (
 {
     var user = await db.Users.FindAsync(UserId(principal));
     if (user is null) return Results.NotFound();
+    if (!ValidTheme(req.Theme))
+        return Results.BadRequest(new { message = "Unknown theme." });
 
-    user.ShowMilestoneNotifications = req.ShowMilestoneNotifications;
-    user.ShowLeaderboardNotifications = req.ShowLeaderboardNotifications;
-    user.ShowBalanceNotifications = req.ShowBalanceNotifications;
+    var userSettings = await GetUserSettings(db, user.Id);
+    userSettings.ShowMilestoneNotifications = req.ShowMilestoneNotifications;
+    userSettings.ShowLeaderboardNotifications = req.ShowLeaderboardNotifications;
+    userSettings.ShowBalanceNotifications = req.ShowBalanceNotifications;
+    userSettings.Theme = NormalizeTheme(req.Theme);
+
+    // Keep the original columns synchronized because the existing notification engine
+    // still reads them. UserSettings is the persistent home for personal UI preferences.
+    user.ShowMilestoneNotifications = userSettings.ShowMilestoneNotifications;
+    user.ShowLeaderboardNotifications = userSettings.ShowLeaderboardNotifications;
+    user.ShowBalanceNotifications = userSettings.ShowBalanceNotifications;
     await db.SaveChangesAsync();
 
-    var settings = await GetTerminalSettings(db, user.TerminalId);
+    var terminalSettings = await GetTerminalSettings(db, user.TerminalId);
     return Results.Ok(new
     {
-        user.ShowMilestoneNotifications,
-        user.ShowLeaderboardNotifications,
-        user.ShowBalanceNotifications,
-        settings.AllowUsersAddDrivers
+        userSettings.ShowMilestoneNotifications,
+        userSettings.ShowLeaderboardNotifications,
+        userSettings.ShowBalanceNotifications,
+        userSettings.Theme,
+        terminalSettings.AllowUsersAddDrivers
     });
 }).RequireAuthorization();
 
@@ -2054,7 +2073,7 @@ app.MapGet("/api/linehaul/receipts", async (
         .Distinct().ToList();
     var users = await db.Users.AsNoTracking().Where(x => userIds.Contains(x.Id)).ToDictionaryAsync(x => x.Id, x => x.DisplayName);
     var terminalCodes = await db.Terminals.AsNoTracking().ToDictionaryAsync(x => x.Id, x => x.Code);
-    var adminCanManageOwn = IsTerminalAdmin(principal) || Role(principal) == Roles.LegacyAdmin;
+    var adminCanManageOwn = IsTerminalAdmin(principal);
     return Results.Ok(new
     {
         from = start,
@@ -2611,7 +2630,7 @@ app.MapGet("/api/received-control/statistics", async (
         .Distinct().ToList();
     var users = await db.Users.AsNoTracking().Where(x => userIds.Contains(x.Id)).ToDictionaryAsync(x => x.Id, x => x.DisplayName);
     var terminalCodes = await db.Terminals.AsNoTracking().ToDictionaryAsync(x => x.Id, x => x.Code);
-    var canManage = IsSuperAdmin(principal) || IsTerminalAdmin(principal) || Role(principal) == Roles.LegacyAdmin;
+    var canManage = IsSuperAdmin(principal) || IsTerminalAdmin(principal);
     return Results.Ok(new
     {
         from = start, to = end,
@@ -3318,7 +3337,10 @@ app.MapGet("/api/admin/all", async (AppDbContext db) =>
     return Results.Ok(new
     {
         terminals = await db.Terminals.AsNoTracking().Where(x => x.IsOperatingTerminal).OrderBy(x => x.Code).ToListAsync(),
-        transporters = await db.Transporters.AsNoTracking().OrderBy(x => x.Name).ToListAsync(),
+        transporters = await db.Transporters.AsNoTracking()
+            .OrderBy(x => x.TerminalId).ThenBy(x => x.Name)
+            .Select(x => new { x.Id, x.Name, x.Active, x.TerminalId })
+            .ToListAsync(),
         vehicles = await db.Vehicles.AsNoTracking()
             .Include(x => x.Terminal)
             .Include(x => x.Transporter)
@@ -3371,13 +3393,26 @@ app.MapGet("/api/admin/all", async (AppDbContext db) =>
 }).RequireAuthorization(SuperAdminOnly());
 
 
-app.MapGet("/api/admin/transporters", async (AppDbContext db) =>
+app.MapGet("/api/admin/transporters", async (
+    int? terminalId,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
 {
+    var ownerTerminalId = ResolveAdminTerminal(principal, terminalId);
+    if (!CanManageTerminal(principal, ownerTerminalId)) return Results.Forbid();
+    var owner = await db.Terminals.AsNoTracking().FirstOrDefaultAsync(x => x.Id == ownerTerminalId && x.IsOperatingTerminal && x.Active);
+    if (owner is null) return Results.NotFound(new { message = "Operating terminal not found." });
+
     return Results.Ok(new
     {
-        transporters = await db.Transporters.AsNoTracking().OrderBy(x => x.Name).ToListAsync()
+        terminalId = ownerTerminalId,
+        terminalCode = owner.Code,
+        terminals = IsSuperAdmin(principal)
+            ? await db.Terminals.AsNoTracking().Where(x => x.Active && x.IsOperatingTerminal).OrderBy(x => x.Code).Select(x => new { x.Id, x.Code, x.Name }).ToListAsync()
+            : await db.Terminals.AsNoTracking().Where(x => x.Id == ownerTerminalId && x.IsOperatingTerminal).Select(x => new { x.Id, x.Code, x.Name }).ToListAsync(),
+        transporters = await db.Transporters.AsNoTracking().Where(x => x.TerminalId == ownerTerminalId).OrderBy(x => x.Name).ToListAsync()
     });
-}).RequireAuthorization(SuperAdminOnly());
+}).RequireAuthorization(AdminOnly());
 
 app.MapGet("/api/admin/vehicles", async (ClaimsPrincipal principal, AppDbContext db) =>
 {
@@ -3388,10 +3423,13 @@ app.MapGet("/api/admin/vehicles", async (ClaimsPrincipal principal, AppDbContext
     var terminals = IsSuperAdmin(principal)
         ? await db.Terminals.AsNoTracking().Where(x => x.Active && x.IsOperatingTerminal).OrderBy(x => x.Code).ToListAsync()
         : await db.Terminals.AsNoTracking().Where(x => x.Id == terminalId).ToListAsync();
+    var transporterQuery = db.Transporters.AsNoTracking().AsQueryable();
+    if (!IsSuperAdmin(principal)) transporterQuery = transporterQuery.Where(x => x.TerminalId == terminalId);
+    var transporters = await transporterQuery.OrderBy(x => x.Name).Select(x => new { x.Id, x.Name, x.Active, x.TerminalId }).ToListAsync();
     return Results.Ok(new
     {
         terminals,
-        transporters = await db.Transporters.AsNoTracking().OrderBy(x => x.Name).ToListAsync(),
+        transporters,
         vehicles = vehicles.Select(x => new
         {
             x.Id, x.VehicleId, x.Active, x.TerminalId, terminal = x.Terminal!.Code,
@@ -3428,7 +3466,7 @@ app.MapGet("/api/admin/users", async (ClaimsPrincipal principal, AppDbContext db
 {
     var terminalId = TerminalId(principal);
     var q = db.Users.AsNoTracking().Include(x => x.Terminal).AsQueryable();
-    if (!IsSuperAdmin(principal)) q = q.Where(x => x.TerminalId == terminalId && x.Role != Roles.SuperAdmin && x.Role != Roles.LegacyAdmin);
+    if (!IsSuperAdmin(principal)) q = q.Where(x => x.TerminalId == terminalId && x.Role != Roles.SuperAdmin);
     var terminals = IsSuperAdmin(principal)
         ? await db.Terminals.AsNoTracking().Where(x => x.Active && x.IsOperatingTerminal).OrderBy(x => x.Code).ToListAsync()
         : await db.Terminals.AsNoTracking().Where(x => x.Id == terminalId).ToListAsync();
@@ -3500,19 +3538,24 @@ app.MapPost("/api/admin/transporters", async (
     ClaimsPrincipal principal,
     AppDbContext db) =>
 {
-    var name = req.Name.Trim();
+    var terminalId = ResolveAdminTerminal(principal, req.TerminalId);
+    if (!CanManageTerminal(principal, terminalId)) return Results.Forbid();
+    if (!await db.Terminals.AnyAsync(x => x.Id == terminalId && x.IsOperatingTerminal && x.Active))
+        return Results.BadRequest(new { message = "Operating terminal not found." });
+
+    var name = (req.Name ?? "").Trim();
     if (string.IsNullOrWhiteSpace(name))
         return Results.BadRequest(new { message = "Transporter name is required." });
 
-    if (await db.Transporters.AnyAsync(x => x.Name.ToLower() == name.ToLower()))
-        return Results.BadRequest(new { message = "Transporter already exists." });
+    if (await db.Transporters.AnyAsync(x => x.TerminalId == terminalId && x.Name.ToLower() == name.ToLower()))
+        return Results.BadRequest(new { message = "Transporter already exists for this terminal." });
 
-    var row = new Transporter { Name = name, Active = true };
+    var row = new Transporter { Name = name, Active = true, TerminalId = terminalId };
     db.Transporters.Add(row);
     await db.SaveChangesAsync();
-    await Audit(db, principal, "TRANSPORTER_CREATE", $"Created transporter {name}");
+    await Audit(db, principal, "TRANSPORTER_CREATE", $"Created transporter {name} for terminal {terminalId}");
     return Results.Ok(row);
-}).RequireAuthorization(SuperAdminOnly());
+}).RequireAuthorization(AdminOnly());
 
 app.MapDelete("/api/admin/transporters/{id:int}", async (
     int id,
@@ -3521,16 +3564,16 @@ app.MapDelete("/api/admin/transporters/{id:int}", async (
 {
     var row = await db.Transporters.FindAsync(id);
     if (row is null) return Results.NotFound();
+    if (!CanManageTerminal(principal, row.TerminalId)) return Results.Forbid();
 
     var vehicles = await db.Vehicles.Where(x => x.TransporterId == id).ToListAsync();
-    foreach (var vehicle in vehicles)
-        vehicle.TransporterId = null;
+    foreach (var vehicle in vehicles) vehicle.TransporterId = null;
 
     db.Transporters.Remove(row);
     await db.SaveChangesAsync();
-    await Audit(db, principal, "TRANSPORTER_DELETE", $"Deleted transporter {row.Name}; {vehicles.Count} vehicle(s) became unassigned");
+    await Audit(db, principal, "TRANSPORTER_DELETE", $"Deleted transporter {row.Name} from terminal {row.TerminalId}; {vehicles.Count} vehicle(s) became unassigned");
     return Results.Ok();
-}).RequireAuthorization(SuperAdminOnly());
+}).RequireAuthorization(AdminOnly());
 
 app.MapPost("/api/admin/vehicles", async (
     AdminVehicleRequest req,
@@ -3548,8 +3591,8 @@ app.MapPost("/api/admin/vehicles", async (
     if (!await db.Terminals.AnyAsync(x => x.Id == req.TerminalId && x.IsOperatingTerminal && x.Active))
         return Results.BadRequest(new { message = "Operating terminal not found." });
 
-    if (!await db.Transporters.AnyAsync(x => x.Id == req.TransporterId && x.Active))
-        return Results.BadRequest(new { message = "Transporter not found." });
+    if (!await db.Transporters.AnyAsync(x => x.Id == req.TransporterId && x.Active && x.TerminalId == req.TerminalId))
+        return Results.BadRequest(new { message = "Transporter not found for this terminal." });
 
     var row = new Vehicle
     {
@@ -3575,8 +3618,8 @@ app.MapPut("/api/admin/vehicles/{id:int}/transporter", async (
     if (row is null) return Results.NotFound();
     if (!CanManageTerminal(principal, row.TerminalId)) return Results.Forbid();
 
-    if (!await db.Transporters.AnyAsync(x => x.Id == req.TransporterId && x.Active))
-        return Results.BadRequest(new { message = "Transporter not found." });
+    if (!await db.Transporters.AnyAsync(x => x.Id == req.TransporterId && x.Active && x.TerminalId == row.TerminalId))
+        return Results.BadRequest(new { message = "Transporter not found for this terminal." });
 
     row.TransporterId = req.TransporterId;
     await db.SaveChangesAsync();
@@ -3752,6 +3795,15 @@ app.MapPost("/api/admin/users", async (
     };
     row.PasswordHash = new PasswordHasher<AppUser>().HashPassword(row, req.Password);
     db.Users.Add(row); await db.SaveChangesAsync();
+    db.UserSettings.Add(new UserSettingsRecord
+    {
+        UserId = row.Id,
+        Theme = "normal",
+        ShowMilestoneNotifications = row.ShowMilestoneNotifications,
+        ShowLeaderboardNotifications = row.ShowLeaderboardNotifications,
+        ShowBalanceNotifications = row.ShowBalanceNotifications
+    });
+    await db.SaveChangesAsync();
     await Audit(db, principal, "USER_CREATE", $"Created user {username} ({req.Role}) modules internal={row.HasInternalPalletAccounting}, linehaul={row.HasLinehaul}, received={row.HasReceivedControl}");
     return Results.Ok();
 }).RequireAuthorization(AdminOnly());
@@ -3768,7 +3820,7 @@ app.MapPut("/api/admin/users/{id:int}", async (
     if (!CanManageTerminal(principal, row.TerminalId) || !CanManageTerminal(principal, req.TerminalId)) return Results.Forbid();
     if (!await db.Terminals.AnyAsync(x => x.Id == req.TerminalId && x.IsOperatingTerminal && x.Active))
         return Results.BadRequest(new { message = "Operating terminal not found." });
-    if (!IsSuperAdmin(principal) && (row.Role == Roles.SuperAdmin || row.Role == Roles.LegacyAdmin || req.Role == Roles.SuperAdmin)) return Results.Forbid();
+    if (!IsSuperAdmin(principal) && (row.Role == Roles.SuperAdmin || req.Role == Roles.SuperAdmin)) return Results.Forbid();
 
     row.DisplayName = req.DisplayName.Trim();
     row.Role = req.Role;
@@ -3793,7 +3845,7 @@ app.MapPut("/api/admin/users/{id:int}/tab-access", async (
     var row = await db.Users.FindAsync(id);
     if (row is null) return Results.NotFound();
     if (!CanManageTerminal(principal, row.TerminalId)) return Results.Forbid();
-    if (!IsSuperAdmin(principal) && (row.Role == Roles.SuperAdmin || row.Role == Roles.LegacyAdmin)) return Results.Forbid();
+    if (!IsSuperAdmin(principal) && row.Role == Roles.SuperAdmin) return Results.Forbid();
 
     row.ShowDriverStatisticsTab = req.ShowDriverStatisticsTab;
     row.ShowDailyCheckTab = req.ShowDailyCheckTab;
@@ -3815,7 +3867,7 @@ app.MapPost("/api/admin/users/{id:int}/password", async (
     var row = await db.Users.FindAsync(id);
     if (row is null) return Results.NotFound();
     if (!CanManageTerminal(principal, row.TerminalId)) return Results.Forbid();
-    if (!IsSuperAdmin(principal) && (row.Role == Roles.SuperAdmin || row.Role == Roles.LegacyAdmin)) return Results.Forbid();
+    if (!IsSuperAdmin(principal) && row.Role == Roles.SuperAdmin) return Results.Forbid();
     row.PasswordHash = new PasswordHasher<AppUser>().HashPassword(row, req.Password);
     await db.SaveChangesAsync();
     await Audit(db, principal, "USER_PASSWORD", $"Reset password for {row.Username}");
@@ -3868,8 +3920,8 @@ app.Run("http://0.0.0.0:5000");
 
 // ---------------- HELPERS ----------------
 
-static AuthorizeAttribute AdminOnly() => new() { Roles = $"{Roles.SuperAdmin},{Roles.TerminalAdmin},{Roles.LegacyAdmin}" };
-static AuthorizeAttribute SuperAdminOnly() => new() { Roles = $"{Roles.SuperAdmin},{Roles.LegacyAdmin}" };
+static AuthorizeAttribute AdminOnly() => new() { Roles = $"{Roles.SuperAdmin},{Roles.Admin},{Roles.LegacyTerminalAdmin}" };
+static AuthorizeAttribute SuperAdminOnly() => new() { Roles = Roles.SuperAdmin };
 
 static int UserId(ClaimsPrincipal principal) =>
     int.Parse(principal.FindFirstValue(ClaimTypes.NameIdentifier)
@@ -3882,12 +3934,91 @@ static int TerminalId(ClaimsPrincipal principal) =>
 static string Role(ClaimsPrincipal principal) =>
     principal.FindFirstValue(ClaimTypes.Role) ?? Roles.User;
 
-static bool ValidRole(string role) => role is Roles.SuperAdmin or Roles.TerminalAdmin or Roles.Superuser or Roles.User or Roles.LegacyAdmin;
+static bool ValidRole(string role) => role is Roles.SuperAdmin or Roles.Admin or Roles.Superuser or Roles.User;
 
-static bool IsSuperAdmin(ClaimsPrincipal principal) => Role(principal) is Roles.SuperAdmin or Roles.LegacyAdmin;
-static bool IsTerminalAdmin(ClaimsPrincipal principal) => Role(principal) == Roles.TerminalAdmin;
+static bool IsSuperAdmin(ClaimsPrincipal principal) => Role(principal) == Roles.SuperAdmin;
+static bool IsTerminalAdmin(ClaimsPrincipal principal) => Role(principal) is Roles.Admin or Roles.LegacyTerminalAdmin;
 static bool CanManageTerminal(ClaimsPrincipal principal, int terminalId) => IsSuperAdmin(principal) || (IsTerminalAdmin(principal) && TerminalId(principal) == terminalId);
 static int ResolveAdminTerminal(ClaimsPrincipal principal, int? requestedTerminalId) => IsSuperAdmin(principal) ? (requestedTerminalId ?? TerminalId(principal)) : TerminalId(principal);
+
+static string NormalizeTheme(string? theme) => (theme ?? "normal").Trim().ToLowerInvariant() switch
+{
+    "dark" => "dark",
+    "terminal" => "terminal",
+    "pallet-stealer" => "pallet-stealer",
+    _ => "normal"
+};
+
+static bool ValidTheme(string? theme) => NormalizeTheme(theme) == (theme ?? "normal").Trim().ToLowerInvariant() ||
+    string.IsNullOrWhiteSpace(theme) || (theme ?? "").Equals("normal", StringComparison.OrdinalIgnoreCase);
+
+static async Task<UserSettingsRecord> GetUserSettings(AppDbContext db, int userId)
+{
+    var row = await db.UserSettings.SingleOrDefaultAsync(x => x.UserId == userId);
+    if (row is not null) return row;
+
+    var user = await db.Users.AsNoTracking().SingleAsync(x => x.Id == userId);
+    row = new UserSettingsRecord
+    {
+        UserId = userId,
+        Theme = "normal",
+        ShowMilestoneNotifications = user.ShowMilestoneNotifications,
+        ShowLeaderboardNotifications = user.ShowLeaderboardNotifications,
+        ShowBalanceNotifications = user.ShowBalanceNotifications
+    };
+    db.UserSettings.Add(row);
+    await db.SaveChangesAsync();
+    return row;
+}
+
+static void EnsureUserSettingsRows(AppDbContext db)
+{
+    var existing = db.UserSettings.AsNoTracking().Select(x => x.UserId).ToHashSet();
+    var users = db.Users.AsNoTracking().ToList().Where(x => !existing.Contains(x.Id)).ToList();
+    if (users.Count == 0) return;
+    db.UserSettings.AddRange(users.Select(user => new UserSettingsRecord
+    {
+        UserId = user.Id,
+        Theme = "normal",
+        ShowMilestoneNotifications = user.ShowMilestoneNotifications,
+        ShowLeaderboardNotifications = user.ShowLeaderboardNotifications,
+        ShowBalanceNotifications = user.ShowBalanceNotifications
+    }));
+    db.SaveChanges();
+}
+
+static void MigrateLegacyTransporters(AppDbContext db)
+{
+    var terminals = db.Terminals.AsNoTracking().Where(x => x.IsOperatingTerminal && x.Active).OrderBy(x => x.Code).ToList();
+    if (terminals.Count == 0) return;
+
+    var legacy = db.Transporters.Where(x => x.TerminalId == 0).ToList();
+    foreach (var source in legacy)
+    {
+        var originalId = source.Id;
+        var preferred = terminals.FirstOrDefault(x => x.Code == "SRD") ?? terminals[0];
+        source.TerminalId = preferred.Id;
+        db.SaveChanges();
+
+        var rowsByTerminal = new Dictionary<int, Transporter> { [preferred.Id] = source };
+        foreach (var terminal in terminals.Where(x => x.Id != preferred.Id))
+        {
+            var existing = db.Transporters.FirstOrDefault(x => x.TerminalId == terminal.Id && x.Name == source.Name);
+            if (existing is null)
+            {
+                existing = new Transporter { Name = source.Name, Active = source.Active, TerminalId = terminal.Id };
+                db.Transporters.Add(existing);
+                db.SaveChanges();
+            }
+            rowsByTerminal[terminal.Id] = existing;
+        }
+
+        var vehicles = db.Vehicles.Where(x => x.TransporterId == originalId).ToList();
+        foreach (var vehicle in vehicles)
+            if (rowsByTerminal.TryGetValue(vehicle.TerminalId, out var target)) vehicle.TransporterId = target.Id;
+        db.SaveChanges();
+    }
+}
 
 static List<int> ParseIds(string? value) =>
     string.IsNullOrWhiteSpace(value)
@@ -3951,6 +4082,15 @@ static void EnsureCompatibilitySchema(AppDbContext db)
             while (reader.Read())
                 userColumns.Add(reader.GetString(1));
         }
+        // UserSettings was introduced in v5.8.7. Its absence is a one-time marker
+        // for converting the previous role names. This prevents newly-created Admin
+        // accounts from ever being promoted on later server restarts.
+        var hadUserSettingsTable = false;
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='UserSettings';";
+            hadUserSettingsTable = Convert.ToInt32(cmd.ExecuteScalar(), CultureInfo.InvariantCulture) > 0;
+        }
 
         if (!userColumns.Contains("ShowDriverStatisticsTab"))
         {
@@ -3985,9 +4125,18 @@ static void EnsureCompatibilitySchema(AppDbContext db)
             cmd.CommandText = "ALTER TABLE \"Users\" ADD COLUMN \"HasReceivedControl\" INTEGER NOT NULL DEFAULT 0;";
             cmd.ExecuteNonQuery();
         }
+        // Before v5.8.7, Admin meant the old global administrator and TerminalAdmin
+        // meant terminal-scoped administration. On the first v5.8.7 upgrade only,
+        // promote the old Admin accounts to SuperAdmin, then rename TerminalAdmin to Admin.
+        if (!hadUserSettingsTable)
+        {
+            using var promote = connection.CreateCommand();
+            promote.CommandText = "UPDATE \"Users\" SET \"Role\"='SuperAdmin' WHERE \"Role\"='Admin';";
+            promote.ExecuteNonQuery();
+        }
         using (var cmd = connection.CreateCommand())
         {
-            cmd.CommandText = "UPDATE \"Users\" SET \"Role\"='SuperAdmin' WHERE \"Role\"='Admin';";
+            cmd.CommandText = "UPDATE \"Users\" SET \"Role\"='Admin' WHERE \"Role\"='TerminalAdmin';";
             cmd.ExecuteNonQuery();
         }
 
@@ -4040,6 +4189,30 @@ static void EnsureCompatibilitySchema(AppDbContext db)
             cmd.ExecuteNonQuery();
         }
 
+        var transporterColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA table_info('Transporters');";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read()) transporterColumns.Add(reader.GetString(1));
+        }
+        if (!transporterColumns.Contains("TerminalId"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"Transporters\" ADD COLUMN \"TerminalId\" INTEGER NOT NULL DEFAULT 0;";
+            cmd.ExecuteNonQuery();
+        }
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = "DROP INDEX IF EXISTS \"IX_Transporters_Name\";";
+            cmd.ExecuteNonQuery();
+        }
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = "CREATE UNIQUE INDEX IF NOT EXISTS \"IX_Transporters_TerminalId_Name\" ON \"Transporters\" (\"TerminalId\", \"Name\");";
+            cmd.ExecuteNonQuery();
+        }
+
         var settingsColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         using (var cmd = connection.CreateCommand())
         {
@@ -4053,6 +4226,23 @@ static void EnsureCompatibilitySchema(AppDbContext db)
         {
             using var cmd = connection.CreateCommand();
             cmd.CommandText = "ALTER TABLE \"Settings\" ADD COLUMN \"DriverUnmatchedInDeduction\" INTEGER NOT NULL DEFAULT 15;";
+            cmd.ExecuteNonQuery();
+        }
+
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = """
+CREATE TABLE IF NOT EXISTS "UserSettings" (
+    "Id" INTEGER NOT NULL CONSTRAINT "PK_UserSettings" PRIMARY KEY AUTOINCREMENT,
+    "UserId" INTEGER NOT NULL,
+    "Theme" TEXT NOT NULL DEFAULT 'normal',
+    "ShowMilestoneNotifications" INTEGER NOT NULL DEFAULT 1,
+    "ShowLeaderboardNotifications" INTEGER NOT NULL DEFAULT 1,
+    "ShowBalanceNotifications" INTEGER NOT NULL DEFAULT 1,
+    CONSTRAINT "FK_UserSettings_Users_UserId" FOREIGN KEY ("UserId") REFERENCES "Users" ("Id") ON DELETE CASCADE
+);
+CREATE UNIQUE INDEX IF NOT EXISTS "IX_UserSettings_UserId" ON "UserSettings" ("UserId");
+""";
             cmd.ExecuteNonQuery();
         }
 
@@ -5104,14 +5294,15 @@ static void Seed(AppDbContext db)
     var krs = new Terminal { Code = "KRS", Name = "Kristiansand", Active = true, IsOperatingTerminal = true };
     var are = new Terminal { Code = "ARE", Name = "Arendal", Active = true, IsOperatingTerminal = true };
     db.Terminals.AddRange(srd, krs, are);
+    db.SaveChanges(); // IDs are required by terminal-scoped transporters/settings.
 
     db.PalletTypes.AddRange(
         new PalletType { Name = "EUR pallet", Active = true, UserSelectable = true },
         new PalletType { Name = "Half pallet", Active = true, UserSelectable = true },
         new PalletType { Name = "One-time pallet", Active = true, UserSelectable = true });
 
-    var telemark = new Transporter { Name = "Telemark TransportService", Active = true };
-    var frode = new Transporter { Name = "Frode Bjønnes", Active = true };
+    var telemark = new Transporter { Name = "Telemark TransportService", Active = true, TerminalId = srd.Id };
+    var frode = new Transporter { Name = "Frode Bjønnes", Active = true, TerminalId = srd.Id };
     db.Transporters.AddRange(telemark, frode);
 
     db.SaveChanges();
@@ -5303,10 +5494,10 @@ public sealed record ExportTable(string Name, List<string> Headers, List<List<ob
 public static class Roles
 {
     public const string SuperAdmin = "SuperAdmin";
-    public const string TerminalAdmin = "TerminalAdmin";
+    public const string Admin = "Admin";
+    public const string LegacyTerminalAdmin = "TerminalAdmin";
     public const string Superuser = "Superuser";
     public const string User = "User";
-    public const string LegacyAdmin = "Admin";
 }
 
 public static class ReceiptStatus
@@ -5330,6 +5521,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
     public DbSet<AppSettings> Settings => Set<AppSettings>();
     public DbSet<TerminalSettings> TerminalSettings => Set<TerminalSettings>();
+    public DbSet<UserSettingsRecord> UserSettings => Set<UserSettingsRecord>();
     public DbSet<Holiday> Holidays => Set<Holiday>();
     public DbSet<LinehaulReceipt> LinehaulReceipts => Set<LinehaulReceipt>();
     public DbSet<LinehaulCommentOption> LinehaulCommentOptions => Set<LinehaulCommentOption>();
@@ -5340,13 +5532,16 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     {
         b.Entity<AppUser>().HasIndex(x => x.Username).IsUnique();
         b.Entity<Vehicle>().HasIndex(x => x.VehicleId).IsUnique();
-        b.Entity<Transporter>().HasIndex(x => x.Name).IsUnique();
+        b.Entity<Transporter>().HasIndex(x => new { x.TerminalId, x.Name }).IsUnique();
         b.Entity<PalletType>().HasIndex(x => x.Name).IsUnique();
         b.Entity<PalletReceipt>().HasIndex(x => x.ReceiptNumber).IsUnique();
         b.Entity<PalletReceipt>().HasIndex(x => x.IdempotencyKey).IsUnique();
         b.Entity<WarningEvent>().HasIndex(x => new { x.TerminalId, x.AcknowledgedAtUtc, x.CreatedAtUtc });
         b.Entity<Holiday>().HasIndex(x => x.Date).IsUnique();
         b.Entity<TerminalSettings>().HasIndex(x => x.TerminalId).IsUnique();
+        b.Entity<UserSettingsRecord>().ToTable("UserSettings");
+        b.Entity<UserSettingsRecord>().HasIndex(x => x.UserId).IsUnique();
+        b.Entity<UserSettingsRecord>().HasOne(x => x.User).WithOne().HasForeignKey<UserSettingsRecord>(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
         b.Entity<LinehaulReceipt>().HasIndex(x => x.ReceiptNumber).IsUnique();
         b.Entity<LinehaulReceipt>().HasIndex(x => x.PalletReceiptNumber);
         b.Entity<LinehaulReceipt>().HasIndex(x => new { x.FromTerminalId, x.ToTerminalId, x.BusinessDate });
@@ -5457,6 +5652,7 @@ public class Transporter
     public int Id { get; set; }
     public string Name { get; set; } = "";
     public bool Active { get; set; } = true;
+    public int TerminalId { get; set; }
     [JsonIgnore] public List<Vehicle> Vehicles { get; set; } = [];
 }
 
@@ -5581,6 +5777,17 @@ public class AuditLog
     public DateTime CreatedAtUtc { get; set; }
 }
 
+
+public class UserSettingsRecord
+{
+    public int Id { get; set; }
+    public int UserId { get; set; }
+    public string Theme { get; set; } = "normal";
+    public bool ShowMilestoneNotifications { get; set; } = true;
+    public bool ShowLeaderboardNotifications { get; set; } = true;
+    public bool ShowBalanceNotifications { get; set; } = true;
+    [JsonIgnore] public AppUser? User { get; set; }
+}
 
 public class TerminalSettings
 {
@@ -5819,15 +6026,15 @@ public record ReceiptValidation(string? Error, Vehicle? Vehicle, Driver? Driver,
 }
 
 public record LoginRequest(string Username, string Password);
-public record LoginResponse(string Token, string Username, string DisplayName, string Role, int TerminalId, string TerminalCode, bool ShowDriverStatisticsTab, bool ShowDailyCheckTab, bool HasInternalPalletAccounting, bool HasLinehaul, bool HasReceivedControl);
+public record LoginResponse(string Token, string Username, string DisplayName, string Role, int TerminalId, string TerminalCode, bool ShowDriverStatisticsTab, bool ShowDailyCheckTab, bool HasInternalPalletAccounting, bool HasLinehaul, bool HasReceivedControl, string Theme);
 public record QuickDriverRequest(string Name);
 public record ReceiptItemRequest(int PalletTypeId, int Quantity);
 public record CreateReceiptRequest(string IdempotencyKey, int VehicleId, int DriverId, string Direction, List<ReceiptItemRequest> Items, bool ConfirmWarnings = false, DateOnly? BusinessDate = null);
 public record CancelRequest(string Reason);
 public record ReverseCancellationRequest(string? Reason);
-public record UserPreferenceRequest(bool ShowMilestoneNotifications, bool ShowLeaderboardNotifications, bool ShowBalanceNotifications);
+public record UserPreferenceRequest(bool ShowMilestoneNotifications, bool ShowLeaderboardNotifications, bool ShowBalanceNotifications, string Theme);
 
-public record AdminTransporterRequest(string Name);
+public record AdminTransporterRequest(string Name, int? TerminalId = null);
 public record AdminVehicleRequest(string VehicleId, int TerminalId, int TransporterId);
 public record VehicleTransporterRequest(int TransporterId);
 public record VehicleScheduleRequest(List<int>? Days);

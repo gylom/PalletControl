@@ -1543,3 +1543,208 @@ tr.rcOrange > td.stickyActionCol { background: #ffedd5 !important; }
 tr.rcGreen > td.stickyActionCol { background: #dcfce7 !important; }
 tr.cancelledTableRow > td.stickyActionCol { background: #f8fafc !important; }
 .pageTitleActions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+
+/* ===== v5.8.7 PERSISTENT USER THEMES ===== */
+.themeSettingsCard { max-width: 920px; }
+.themeSettingsCard h3 { margin: 18px 0 9px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: #64748b; }
+.themeChoiceGrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.themeChoice {
+    position: relative;
+    min-height: 92px;
+    display: grid;
+    grid-template-columns: 44px 1fr auto;
+    align-items: center;
+    gap: 12px;
+    text-align: left;
+    border: 1px solid #dbe3ec;
+    border-radius: 14px;
+    padding: 14px;
+    background: #fff;
+    color: #172033;
+}
+.themeChoice > span:nth-child(2) { display: flex; flex-direction: column; gap: 4px; }
+.themeChoice small { font-weight: 500; color: #64748b; line-height: 1.35; }
+.themeChoice.selected { border-color: #111827; box-shadow: 0 0 0 2px rgba(17,24,39,.11); }
+.themePreviewIcon { width: 42px; height: 42px; display: grid; place-items: center; border-radius: 11px; background: #eef2f7; font-size: 21px; }
+.themeSelectedMark { font-size: 18px; font-weight: 900; }
+.themePreview-dark { background: #111827; color: #f8fafc; border-color: #334155; }
+.themePreview-dark small { color: #cbd5e1; }
+.themePreview-dark .themePreviewIcon { background: #273449; }
+.themePreview-terminal { background: #f4f0df; color: #283328; border-color: #a69263; }
+.themePreview-terminal small { color: #66705c; }
+.themePreview-terminal .themePreviewIcon { background: repeating-linear-gradient(90deg,#b18a52 0 6px,#d8b77d 6px 12px); }
+.themePreview-pallet-stealer { background: #17131f; color: #f5f3ff; border-color: #7c3aed; }
+.themePreview-pallet-stealer small { color: #c4b5fd; }
+.themePreview-pallet-stealer .themePreviewIcon { background: repeating-linear-gradient(135deg,#312e81 0 8px,#4c1d95 8px 16px); }
+.specialThemeTitle { margin-top: 20px !important; }
+.settingsSectionHeading { margin: 28px 0 12px; padding-top: 22px; border-top: 1px solid #dbe3ec; }
+.settingsSectionHeading h2 { margin-bottom: 5px; }
+.terminalAdminSettingsBlock { margin-top: 8px; }
+.embeddedAdmin .adminCategoryGrid { margin-top: 0; }
+.embeddedAdminClose { display: flex; justify-content: flex-end; margin-bottom: 10px; }
+.embeddedAdminClose button { border: 1px solid #cbd5e1; background: #fff; border-radius: 9px; padding: 8px 11px; }
+
+@media (max-width: 700px) {
+    .themeChoiceGrid { grid-template-columns: 1fr; }
+}
+
+/* Dark is deliberately a dark counterpart of the normal PalletControl theme. */
+html[data-theme="dark"] { color-scheme: dark; }
+html[data-theme="dark"] body { background: #0b1220; color: #e5e7eb; }
+html[data-theme="dark"] header { background: #050a13; }
+html[data-theme="dark"] nav { background: #111827; border-color: #263449; }
+html[data-theme="dark"] .navGroup { background: #0f172a; border-color: #334155; }
+html[data-theme="dark"] .navGroupTitle,
+html[data-theme="dark"] .muted,
+html[data-theme="dark"] .pageTitle p,
+html[data-theme="dark"] .healthTime,
+html[data-theme="dark"] .toggleRow span,
+html[data-theme="dark"] .adminCategoryText small,
+html[data-theme="dark"] .userIdentity small,
+html[data-theme="dark"] .clock,
+html[data-theme="dark"] .warningHead,
+html[data-theme="dark"] .warningMeta,
+html[data-theme="dark"] .fieldHint { color: #94a3b8; }
+html[data-theme="dark"] .card,
+html[data-theme="dark"] .statCard,
+html[data-theme="dark"] .receiptCard,
+html[data-theme="dark"] .healthCheck,
+html[data-theme="dark"] .warningCard,
+html[data-theme="dark"] .multiMenu,
+html[data-theme="dark"] .multiSelect > summary { background: #111827; border-color: #334155; color: #e5e7eb; }
+html[data-theme="dark"] input,
+html[data-theme="dark"] select,
+html[data-theme="dark"] textarea { background: #0f172a; color: #f1f5f9; border-color: #475569; }
+html[data-theme="dark"] input:disabled { background: #1e293b; }
+html[data-theme="dark"] .adminCategoryCard,
+html[data-theme="dark"] .adminRow,
+html[data-theme="dark"] .settingsGroup,
+html[data-theme="dark"] .userCreateCard,
+html[data-theme="dark"] .checkCard,
+html[data-theme="dark"] .segmented,
+html[data-theme="dark"] .subAccess,
+html[data-theme="dark"] .receiptItems span { background: #172033; border-color: #334155; color: #e5e7eb; }
+html[data-theme="dark"] .adminCategoryCard:hover,
+html[data-theme="dark"] .adminCategoryCard.active { background: #1e293b; border-color: #64748b; }
+html[data-theme="dark"] .adminCategoryIcon { background: #273449; }
+html[data-theme="dark"] .segmented button,
+html[data-theme="dark"] .limitButtons button,
+html[data-theme="dark"] .receiptActions button,
+html[data-theme="dark"] .warningCard button,
+html[data-theme="dark"] .adminRow button,
+html[data-theme="dark"] .embeddedAdminClose button,
+html[data-theme="dark"] .receiptStatusFilters button { background: #111827; color: #e5e7eb; border-color: #475569; }
+html[data-theme="dark"] .primary,
+html[data-theme="dark"] nav button.active,
+html[data-theme="dark"] .segmented button.active,
+html[data-theme="dark"] .limitButtons button.active,
+html[data-theme="dark"] .receiptStatusFilters button.active { background: #e2e8f0; color: #0f172a; }
+html[data-theme="dark"] .buildFooter { background: rgba(15,23,42,.92); color: #94a3b8; border-color: #334155; }
+html[data-theme="dark"] th.stickyActionCol,
+html[data-theme="dark"] td.stickyActionCol { background: #111827; }
+html[data-theme="dark"] .dangerGhost { background: #111827 !important; color: #fca5a5 !important; border-color: #7f1d1d !important; }
+html[data-theme="dark"] tr.rcBlue > td { color: #172554; }
+html[data-theme="dark"] tr.rcRed > td { color: #450a0a; }
+html[data-theme="dark"] tr.rcOrange > td { color: #431407; }
+html[data-theme="dark"] tr.rcGreen > td { color: #052e16; }
+
+/* Terminal: warm industrial/warehouse palette with a subtle pallet-board pattern. */
+html[data-theme="terminal"] body {
+    background-color: #e8e5d8;
+    background-image: repeating-linear-gradient(0deg, rgba(87,76,54,.035) 0 1px, transparent 1px 26px),
+    repeating-linear-gradient(90deg, rgba(87,76,54,.028) 0 1px, transparent 1px 92px);
+    color: #283128;
+}
+html[data-theme="terminal"] header { background: #29352d; }
+html[data-theme="terminal"] .terminal { background: #b1793b; color: #fffaf0; }
+html[data-theme="terminal"] nav { background: #f3f0e5; border-color: #cfc7ae; }
+html[data-theme="terminal"] .navGroup { background: #ebe6d7; border-color: #c6b996; }
+html[data-theme="terminal"] .navGroupTitle,
+html[data-theme="terminal"] .muted,
+html[data-theme="terminal"] .pageTitle p,
+html[data-theme="terminal"] .toggleRow span,
+html[data-theme="terminal"] .adminCategoryText small,
+html[data-theme="terminal"] .userIdentity small { color: #6f705f; }
+html[data-theme="terminal"] .card,
+html[data-theme="terminal"] .statCard,
+html[data-theme="terminal"] .receiptCard,
+html[data-theme="terminal"] .healthCheck,
+html[data-theme="terminal"] .warningCard,
+html[data-theme="terminal"] .multiMenu,
+html[data-theme="terminal"] .multiSelect > summary { background: #fffdf5; border-color: #cfc7ae; color: #283128; }
+html[data-theme="terminal"] input,
+html[data-theme="terminal"] select,
+html[data-theme="terminal"] textarea { background: #fffdf8; color: #283128; border-color: #b9ad8c; }
+html[data-theme="terminal"] .adminCategoryCard,
+html[data-theme="terminal"] .adminRow,
+html[data-theme="terminal"] .settingsGroup,
+html[data-theme="terminal"] .userCreateCard,
+html[data-theme="terminal"] .checkCard,
+html[data-theme="terminal"] .segmented,
+html[data-theme="terminal"] .subAccess,
+html[data-theme="terminal"] .receiptItems span { background: #f1eddf; border-color: #cfc7ae; color: #283128; }
+html[data-theme="terminal"] .adminCategoryCard:hover,
+html[data-theme="terminal"] .adminCategoryCard.active { background: #e7dfca; border-color: #8c7750; }
+html[data-theme="terminal"] .adminCategoryIcon { background: repeating-linear-gradient(90deg,#ba9157 0 7px,#d8b67c 7px 14px); }
+html[data-theme="terminal"] .primary,
+html[data-theme="terminal"] nav button.active,
+html[data-theme="terminal"] .segmented button.active,
+html[data-theme="terminal"] .limitButtons button.active,
+html[data-theme="terminal"] .receiptStatusFilters button.active { background: #3c4b3e; color: #fffdf5; }
+html[data-theme="terminal"] .buildFooter { background: rgba(255,253,245,.93); color: #6f705f; border-color: #b9ad8c; }
+html[data-theme="terminal"] th.stickyActionCol,
+html[data-theme="terminal"] td.stickyActionCol { background: #fffdf5; }
+
+/* Pallet Stealer: intentionally playful special theme, still readable for daily use. */
+html[data-theme="pallet-stealer"] { color-scheme: dark; }
+html[data-theme="pallet-stealer"] body {
+    background-color: #100d18;
+    background-image: repeating-linear-gradient(135deg, rgba(245,158,11,.025) 0 12px, transparent 12px 28px);
+    color: #f5f3ff;
+}
+html[data-theme="pallet-stealer"] header { background: #0a0710; border-bottom: 2px solid #7c3aed; }
+html[data-theme="pallet-stealer"] .terminal { background: #7c3aed; color: #fff; }
+html[data-theme="pallet-stealer"] nav { background: #171220; border-color: #312e45; }
+html[data-theme="pallet-stealer"] .navGroup { background: #1b1526; border-color: #44345e; }
+html[data-theme="pallet-stealer"] .navGroupTitle,
+html[data-theme="pallet-stealer"] .muted,
+html[data-theme="pallet-stealer"] .pageTitle p,
+html[data-theme="pallet-stealer"] .toggleRow span,
+html[data-theme="pallet-stealer"] .adminCategoryText small,
+html[data-theme="pallet-stealer"] .userIdentity small,
+html[data-theme="pallet-stealer"] .warningHead,
+html[data-theme="pallet-stealer"] .warningMeta { color: #b9a9d6; }
+html[data-theme="pallet-stealer"] .card,
+html[data-theme="pallet-stealer"] .statCard,
+html[data-theme="pallet-stealer"] .receiptCard,
+html[data-theme="pallet-stealer"] .healthCheck,
+html[data-theme="pallet-stealer"] .warningCard,
+html[data-theme="pallet-stealer"] .multiMenu,
+html[data-theme="pallet-stealer"] .multiSelect > summary { background: #1a1523; border-color: #493761; color: #f5f3ff; }
+html[data-theme="pallet-stealer"] input,
+html[data-theme="pallet-stealer"] select,
+html[data-theme="pallet-stealer"] textarea { background: #120e1a; color: #f5f3ff; border-color: #5b4677; }
+html[data-theme="pallet-stealer"] .adminCategoryCard,
+html[data-theme="pallet-stealer"] .adminRow,
+html[data-theme="pallet-stealer"] .settingsGroup,
+html[data-theme="pallet-stealer"] .userCreateCard,
+html[data-theme="pallet-stealer"] .checkCard,
+html[data-theme="pallet-stealer"] .segmented,
+html[data-theme="pallet-stealer"] .subAccess,
+html[data-theme="pallet-stealer"] .receiptItems span { background: #21192e; border-color: #493761; color: #f5f3ff; }
+html[data-theme="pallet-stealer"] .adminCategoryCard:hover,
+html[data-theme="pallet-stealer"] .adminCategoryCard.active { background: #2b1e3d; border-color: #8b5cf6; }
+html[data-theme="pallet-stealer"] .adminCategoryIcon { background: repeating-linear-gradient(135deg,#312e81 0 8px,#581c87 8px 16px); }
+html[data-theme="pallet-stealer"] .primary,
+html[data-theme="pallet-stealer"] nav button.active,
+html[data-theme="pallet-stealer"] .segmented button.active,
+html[data-theme="pallet-stealer"] .limitButtons button.active,
+html[data-theme="pallet-stealer"] .receiptStatusFilters button.active { background: #7c3aed; color: #fff; }
+html[data-theme="pallet-stealer"] .buildFooter { background: rgba(18,14,26,.94); color: #c4b5fd; border-color: #5b4677; }
+html[data-theme="pallet-stealer"] th.stickyActionCol,
+html[data-theme="pallet-stealer"] td.stickyActionCol { background: #1a1523; }
+html[data-theme="pallet-stealer"] .dangerGhost { background: #1a1523 !important; color: #fda4af !important; border-color: #881337 !important; }
+html[data-theme="pallet-stealer"] tr.rcBlue > td { color: #172554; }
+html[data-theme="pallet-stealer"] tr.rcRed > td { color: #450a0a; }
+html[data-theme="pallet-stealer"] tr.rcOrange > td { color: #431407; }
+html[data-theme="pallet-stealer"] tr.rcGreen > td { color: #052e16; }

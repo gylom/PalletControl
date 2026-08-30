@@ -3,10 +3,30 @@ import { createRoot } from 'react-dom/client'
 import './styles.css'
 
 const API = '/api'
-const BUILD_VERSION = '5.8.6'
+const BUILD_VERSION = '5.8.7'
 const BUILD_CREDIT = 'Developed by Gytis Lukosevicius'
 
-console.info(`PalletControl frontend v${BUILD_VERSION} - multi-module terminal accounting with historical import enabled`)
+const THEME_OPTIONS = [
+  { id: 'normal', name: 'Normal', group: 'standard', description: 'Original clean PalletControl theme.' },
+  { id: 'dark', name: 'Dark', group: 'standard', description: 'Dark version of the normal PalletControl theme.' },
+  { id: 'terminal', name: 'Terminal', group: 'special', description: 'Industrial terminal theme with warehouse and pallet styling.' },
+  { id: 'pallet-stealer', name: 'Pallet Stealer', group: 'special', description: 'A darker playful pallet-themed look.' }
+]
+
+function normalizeTheme(theme) {
+  return THEME_OPTIONS.some(t => t.id === theme) ? theme : 'normal'
+}
+
+function applyTheme(theme) {
+  const next = normalizeTheme(theme)
+  document.documentElement.dataset.theme = next
+  localStorage.setItem('theme', next)
+  return next
+}
+
+applyTheme(localStorage.getItem('theme') || 'normal')
+
+console.info(`PalletControl frontend v${BUILD_VERSION} - terminal administration and persistent themes enabled`)
 
 class ApiError extends Error {
   constructor(message, status, data) {
@@ -136,6 +156,10 @@ function App() {
     setMe(null)
   }
 
+  useEffect(() => {
+    applyTheme(me?.theme || localStorage.getItem('theme') || 'normal')
+  }, [me?.theme])
+
   // Keep role and terminal synchronized with the database while the user is logged in.
   // The backend also refreshes these values for authorization on every request, so this
   // is mainly for keeping the visible terminal badge/navigation current.
@@ -196,6 +220,7 @@ function Login({ onLogin }) {
       })
       localStorage.setItem('token', result.token)
       localStorage.setItem('me', JSON.stringify(result))
+      applyTheme(result.theme || 'normal')
       onLogin(result)
     } catch (e) {
       setError(`Login failed: ${e.message}`)
@@ -234,8 +259,8 @@ function Login({ onLogin }) {
 
 function Shell({ me, logout }) {
   const [tab, setTab] = useState(() => firstAllowedTab(me))
-  const isSuperAdmin = me.role === 'SuperAdmin' || me.role === 'Admin'
-  const isTerminalAdmin = me.role === 'TerminalAdmin'
+  const isSuperAdmin = me.role === 'SuperAdmin'
+  const isTerminalAdmin = me.role === 'Admin' || me.role === 'TerminalAdmin'
   const adminAccess = isSuperAdmin || isTerminalAdmin
   const elevated = adminAccess || me.role === 'Superuser'
   const hasInternal = me.hasInternalPalletAccounting === true
@@ -252,7 +277,7 @@ function Shell({ me, logout }) {
     if (internalTabs.includes(tab) && !hasInternal) setTab(firstAllowedTab(me))
     if (linehaulTabs.includes(tab) && !hasLinehaul) setTab(firstAllowedTab(me))
     if (receivedTabs.includes(tab) && !hasReceivedControl) setTab(firstAllowedTab(me))
-    if (tab === 'admin' && !adminAccess) setTab(firstAllowedTab(me))
+    if (tab === 'admin' && !isSuperAdmin) setTab(firstAllowedTab(me))
     if ((tab === 'warnings' || tab === 'export') && !elevated) setTab('register')
     if (tab === 'driverStats' && !showDriverStatisticsTab) setTab('register')
     if (tab === 'dailyCheck' && !showDailyCheckTab) setTab('register')
@@ -304,7 +329,7 @@ function Shell({ me, logout }) {
         <span className="navGroupTitle">Account</span>
         <div className="navGroupButtons">
           <NavButton id="settings" tab={tab} setTab={setTab}>Settings</NavButton>
-          {adminAccess && <NavButton id="admin" tab={tab} setTab={setTab}>Admin</NavButton>}
+          {isSuperAdmin && <NavButton id="admin" tab={tab} setTab={setTab}>Admin</NavButton>}
         </div>
       </div>
     </nav>
@@ -333,7 +358,7 @@ function Shell({ me, logout }) {
       {tab === 'receivedImport' && hasReceivedControl && adminAccess && <ReceivedControlImport key={`rc-imp-${terminalKey}`} me={me} />}
 
       {tab === 'settings' && <UserSettings me={me} />}
-      {tab === 'admin' && adminAccess && <Admin me={me} />}
+      {tab === 'admin' && isSuperAdmin && <Admin me={me} />}
     </main>
   </div>
 }
@@ -1668,15 +1693,41 @@ function UserSettings({ me }) {
   const [error, setError] = useState('')
   const [newDriver, setNewDriver] = useState('')
   const [addingDriver, setAddingDriver] = useState(false)
-  useEffect(() => { api('/me/settings').then(setS).catch(e => setError(e.message)) }, [])
+  const isTerminalAdmin = me.role === 'Admin' || me.role === 'TerminalAdmin'
+
+  useEffect(() => {
+    api('/me/settings').then(result => {
+      setS(result)
+      applyTheme(result.theme || me.theme || 'normal')
+    }).catch(e => setError(e.message))
+  }, [])
   if (!s) return <Loading />
 
-  async function save() {
+  async function save(next = s, ok = 'Settings saved.') {
     setMessage(''); setError('')
     try {
-      const result = await api('/me/settings', { method: 'PUT', body: JSON.stringify(s) })
-      setS(result); setMessage('Settings saved.')
-    } catch (e) { setError(e.message) }
+      const result = await api('/me/settings', { method: 'PUT', body: JSON.stringify(next) })
+      setS(result)
+      applyTheme(result.theme)
+      try {
+        const cached = JSON.parse(localStorage.getItem('me') || '{}')
+        localStorage.setItem('me', JSON.stringify({ ...cached, theme: result.theme }))
+      } catch {}
+      setMessage(ok)
+      return result
+    } catch (e) {
+      setError(e.message)
+      return null
+    }
+  }
+
+  async function chooseTheme(theme) {
+    const previous = s.theme || 'normal'
+    const next = { ...s, theme }
+    setS(next)
+    applyTheme(theme)
+    const result = await save(next, `${THEME_OPTIONS.find(t => t.id === theme)?.name || 'Theme'} theme saved.`)
+    if (!result) { setS(s); applyTheme(previous) }
   }
 
   async function addDriver() {
@@ -1697,14 +1748,31 @@ function UserSettings({ me }) {
     }
   }
 
-  return <section><div className="pageTitle"><div><h1>My settings</h1><p>Personal settings and driver-name management for {me.displayName}.</p></div></div>
+  const standardThemes = THEME_OPTIONS.filter(t => t.group === 'standard')
+  const specialThemes = THEME_OPTIONS.filter(t => t.group === 'special')
+
+  return <section><div className="pageTitle"><div><h1>My settings</h1><p>Personal settings for {me.displayName}. These settings are stored with your account.</p></div></div>
     {message && <div className="success">{message}</div>}{error && <div className="error">{error}</div>}
+
+    <div className="card settingsCard themeSettingsCard">
+      <h2>Appearance</h2>
+      <p className="muted">Your theme is saved to your PalletControl account and will be restored after login, browser changes and server restarts.</p>
+      <h3>Standard themes</h3>
+      <div className="themeChoiceGrid">
+        {standardThemes.map(t => <button type="button" key={t.id} className={`themeChoice ${s.theme === t.id ? 'selected' : ''} themePreview-${t.id}`} onClick={() => chooseTheme(t.id)}><span className="themePreviewIcon">{t.id === 'dark' ? '🌙' : '☀️'}</span><span><b>{t.name}</b><small>{t.description}</small></span>{s.theme === t.id && <span className="themeSelectedMark">✓</span>}</button>)}
+      </div>
+      <h3 className="specialThemeTitle">Special themes</h3>
+      <div className="themeChoiceGrid">
+        {specialThemes.map(t => <button type="button" key={t.id} className={`themeChoice ${s.theme === t.id ? 'selected' : ''} themePreview-${t.id}`} onClick={() => chooseTheme(t.id)}><span className="themePreviewIcon">{t.id === 'terminal' ? '🏭' : '🕵️'}</span><span><b>{t.name}</b><small>{t.description}</small></span>{s.theme === t.id && <span className="themeSelectedMark">✓</span>}</button>)}
+      </div>
+    </div>
+
     <div className="card settingsCard">
       <h2>Notifications</h2>
       <Toggle label="Monthly milestone notifications" text="Example: You have now brought in over 100 pallets this month." checked={s.showMilestoneNotifications} onChange={v => setS({ ...s, showMilestoneNotifications: v })} />
       <Toggle label="Leaderboard notifications" text="Show current monthly rank and who is ahead/behind after submission." checked={s.showLeaderboardNotifications} onChange={v => setS({ ...s, showLeaderboardNotifications: v })} />
       <Toggle label="Monthly balance notification" text="Show your selected driver's current IN, OUT and balance after submission." checked={s.showBalanceNotifications} onChange={v => setS({ ...s, showBalanceNotifications: v })} />
-      <button className="primary" onClick={save}>Save my settings</button>
+      <button className="primary" onClick={() => save(s)}>Save notification settings</button>
     </div>
 
     <div className="card settingsDriverCard">
@@ -1716,10 +1784,15 @@ function UserSettings({ me }) {
         <input placeholder="Driver name" value={newDriver} onChange={e => setNewDriver(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addDriver() } }} />
         <button type="button" className="primary" disabled={addingDriver || !newDriver.trim()} onClick={addDriver}>{addingDriver ? 'Adding…' : 'Add driver'}</button>
       </div> : <div className="settingsDisabledNotice">Adding new driver names is currently disabled by the administrator.</div>}
-      {['SuperAdmin', 'TerminalAdmin', 'Admin'].includes(me.role) && <p className="muted small settingsAdminHint">Administrator: this option is controlled under Admin → Terminal settings.</p>}
+      {isTerminalAdmin && <p className="muted small settingsAdminHint">As Admin you can change this under Terminal administration → Terminal settings below.</p>}
     </div>
 
-    {me.role === 'Superuser' && <div className="card noteCard"><b>Superuser access</b><p>You can view/acknowledge warnings, manage cancellations and export data. Warning thresholds remain Admin-only.</p></div>}
+    {me.role === 'Superuser' && <div className="card noteCard"><b>Superuser access</b><p>You can view/acknowledge warnings, manage cancellations and export data. Terminal configuration remains Admin-only.</p></div>}
+
+    {isTerminalAdmin && <div className="terminalAdminSettingsBlock">
+      <div className="settingsSectionHeading"><h2>Terminal administration · {me.terminalCode}</h2><p className="muted">Manage only your assigned terminal. You can create users up to Admin, but cannot create SuperAdmins or access another operating terminal.</p></div>
+      <Admin me={me} embedded />
+    </div>}
   </section>
 }
 
@@ -1867,8 +1940,8 @@ function Export({ me }) {
   </section>
 }
 
-function Admin({ me }) {
-  const superAdmin = me.role === 'SuperAdmin' || me.role === 'Admin'
+function Admin({ me, embedded = false }) {
+  const superAdmin = me.role === 'SuperAdmin'
   const [category,setCategory]=useState(''),[data,setData]=useState(null),[loadedCategory,setLoadedCategory]=useState(''),[loading,setLoading]=useState(false),[error,setError]=useState(''),[message,setMessage]=useState('')
   const activeCategoryRef=useRef('')
   const adminLoadSequence=useRef(0)
@@ -1887,8 +1960,8 @@ function Admin({ me }) {
     {id:'terminalSettings',icon:'⚙️',title:'Terminal settings',description:'Warnings, driver adjustment and registration settings for one terminal.'},
     {id:'linehaulComments',icon:'💬',title:'Linehaul comments',description:'Selectable standard comments for Linehaul registration.'},
     {id:'locations',icon:'📍',title:'Linehaul / Mottatt locations',description:'Terminal-specific From/To names, display names and import aliases.'},
+    {id:'transporters',icon:'🏢',title:'Transporters',description:'Transport companies belonging only to this operating terminal.'},
     ...(superAdmin?[
-      {id:'transporters',icon:'🏢',title:'Transporters',description:'Global transport company master list.'},
       {id:'pallets',icon:'📦',title:'Pallet types',description:'Global pallet type master list.'},
       {id:'holidays',icon:'📅',title:'Global holidays',description:'Non-working days applied across terminals.'},
       {id:'globalSettings',icon:'🌐',title:'Global defaults',description:'SuperAdmin-only defaults used when new terminal settings are created.'},
@@ -1896,7 +1969,7 @@ function Admin({ me }) {
     ]:[])
   ]
 
-  function endpoint(cat, terminalId=targetTerminalId){const q=`?terminalId=${terminalId}`;return {users:'/admin/users',vehicles:'/admin/vehicles',drivers:'/admin/drivers',terminalSettings:'/admin/terminal-settings'+q,linehaulComments:'/admin/linehaul-comments'+q,locations:'/admin/linehaul-locations'+q,transporters:'/admin/transporters',pallets:'/admin/pallet-types',holidays:'/admin/holidays',globalSettings:'/admin/settings',database:'/admin/database/status'}[cat]}
+  function endpoint(cat, terminalId=targetTerminalId){const q=`?terminalId=${terminalId}`;return {users:'/admin/users',vehicles:'/admin/vehicles',drivers:'/admin/drivers',terminalSettings:'/admin/terminal-settings'+q,linehaulComments:'/admin/linehaul-comments'+q,locations:'/admin/linehaul-locations'+q,transporters:'/admin/transporters'+q,pallets:'/admin/pallet-types',holidays:'/admin/holidays',globalSettings:'/admin/settings',database:'/admin/database/status'}[cat]}
   async function load(cat=activeCategoryRef.current||category, terminalId=targetTerminalId){
     if(!cat)return
     const seq=++adminLoadSequence.current
@@ -1908,7 +1981,7 @@ function Admin({ me }) {
       const r=await api(url)
       if(seq!==adminLoadSequence.current||activeCategoryRef.current!==requestedCategory)return
       setData(r);setLoadedCategory(requestedCategory)
-      if(requestedCategory==='vehicles'&&r.transporters?.length&&!vehicleForm.transporterId)setVehicleForm(f=>({...f,terminalId:String(r.terminals?.[0]?.id||me.terminalId),transporterId:String(r.transporters.find(t=>t.active)?.id||'')}))
+      if(requestedCategory==='vehicles'&&r.terminals?.length&&!vehicleForm.transporterId)setVehicleForm(f=>{const terminalId=String(r.terminals?.find(t=>String(t.id)===String(f.terminalId))?.id||r.terminals[0].id||me.terminalId);const transporter=r.transporters?.find(t=>t.active&&Number(t.terminalId)===Number(terminalId));return {...f,terminalId,transporterId:String(transporter?.id||'')}})
       if(requestedCategory==='users'&&r.terminals?.[0])setUserForm(f=>({...f,terminalId:String(r.terminals[0].id)}))
       if(requestedCategory==='drivers'&&r.terminals?.[0])setDriverForm(f=>({...f,terminalId:String(r.terminals[0].id)}))
     }catch(e){if(seq===adminLoadSequence.current&&activeCategoryRef.current===requestedCategory)setError(e.message)}finally{if(seq===adminLoadSequence.current&&activeCategoryRef.current===requestedCategory)setLoading(false)}
@@ -1934,21 +2007,22 @@ function Admin({ me }) {
     setData(null);setLoadedCategory('');setLoading(true);setError('');setMessage('')
     setCategory(id)
   }
-  const activeTransporters=data?.transporters?.filter(t=>t.active)||[]
-  const roleOptions=superAdmin?['User','Superuser','TerminalAdmin','SuperAdmin']:['User','Superuser','TerminalAdmin']
+  const activeTransporters=data?.transporters?.filter(t=>t.active && (!t.terminalId || Number(t.terminalId)===Number(vehicleForm.terminalId)))||[]
+  const roleOptions=superAdmin?['User','Superuser','Admin','SuperAdmin']:['User','Superuser','Admin']
 
   function closeCategory(){activeCategoryRef.current='';adminLoadSequence.current+=1;setData(null);setLoadedCategory('');setLoading(false);setError('');setMessage('');setCategory('')}
 
-  return <section><div className="pageTitle"><div><h1>{superAdmin?'SuperAdmin':'Terminal Admin'} · {me.terminalCode}</h1><p>{superAdmin?'Global administration plus every terminal.':'Administration is restricted to your assigned terminal.'}</p></div>{category&&<button onClick={closeCategory}>Close category</button>}</div>
+  return <section className={embedded?'embeddedAdmin':''}>{!embedded&&<div className="pageTitle"><div><h1>{superAdmin?'SuperAdmin':'Admin'} · {me.terminalCode}</h1><p>{superAdmin?'Global administration plus every operating terminal.':'Administration is restricted to your assigned terminal.'}</p></div>{category&&<button onClick={closeCategory}>Close category</button>}</div>}
+    {embedded&&category&&<div className="embeddedAdminClose"><button onClick={closeCategory}>← Back to terminal administration</button></div>}
     <div className="adminCategoryGrid">{categories.map(c=><button key={c.id} className={`adminCategoryCard ${category===c.id?'active':''}`} onClick={()=>choose(c.id)}><span className="adminCategoryIcon">{c.icon}</span><span className="adminCategoryText"><b>{c.title}</b><small>{c.description}</small></span><span className="adminCategoryArrow">›</span></button>)}</div>
     {message&&<div className="success adminFeedback">{message}</div>}{error&&<div className="error adminFeedback">{error}</div>}
-    {!category&&<div className="card adminWelcome"><b>Select an Admin category above</b><p className="muted">TerminalAdmin cannot modify global configuration or another terminal.</p></div>}{category&&loading&&<Loading/>}
+    {!category&&<div className="card adminWelcome"><b>Select an Admin category above</b><p className="muted">Admin cannot modify global configuration or another operating terminal.</p></div>}{category&&loading&&<Loading/>}
     {category&&!loading&&data&&loadedCategory===category&&<div key={category} className="adminCategoryContent">
       {category==='locations'&&<AdminSection title={`Linehaul / Mottatt locations · ${data.terminalCode}`} subtitle="These names are only routing/statistics locations for the selected operating terminal. SRD, ARE and KRS are the only real PalletControl terminals. Code, Name and Aliases are all accepted on import.">{superAdmin&&<label className="adminTerminalPicker">Operating terminal<select value={targetTerminalId} onChange={e=>setTargetTerminalId(e.target.value)}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code} — {t.name}</option>)}</select></label>}<div className="inlineForm terminalCreate"><input placeholder="Location code, e.g. AL" value={terminalForm.code} onChange={e=>setTerminalForm({...terminalForm,code:e.target.value.toUpperCase()})}/><input placeholder="Display name" value={terminalForm.name} onChange={e=>setTerminalForm({...terminalForm,name:e.target.value})}/><input placeholder="Import aliases, e.g. AL123; Arendal Lager" value={terminalForm.aliases} onChange={e=>setTerminalForm({...terminalForm,aliases:e.target.value})}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/linehaul-locations',{method:'POST',body:JSON.stringify({terminalId:Number(targetTerminalId),...terminalForm})});setTerminalForm({code:'',name:'',aliases:''})},'Location added.')}>Add location</button></div><div className="adminRows terminalAdminRows">{data.locations.map(t=><TerminalAdminRow key={t.id} row={t} save={next=>action(()=>api(`/admin/linehaul-locations/${t.id}`,{method:'PUT',body:JSON.stringify(next)}),`Location ${next.code} updated.`)} remove={()=>{if(window.confirm(`Delete location ${t.code}? Historical Linehaul/Mottatt receipts keep their saved name.`))action(()=>api(`/admin/linehaul-locations/${t.id}`,{method:'DELETE'}),'Location deleted.')}}/>)}</div></AdminSection>}
-      {category==='transporters'&&<AdminSection title="Global transporters"><div className="inlineForm"><input placeholder="Transporter name" value={transporterName} onChange={e=>setTransporterName(e.target.value)}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/transporters',{method:'POST',body:JSON.stringify({name:transporterName})});setTransporterName('')},'Transporter added.')}>Add transporter</button></div><div className="adminRows">{data.transporters.map(t=><div className="adminRow" key={t.id}><b>{t.name}</b><span>{t.active?'Active':'Inactive'}</span><button className="dangerGhost" onClick={()=>{if(window.confirm(`Delete ${t.name}?`))action(()=>api(`/admin/transporters/${t.id}`,{method:'DELETE'}),'Transporter deleted.')}}>Delete</button></div>)}</div></AdminSection>}
+      {category==='transporters'&&<AdminSection title={`Transporters · ${data.terminalCode}`} subtitle="Transporters are terminal-specific. Changes here affect only this operating terminal.">{superAdmin&&<label className="adminTerminalPicker">Operating terminal<select value={targetTerminalId} onChange={e=>setTargetTerminalId(e.target.value)}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code} — {t.name}</option>)}</select></label>}<div className="inlineForm"><input placeholder="Transporter name" value={transporterName} onChange={e=>setTransporterName(e.target.value)}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/transporters',{method:'POST',body:JSON.stringify({name:transporterName,terminalId:Number(targetTerminalId)})});setTransporterName('')},'Transporter added.')}>Add transporter</button></div><div className="adminRows">{data.transporters.map(t=><div className="adminRow" key={t.id}><b>{t.name}</b><span>{t.active?'Active':'Inactive'}</span><button className="dangerGhost" onClick={()=>{if(window.confirm(`Delete ${t.name} from ${data.terminalCode}? Vehicles using it will become unassigned.`))action(()=>api(`/admin/transporters/${t.id}`,{method:'DELETE'}),'Transporter deleted.')}}>Delete</button></div>)}</div></AdminSection>}
       {category==='pallets'&&<AdminSection title="Global pallet types"><div className="inlineForm"><input placeholder="New pallet type" value={palletName} onChange={e=>setPalletName(e.target.value)}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/pallet-types',{method:'POST',body:JSON.stringify({name:palletName,userSelectable:true})});setPalletName('')},'Pallet type added.')}>Add pallet type</button></div><div className="adminRows">{data.palletTypes.map(p=><PalletAdminRow key={p.id} row={p} save={next=>action(()=>api(`/admin/pallet-types/${p.id}`,{method:'PUT',body:JSON.stringify(next)}))}/>)}</div></AdminSection>}
       {category==='holidays'&&<AdminSection title="Global holidays / non-working days" subtitle="These remain global and can only be changed by SuperAdmin."><div className="inlineForm three"><input type="date" value={holidayForm.date} onChange={e=>setHolidayForm({...holidayForm,date:e.target.value})}/><input placeholder="Name" value={holidayForm.name} onChange={e=>setHolidayForm({...holidayForm,name:e.target.value})}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/holidays',{method:'POST',body:JSON.stringify(holidayForm)});setHolidayForm({date:dateInput(),name:''})},'Holiday added.')}>Add</button></div><div className="adminRows">{data.holidays.map(h=><div className="adminRow" key={h.id}><b>{formatDate(h.date)}</b><span>{h.name}</span><button className="dangerGhost" onClick={()=>action(()=>api(`/admin/holidays/${h.id}`,{method:'DELETE'}),'Holiday removed.')}>Delete</button></div>)}</div></AdminSection>}
-      {category==='vehicles'&&<AdminSection title={`Vehicles · ${data.terminals?.[0]?.code||me.terminalCode}`} subtitle={superAdmin?'SuperAdmin can assign vehicles to any terminal. TerminalAdmin only sees and changes its own terminal.':'Only vehicles belonging to your terminal are shown.'}><div className="inlineForm three"><input placeholder="Vehicle ID" value={vehicleForm.vehicleId} onChange={e=>setVehicleForm({...vehicleForm,vehicleId:e.target.value.toUpperCase()})}/><select value={vehicleForm.terminalId} onChange={e=>setVehicleForm({...vehicleForm,terminalId:e.target.value})}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select><select value={vehicleForm.transporterId} onChange={e=>setVehicleForm({...vehicleForm,transporterId:e.target.value})}><option value="">Choose transporter</option>{activeTransporters.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select><button className="primary" onClick={()=>action(async()=>{await api('/admin/vehicles',{method:'POST',body:JSON.stringify({vehicleId:vehicleForm.vehicleId,terminalId:Number(vehicleForm.terminalId),transporterId:Number(vehicleForm.transporterId)})});setVehicleForm({...vehicleForm,vehicleId:''})},'Vehicle added.')}>Add vehicle</button></div><div className="adminRows">{data.vehicles.map(v=><VehicleAdminRow key={v.id} row={v} transporters={data.transporters} saveTransporter={transporterId=>action(()=>api(`/admin/vehicles/${v.id}/transporter`,{method:'PUT',body:JSON.stringify({transporterId})}),'Transporter changed.')} saveSchedule={days=>action(()=>api(`/admin/vehicles/${v.id}/schedule`,{method:'PUT',body:JSON.stringify({days})}),'Operating days saved.')} remove={()=>{if(window.confirm(`Delete ${v.vehicleId}? Historical receipts keep snapshots.`))action(()=>api(`/admin/vehicles/${v.id}`,{method:'DELETE'}),'Vehicle deleted.')}}/>)}</div></AdminSection>}
+      {category==='vehicles'&&<AdminSection title={`Vehicles · ${data.terminals?.[0]?.code||me.terminalCode}`} subtitle={superAdmin?'SuperAdmin can assign vehicles to any operating terminal. Admin only sees and changes their own terminal.':'Only vehicles belonging to your terminal are shown.'}><div className="inlineForm three"><input placeholder="Vehicle ID" value={vehicleForm.vehicleId} onChange={e=>setVehicleForm({...vehicleForm,vehicleId:e.target.value.toUpperCase()})}/><select value={vehicleForm.terminalId} onChange={e=>setVehicleForm({...vehicleForm,terminalId:e.target.value,transporterId:''})}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select><select value={vehicleForm.transporterId} onChange={e=>setVehicleForm({...vehicleForm,transporterId:e.target.value})}><option value="">Choose transporter</option>{activeTransporters.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select><button className="primary" onClick={()=>action(async()=>{await api('/admin/vehicles',{method:'POST',body:JSON.stringify({vehicleId:vehicleForm.vehicleId,terminalId:Number(vehicleForm.terminalId),transporterId:Number(vehicleForm.transporterId)})});setVehicleForm({...vehicleForm,vehicleId:''})},'Vehicle added.')}>Add vehicle</button></div><div className="adminRows">{data.vehicles.map(v=><VehicleAdminRow key={v.id} row={v} transporters={data.transporters.filter(t=>!t.terminalId||Number(t.terminalId)===Number(v.terminalId))} saveTransporter={transporterId=>action(()=>api(`/admin/vehicles/${v.id}/transporter`,{method:'PUT',body:JSON.stringify({transporterId})}),'Transporter changed.')} saveSchedule={days=>action(()=>api(`/admin/vehicles/${v.id}/schedule`,{method:'PUT',body:JSON.stringify({days})}),'Operating days saved.')} remove={()=>{if(window.confirm(`Delete ${v.vehicleId}? Historical receipts keep snapshots.`))action(()=>api(`/admin/vehicles/${v.id}`,{method:'DELETE'}),'Vehicle deleted.')}}/>)}</div></AdminSection>}
       {category==='drivers'&&<AdminSection title="Driver names" subtitle="Remove only hides a name from future registration; historical statistics remain."><div className="inlineForm"><input placeholder="Driver name" value={driverForm.name} onChange={e=>setDriverForm({...driverForm,name:e.target.value})}/><select value={driverForm.terminalId} onChange={e=>setDriverForm({...driverForm,terminalId:e.target.value})}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select><button className="primary" onClick={()=>action(async()=>{await api('/admin/drivers',{method:'POST',body:JSON.stringify({name:driverForm.name,terminalId:Number(driverForm.terminalId)})});setDriverForm({...driverForm,name:''})},'Driver added/restored.')}>Add driver</button></div><div className="adminRows">{data.drivers.map(d=><div className="adminRow driverAdmin" key={d.id}><b>{d.name}</b><span>{d.terminal}</span><span>{d.active?'Active':'Removed'}</span>{d.active?<button className="dangerGhost" onClick={()=>{if(window.confirm(`Remove ${d.name} from future selection? Historical receipts stay.`))action(()=>api(`/admin/drivers/${d.id}`,{method:'DELETE'}),'Driver removed.')}}>Remove</button>:<button onClick={()=>action(()=>api(`/admin/drivers/${d.id}/active`,{method:'PUT',body:JSON.stringify({active:true})}),'Driver restored.')}>Restore</button>}</div>)}</div></AdminSection>}
       {category==='users'&&<AdminSection title="Users & module access" subtitle="Security role controls administration; module access controls which pallet-accounting tab groups the account can use."><div className="userCreateCard"><div className="inlineForm userAdd"><input placeholder="Username" value={userForm.username} onChange={e=>setUserForm({...userForm,username:e.target.value})}/><input placeholder="Display name" value={userForm.displayName} onChange={e=>setUserForm({...userForm,displayName:e.target.value})}/><input type="password" placeholder="Password" value={userForm.password} onChange={e=>setUserForm({...userForm,password:e.target.value})}/><select value={userForm.role} onChange={e=>setUserForm({...userForm,role:e.target.value})}>{roleOptions.map(r=><option key={r}>{r}</option>)}</select><select value={userForm.terminalId} onChange={e=>setUserForm({...userForm,terminalId:e.target.value})}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select></div><ModuleChecks value={userForm} setValue={setUserForm}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/users',{method:'POST',body:JSON.stringify({...userForm,terminalId:Number(userForm.terminalId)})});setUserForm({...userForm,username:'',displayName:'',password:''})},'User created.')}>Create user</button></div><div className="adminRows">{data.users.map(u=><UserAdminRow key={u.id} row={u} terminals={data.terminals} roles={roleOptions} save={next=>action(()=>api(`/admin/users/${u.id}`,{method:'PUT',body:JSON.stringify(next)}),'User updated.')} resetPassword={()=>{const password=window.prompt(`New password for ${u.username}:`);if(password)action(()=>api(`/admin/users/${u.id}/password`,{method:'POST',body:JSON.stringify({password})}),'Password changed.')}}/>)}</div></AdminSection>}
       {category==='terminalSettings'&&<AdminSettingsScope title="Terminal settings" data={data} targetTerminalId={targetTerminalId} setTargetTerminalId={setTargetTerminalId} showTerminalSelect={superAdmin} save={next=>action(()=>api(`/admin/terminal-settings?terminalId=${targetTerminalId}`,{method:'PUT',body:JSON.stringify(next)}),'Terminal settings saved.')}/>}

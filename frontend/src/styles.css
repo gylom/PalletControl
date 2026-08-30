@@ -1525,3 +1525,21 @@ tr.rcGreen > td, .receivedSuccess.rcGreen { background: #dcfce7 !important; }
 .importIssue { margin: 0; }
 .compactStats { margin: 0 0 12px; }
 @media (max-width: 800px) { .importSchema { min-width: 760px; } }
+
+/* v5.8.6: keep receipt actions visible while horizontally scrolling wide module tables. */
+th.stickyActionCol,
+td.stickyActionCol {
+    position: sticky;
+    right: 0;
+    z-index: 3;
+    min-width: 185px;
+    background: #fff;
+    box-shadow: -10px 0 12px -12px rgba(15, 23, 42, .45);
+}
+thead th.stickyActionCol { z-index: 5; }
+tr.rcBlue > td.stickyActionCol { background: #dbeafe !important; }
+tr.rcRed > td.stickyActionCol { background: #fee2e2 !important; }
+tr.rcOrange > td.stickyActionCol { background: #ffedd5 !important; }
+tr.rcGreen > td.stickyActionCol { background: #dcfce7 !important; }
+tr.cancelledTableRow > td.stickyActionCol { background: #f8fafc !important; }
+.pageTitleActions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }

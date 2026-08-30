@@ -175,13 +175,14 @@ using (var scope = app.Services.CreateScope())
     db.Database.EnsureCreated();
     EnsureCompatibilitySchema(db);
     Seed(db);
+    MigrateLegacyLinehaulLocations(db);
 }
 
 app.MapGet("/", () => Results.Ok(new
 {
     name = "Pallet Control API",
     status = "running",
-    version = "5.8.5"
+    version = "5.8.6"
 }));
 
 // Public health endpoint. This performs a real SQLite connection, real table read,
@@ -1510,6 +1511,24 @@ app.MapPost("/api/warnings/{id:int}/acknowledge", async (
     return Results.Ok();
 }).RequireAuthorization("InternalElevated");
 
+app.MapPost("/api/warnings/acknowledge-all", async (
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var terminalId = TerminalId(principal);
+    var userId = UserId(principal);
+    var now = DateTime.UtcNow;
+    var rows = await db.WarningEvents.Where(x => x.TerminalId == terminalId && x.AcknowledgedAtUtc == null).ToListAsync();
+    foreach (var row in rows)
+    {
+        row.AcknowledgedAtUtc = now;
+        row.AcknowledgedByUserId = userId;
+    }
+    if (rows.Count > 0) await db.SaveChangesAsync();
+    await Audit(db, principal, "WARNING_ACK_ALL", $"Acknowledged {rows.Count} open warnings");
+    return Results.Ok(new { acknowledged = rows.Count });
+}).RequireAuthorization("InternalElevated");
+
 app.MapGet("/api/export", async (
     DateOnly from,
     DateOnly to,
@@ -1908,8 +1927,9 @@ app.MapGet("/api/linehaul/setup", async (ClaimsPrincipal principal, AppDbContext
 {
     var terminalId = TerminalId(principal);
     var terminals = await db.Terminals.AsNoTracking()
-        .Where(x => x.Active)
-        .OrderBy(x => x.Code)
+        .Where(x => x.Active && (x.Id == terminalId || (!x.IsOperatingTerminal && x.ScopeTerminalId == terminalId)))
+        .OrderByDescending(x => x.Id == terminalId)
+        .ThenBy(x => x.Code)
         .Select(x => new { x.Id, x.Code, x.Name })
         .ToListAsync();
     var comments = await db.LinehaulCommentOptions.AsNoTracking()
@@ -1947,7 +1967,9 @@ app.MapPost("/api/linehaul/receipts", async (
         return Results.BadRequest(new { message = "From terminal and To terminal must be different." });
 
     var terminals = await db.Terminals.AsNoTracking()
-        .Where(x => x.Active && (x.Id == req.FromTerminalId || x.Id == req.ToTerminalId))
+        .Where(x => x.Active &&
+                    (x.Id == req.FromTerminalId || x.Id == req.ToTerminalId) &&
+                    (x.Id == currentTerminalId || (!x.IsOperatingTerminal && x.ScopeTerminalId == currentTerminalId)))
         .ToListAsync();
     var fromTerminal = terminals.FirstOrDefault(x => x.Id == req.FromTerminalId);
     var toTerminal = terminals.FirstOrDefault(x => x.Id == req.ToTerminalId);
@@ -2218,8 +2240,8 @@ app.MapGet("/api/linehaul/import-template", (string? format) =>
         ["ContainerTrailer", "No", "Optional container/trailer number or other reference text.", "TTR12345"],
         ["PalletReceiptNumber", "New data: Yes / legacy import: optional", "Pallekvitteringsnummer. Blank is accepted only to make old historical data importable.", "PK-123456"],
         ["Pallets", "Yes", "Whole number of pallets, 0-10000.", "33"],
-        ["FromTerminal", "At least From or To", "Existing terminal Code, Name or Alias. If blank/missing, your current terminal is inferred.", "SRD / SRD123 / Sandefjord"],
-        ["ToTerminal", "At least From or To", "Existing terminal Code, Name or Alias. If blank/missing, your current terminal is inferred.", "ARE"],
+        ["FromTerminal", "At least From or To", "Code, Name or Alias from this operating terminal’s Linehaul/Mottatt location list. If blank/missing, your current SRD/ARE/KRS terminal is inferred.", "SRD / SRD123 / Sandefjord"],
+        ["ToTerminal", "At least From or To", "Code, Name or Alias from this operating terminal’s Linehaul/Mottatt location list. If blank/missing, your current SRD/ARE/KRS terminal is inferred.", "ARE"],
         ["StandardComment", "No", "Historical selectable comment text. Does not need to exist as a current option.", "Loaded by night shift"],
         ["Comment", "No", "Free-text comment.", "Old Excel import"]
     ]);
@@ -2256,7 +2278,9 @@ app.MapPost("/api/linehaul/import", async (
 
     var terminalId = TerminalId(principal);
     var userId = UserId(principal);
-    var terminalRows = await db.Terminals.AsNoTracking().ToListAsync();
+    var terminalRows = await db.Terminals.AsNoTracking()
+        .Where(x => x.Active && (x.Id == terminalId || (!x.IsOperatingTerminal && x.ScopeTerminalId == terminalId)))
+        .ToListAsync();
     var terminalLookup = BuildTerminalLookup(terminalRows);
     var ownerTerminal = terminalRows.FirstOrDefault(x => x.Id == terminalId);
     if (ownerTerminal is null) return Results.BadRequest(new { message = "Your assigned terminal no longer exists." });
@@ -2444,8 +2468,9 @@ app.MapGet("/api/received-control/setup", async (ClaimsPrincipal principal, AppD
 {
     var terminalId = TerminalId(principal);
     var terminals = await db.Terminals.AsNoTracking()
-        .Where(x => x.Active)
-        .OrderBy(x => x.Code)
+        .Where(x => x.Active && (x.Id == terminalId || (!x.IsOperatingTerminal && x.ScopeTerminalId == terminalId)))
+        .OrderByDescending(x => x.Id == terminalId)
+        .ThenBy(x => x.Code)
         .Select(x => new { x.Id, x.Code, x.Name })
         .ToListAsync();
     return Results.Ok(new { terminalId, terminalCode = principal.FindFirstValue("terminalCode") ?? "", terminals });
@@ -2465,7 +2490,8 @@ app.MapPost("/api/received-control/entries", async (
     if (req.PalletReceiptReceived && (!req.ReceiptPalletCount.HasValue || req.ReceiptPalletCount.Value < 0 || req.ReceiptPalletCount.Value > 10000))
         return Results.BadRequest(new { message = "Enter the pallet quantity written on the received pallet receipt." });
 
-    var fromTerminal = await db.Terminals.AsNoTracking().FirstOrDefaultAsync(x => x.Id == req.FromTerminalId && x.Active);
+    var fromTerminal = await db.Terminals.AsNoTracking().FirstOrDefaultAsync(x =>
+        x.Id == req.FromTerminalId && x.Active && !x.IsOperatingTerminal && x.ScopeTerminalId == terminalId);
     if (fromTerminal is null) return Results.BadRequest(new { message = "From terminal was not found or is inactive." });
     if (fromTerminal.Id == terminalId) return Results.BadRequest(new { message = "From terminal must be different from your receiving terminal." });
 
@@ -2656,6 +2682,29 @@ app.MapPost("/api/received-control/warnings/{id:int}/acknowledge", async (
     return Results.Ok();
 }).RequireAuthorization("ReceivedControlModule");
 
+app.MapPost("/api/received-control/warnings/acknowledge-all", async (
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var terminalId = TerminalId(principal);
+    var userId = UserId(principal);
+    var now = DateTime.UtcNow;
+    var activeEntryIds = db.ReceivedControlEntries.AsNoTracking()
+        .Where(x => x.TerminalId == terminalId && x.Status == ReceiptStatus.Active)
+        .Select(x => x.Id);
+    var rows = await db.ReceivedControlWarnings
+        .Where(x => x.TerminalId == terminalId && x.AcknowledgedAtUtc == null && activeEntryIds.Contains(x.EntryId))
+        .ToListAsync();
+    foreach (var row in rows)
+    {
+        row.AcknowledgedAtUtc = now;
+        row.AcknowledgedByUserId = userId;
+    }
+    if (rows.Count > 0) await db.SaveChangesAsync();
+    await Audit(db, principal, "RECEIVED_CONTROL_WARNING_ACK_ALL", $"Acknowledged {rows.Count} MottattKontroll warnings");
+    return Results.Ok(new { acknowledged = rows.Count });
+}).RequireAuthorization("ReceivedControlModule");
+
 app.MapGet("/api/received-control/export", async (
     DateOnly from,
     DateOnly to,
@@ -2715,7 +2764,7 @@ app.MapGet("/api/received-control/import-template", (string? format) =>
     var data = new ExportTable("MottattKontroll Import", headers, []);
     var instructions = new ExportTable("Instructions", ["Column", "Required", "Description", "Example"], [
         ["Date", "Yes", "Business date. Recommended format YYYY-MM-DD.", "2026-08-28"],
-        ["FromTerminal", "Yes", "Existing terminal Code, Name or Alias. SRD, SRD123 and Sandefjord can all resolve to the same terminal when configured.", "ARE"],
+        ["FromTerminal", "Yes", "Code, Name or Alias from this operating terminal’s Linehaul/Mottatt location list.", "ARE"],
         ["ContainerTrailer", "Yes", "Container/trailer number or reference.", "TTR12345"],
         ["PalletReceiptReceived", "Yes", "Yes/No. Ja/Nei, true/false and 1/0 are also accepted.", "Yes"],
         ["ReceiptPallets", "When receipt received", "Pallet quantity written on the pallet receipt. Leave blank when PalletReceiptReceived=No.", "33"],
@@ -2755,7 +2804,9 @@ app.MapPost("/api/received-control/import", async (
 
     var terminalId = TerminalId(principal);
     var userId = UserId(principal);
-    var terminalRows = await db.Terminals.AsNoTracking().ToListAsync();
+    var terminalRows = await db.Terminals.AsNoTracking()
+        .Where(x => x.Active && (x.Id == terminalId || (!x.IsOperatingTerminal && x.ScopeTerminalId == terminalId)))
+        .ToListAsync();
     var terminalLookup = BuildTerminalLookup(terminalRows);
     var terminal = terminalRows.FirstOrDefault(x => x.Id == terminalId);
     if (terminal is null) return Results.BadRequest(new { message = "Your assigned terminal no longer exists." });
@@ -2954,7 +3005,13 @@ app.MapPost("/api/admin/database/backup", async (
 
 app.MapGet("/api/admin/terminals", async (AppDbContext db) =>
 {
-    return Results.Ok(new { terminals = await db.Terminals.AsNoTracking().OrderBy(x => x.Code).ToListAsync() });
+    return Results.Ok(new
+    {
+        terminals = await db.Terminals.AsNoTracking()
+            .Where(x => x.IsOperatingTerminal && x.Active)
+            .OrderBy(x => x.Code)
+            .ToListAsync()
+    });
 }).RequireAuthorization(SuperAdminOnly());
 
 app.MapPost("/api/admin/terminals", async (
@@ -2964,17 +3021,19 @@ app.MapPost("/api/admin/terminals", async (
 {
     var code = (req.Code ?? "").Trim().ToUpperInvariant();
     var name = (req.Name ?? "").Trim();
+    if (!IsOperatingTerminalCode(code))
+        return Results.BadRequest(new { message = "Only SRD, ARE and KRS are operating PalletControl terminals. Add Linehaul/Mottatt locations under the Locations category instead." });
     if (string.IsNullOrWhiteSpace(code) || code.Length > 24) return Results.BadRequest(new { message = "Terminal code is required (max 24 characters)." });
     if (string.IsNullOrWhiteSpace(name)) name = code;
-    var existing = await db.Terminals.FirstOrDefaultAsync(x => x.Code.ToUpper() == code);
+    var existing = await db.Terminals.FirstOrDefaultAsync(x => x.IsOperatingTerminal && x.Code.ToUpper() == code);
     if (existing != null)
     {
         if (existing.Active) return Results.Conflict(new { message = $"Terminal {code} already exists." });
-        existing.Active = true; existing.Name = name; existing.Aliases = string.Join(", ", ParseTerminalAliases(req.Aliases)); await db.SaveChangesAsync();
+        existing.Active = true; existing.IsOperatingTerminal = true; existing.ScopeTerminalId = null; existing.Name = name; existing.Aliases = string.Join(", ", ParseTerminalAliases(req.Aliases)); await db.SaveChangesAsync();
         await EnsureTerminalSettings(db, existing.Id);
         return Results.Ok(existing);
     }
-    var row = new Terminal { Code = code, Name = name, Aliases = string.Join(", ", ParseTerminalAliases(req.Aliases)), Active = true };
+    var row = new Terminal { Code = code, Name = name, Aliases = string.Join(", ", ParseTerminalAliases(req.Aliases)), Active = true, IsOperatingTerminal = true };
     db.Terminals.Add(row); await db.SaveChangesAsync();
     await EnsureTerminalSettings(db, row.Id);
     await Audit(db, principal, "TERMINAL_CREATE", $"Created terminal {code} - {name}");
@@ -2989,14 +3048,17 @@ app.MapPut("/api/admin/terminals/{id:int}", async (
 {
     var row = await db.Terminals.FindAsync(id);
     if (row is null) return Results.NotFound();
+    if (!row.IsOperatingTerminal) return Results.BadRequest(new { message = "Use Linehaul/Mottatt Locations to edit this location." });
 
     var oldCode = row.Code;
     var oldName = row.Name;
     var code = string.IsNullOrWhiteSpace(req.Code) ? row.Code : req.Code.Trim().ToUpperInvariant();
     var name = string.IsNullOrWhiteSpace(req.Name) ? row.Name : req.Name.Trim();
+    if (!IsOperatingTerminalCode(code) || !code.Equals(oldCode, StringComparison.OrdinalIgnoreCase))
+        return Results.BadRequest(new { message = "Operating terminal codes are fixed to SRD, ARE and KRS. You may change the display name, not the code." });
     if (string.IsNullOrWhiteSpace(code) || code.Length > 24)
         return Results.BadRequest(new { message = "Terminal code is required (max 24 characters)." });
-    if (await db.Terminals.AsNoTracking().AnyAsync(x => x.Id != id && x.Code.ToUpper() == code))
+    if (await db.Terminals.AsNoTracking().AnyAsync(x => x.Id != id && x.IsOperatingTerminal && x.Code.ToUpper() == code))
         return Results.Conflict(new { message = $"Terminal code {code} is already in use." });
 
     var aliases = req.Aliases is null ? ParseTerminalAliases(row.Aliases) : ParseTerminalAliases(req.Aliases);
@@ -3027,6 +3089,135 @@ app.MapPut("/api/admin/terminals/{id:int}", async (
     return Results.Ok(row);
 }).RequireAuthorization(SuperAdminOnly());
 
+// Terminal-specific Linehaul/Mottatt routing/statistics locations. These are not user terminals.
+app.MapGet("/api/admin/linehaul-locations", async (
+    int? terminalId,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var ownerTerminalId = ResolveAdminTerminal(principal, terminalId);
+    if (ownerTerminalId <= 0) return Results.Forbid();
+    var owner = await db.Terminals.AsNoTracking().FirstOrDefaultAsync(x => x.Id == ownerTerminalId && x.IsOperatingTerminal && x.Active);
+    if (owner is null) return Results.NotFound(new { message = "Operating terminal not found." });
+    return Results.Ok(new
+    {
+        terminalId = ownerTerminalId,
+        terminalCode = owner.Code,
+        terminals = IsSuperAdmin(principal)
+            ? await db.Terminals.AsNoTracking().Where(x => x.Active && x.IsOperatingTerminal).OrderBy(x => x.Code).Select(x => new { x.Id, x.Code, x.Name }).ToListAsync()
+            : await db.Terminals.AsNoTracking().Where(x => x.Id == ownerTerminalId && x.IsOperatingTerminal).Select(x => new { x.Id, x.Code, x.Name }).ToListAsync(),
+        locations = await db.Terminals.AsNoTracking()
+            .Where(x => !x.IsOperatingTerminal && x.ScopeTerminalId == ownerTerminalId && x.Active)
+            .OrderBy(x => x.Code)
+            .Select(x => new { x.Id, x.Code, x.Name, x.Aliases, x.Active, x.ScopeTerminalId })
+            .ToListAsync()
+    });
+}).RequireAuthorization(AdminOnly());
+
+app.MapPost("/api/admin/linehaul-locations", async (
+    AdminLinehaulLocationRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var ownerTerminalId = ResolveAdminTerminal(principal, req.TerminalId);
+    if (ownerTerminalId <= 0) return Results.Forbid();
+    if (!await db.Terminals.AnyAsync(x => x.Id == ownerTerminalId && x.IsOperatingTerminal && x.Active))
+        return Results.BadRequest(new { message = "Operating terminal not found." });
+    var code = (req.Code ?? "").Trim().ToUpperInvariant();
+    var name = (req.Name ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(code) || code.Length > 40)
+        return Results.BadRequest(new { message = "Location code is required (max 40 characters)." });
+    if (string.IsNullOrWhiteSpace(name)) name = code;
+    var existing = await db.Terminals.FirstOrDefaultAsync(x => !x.IsOperatingTerminal && x.ScopeTerminalId == ownerTerminalId && x.Code.ToUpper() == code);
+    if (existing is not null)
+    {
+        if (existing.Active)
+            return Results.Conflict(new { message = $"Location {code} already exists for this terminal." });
+        existing.Name = name;
+        existing.Aliases = string.Join(", ", ParseTerminalAliases(req.Aliases));
+        existing.Active = true;
+        await db.SaveChangesAsync();
+        await Audit(db, principal, "LINEHAUL_LOCATION_RESTORE", $"Restored {code} for terminal #{ownerTerminalId}");
+        return Results.Ok(existing);
+    }
+    var row = new Terminal
+    {
+        Code = code,
+        Name = name,
+        Aliases = string.Join(", ", ParseTerminalAliases(req.Aliases)),
+        Active = true,
+        IsOperatingTerminal = false,
+        ScopeTerminalId = ownerTerminalId
+    };
+    db.Terminals.Add(row);
+    await db.SaveChangesAsync();
+    await Audit(db, principal, "LINEHAUL_LOCATION_CREATE", $"Created {code} for terminal #{ownerTerminalId}");
+    return Results.Ok(row);
+}).RequireAuthorization(AdminOnly());
+
+app.MapPut("/api/admin/linehaul-locations/{id:int}", async (
+    int id,
+    AdminLinehaulLocationUpdateRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var row = await db.Terminals.FindAsync(id);
+    if (row is null) return Results.NotFound();
+    if (row.IsOperatingTerminal || !row.ScopeTerminalId.HasValue)
+        return Results.BadRequest(new { message = "This is not a Linehaul/Mottatt location." });
+    if (!CanManageTerminal(principal, row.ScopeTerminalId.Value)) return Results.Forbid();
+
+    var code = (req.Code ?? row.Code).Trim().ToUpperInvariant();
+    var name = string.IsNullOrWhiteSpace(req.Name) ? row.Name : req.Name.Trim();
+    if (string.IsNullOrWhiteSpace(code) || code.Length > 40)
+        return Results.BadRequest(new { message = "Location code is required (max 40 characters)." });
+    if (await db.Terminals.AnyAsync(x => x.Id != id && !x.IsOperatingTerminal && x.ScopeTerminalId == row.ScopeTerminalId && x.Code.ToUpper() == code))
+        return Results.Conflict(new { message = $"Location {code} already exists for this terminal." });
+
+    var oldCode = row.Code;
+    var oldName = row.Name;
+    var aliases = req.Aliases is null ? ParseTerminalAliases(row.Aliases) : ParseTerminalAliases(req.Aliases);
+    if (!oldCode.Equals(code, StringComparison.OrdinalIgnoreCase)) aliases.Add(oldCode);
+    if (!oldName.Equals(name, StringComparison.OrdinalIgnoreCase)) aliases.Add(oldName);
+    row.Code = code;
+    row.Name = name;
+    row.Aliases = string.Join(", ", aliases
+        .Where(x => !x.Equals(code, StringComparison.OrdinalIgnoreCase) && !x.Equals(name, StringComparison.OrdinalIgnoreCase))
+        .Distinct(StringComparer.OrdinalIgnoreCase));
+    row.Active = req.Active;
+
+    var linehaulRows = await db.LinehaulReceipts.Where(x => x.FromTerminalId == id || x.ToTerminalId == id).ToListAsync();
+    foreach (var receipt in linehaulRows)
+    {
+        if (receipt.FromTerminalId == id) receipt.FromTerminalSnapshot = code;
+        if (receipt.ToTerminalId == id) receipt.ToTerminalSnapshot = code;
+    }
+    var receivedRows = await db.ReceivedControlEntries.Where(x => x.FromTerminalId == id).ToListAsync();
+    foreach (var entry in receivedRows) entry.FromTerminalSnapshot = code;
+    await db.SaveChangesAsync();
+    await Audit(db, principal, "LINEHAUL_LOCATION_UPDATE", $"Updated {oldCode} -> {code} for terminal #{row.ScopeTerminalId}");
+    return Results.Ok(row);
+}).RequireAuthorization(AdminOnly());
+
+app.MapDelete("/api/admin/linehaul-locations/{id:int}", async (
+    int id,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var row = await db.Terminals.FindAsync(id);
+    if (row is null) return Results.NotFound();
+    if (row.IsOperatingTerminal || !row.ScopeTerminalId.HasValue)
+        return Results.BadRequest(new { message = "SRD, ARE and KRS cannot be deleted from the Linehaul/Mottatt locations list." });
+    if (!CanManageTerminal(principal, row.ScopeTerminalId.Value)) return Results.Forbid();
+    var label = row.Code;
+    // Keep the row behind historical foreign-key references, but remove it completely
+    // from future registration/import/admin selection. Re-adding the same code restores it.
+    row.Active = false;
+    await db.SaveChangesAsync();
+    await Audit(db, principal, "LINEHAUL_LOCATION_DELETE", $"Removed location {label} from future selection; historical receipts keep their saved name");
+    return Results.Ok();
+}).RequireAuthorization(AdminOnly());
+
 app.MapGet("/api/admin/terminal-settings", async (
     int? terminalId,
     ClaimsPrincipal principal,
@@ -3034,7 +3225,7 @@ app.MapGet("/api/admin/terminal-settings", async (
 {
     var targetTerminalId = ResolveAdminTerminal(principal, terminalId);
     if (targetTerminalId <= 0) return Results.Forbid();
-    var terminal = await db.Terminals.AsNoTracking().FirstOrDefaultAsync(x => x.Id == targetTerminalId);
+    var terminal = await db.Terminals.AsNoTracking().FirstOrDefaultAsync(x => x.Id == targetTerminalId && x.IsOperatingTerminal);
     if (terminal is null) return Results.NotFound(new { message = "Terminal not found." });
     var settings = await GetTerminalSettings(db, targetTerminalId);
     return Results.Ok(new
@@ -3042,7 +3233,7 @@ app.MapGet("/api/admin/terminal-settings", async (
         terminalId = targetTerminalId,
         terminalCode = terminal.Code,
         terminals = IsSuperAdmin(principal)
-            ? await db.Terminals.AsNoTracking().Where(x => x.Active).OrderBy(x => x.Code).Select(x => new { x.Id, x.Code, x.Name }).ToListAsync()
+            ? await db.Terminals.AsNoTracking().Where(x => x.Active && x.IsOperatingTerminal).OrderBy(x => x.Code).Select(x => new { x.Id, x.Code, x.Name }).ToListAsync()
             : await db.Terminals.AsNoTracking().Where(x => x.Id == targetTerminalId).Select(x => new { x.Id, x.Code, x.Name }).ToListAsync(),
         settings
     });
@@ -3056,6 +3247,8 @@ app.MapPut("/api/admin/terminal-settings", async (
 {
     var targetTerminalId = ResolveAdminTerminal(principal, terminalId);
     if (targetTerminalId <= 0) return Results.Forbid();
+    if (!await db.Terminals.AsNoTracking().AnyAsync(x => x.Id == targetTerminalId && x.IsOperatingTerminal && x.Active))
+        return Results.BadRequest(new { message = "Terminal settings are only available for SRD, ARE and KRS." });
     var s = await GetTerminalSettings(db, targetTerminalId, tracking: true);
     ApplySettings(s, req);
     await db.SaveChangesAsync();
@@ -3070,14 +3263,14 @@ app.MapGet("/api/admin/linehaul-comments", async (
 {
     var targetTerminalId = ResolveAdminTerminal(principal, terminalId);
     if (targetTerminalId <= 0) return Results.Forbid();
-    var terminal = await db.Terminals.AsNoTracking().FirstOrDefaultAsync(x => x.Id == targetTerminalId);
+    var terminal = await db.Terminals.AsNoTracking().FirstOrDefaultAsync(x => x.Id == targetTerminalId && x.IsOperatingTerminal);
     if (terminal is null) return Results.NotFound();
     return Results.Ok(new
     {
         terminalId = targetTerminalId,
         terminalCode = terminal.Code,
         terminals = IsSuperAdmin(principal)
-            ? await db.Terminals.AsNoTracking().Where(x => x.Active).OrderBy(x => x.Code).Select(x => new { x.Id, x.Code, x.Name }).ToListAsync()
+            ? await db.Terminals.AsNoTracking().Where(x => x.Active && x.IsOperatingTerminal).OrderBy(x => x.Code).Select(x => new { x.Id, x.Code, x.Name }).ToListAsync()
             : await db.Terminals.AsNoTracking().Where(x => x.Id == targetTerminalId).Select(x => new { x.Id, x.Code, x.Name }).ToListAsync(),
         comments = await db.LinehaulCommentOptions.AsNoTracking().Where(x => x.TerminalId == targetTerminalId).OrderBy(x => x.Text).ToListAsync()
     });
@@ -3090,6 +3283,8 @@ app.MapPost("/api/admin/linehaul-comments", async (
 {
     var targetTerminalId = ResolveAdminTerminal(principal, req.TerminalId);
     if (targetTerminalId <= 0) return Results.Forbid();
+    if (!await db.Terminals.AsNoTracking().AnyAsync(x => x.Id == targetTerminalId && x.IsOperatingTerminal && x.Active))
+        return Results.BadRequest(new { message = "Linehaul comments must belong to SRD, ARE or KRS." });
     var text = (req.Text ?? "").Trim();
     if (string.IsNullOrWhiteSpace(text)) return Results.BadRequest(new { message = "Comment text is required." });
     var existing = await db.LinehaulCommentOptions.FirstOrDefaultAsync(x => x.TerminalId == targetTerminalId && x.Text.ToLower() == text.ToLower());
@@ -3122,7 +3317,7 @@ app.MapGet("/api/admin/all", async (AppDbContext db) =>
     var settings = await db.Settings.AsNoTracking().SingleAsync();
     return Results.Ok(new
     {
-        terminals = await db.Terminals.AsNoTracking().OrderBy(x => x.Code).ToListAsync(),
+        terminals = await db.Terminals.AsNoTracking().Where(x => x.IsOperatingTerminal).OrderBy(x => x.Code).ToListAsync(),
         transporters = await db.Transporters.AsNoTracking().OrderBy(x => x.Name).ToListAsync(),
         vehicles = await db.Vehicles.AsNoTracking()
             .Include(x => x.Terminal)
@@ -3191,7 +3386,7 @@ app.MapGet("/api/admin/vehicles", async (ClaimsPrincipal principal, AppDbContext
     if (!IsSuperAdmin(principal)) q = q.Where(x => x.TerminalId == terminalId);
     var vehicles = await q.OrderBy(x => x.VehicleId).ToListAsync();
     var terminals = IsSuperAdmin(principal)
-        ? await db.Terminals.AsNoTracking().Where(x => x.Active).OrderBy(x => x.Code).ToListAsync()
+        ? await db.Terminals.AsNoTracking().Where(x => x.Active && x.IsOperatingTerminal).OrderBy(x => x.Code).ToListAsync()
         : await db.Terminals.AsNoTracking().Where(x => x.Id == terminalId).ToListAsync();
     return Results.Ok(new
     {
@@ -3212,7 +3407,7 @@ app.MapGet("/api/admin/drivers", async (ClaimsPrincipal principal, AppDbContext 
     var q = db.Drivers.AsNoTracking().Include(x => x.Terminal).AsQueryable();
     if (!IsSuperAdmin(principal)) q = q.Where(x => x.TerminalId == terminalId);
     var terminals = IsSuperAdmin(principal)
-        ? await db.Terminals.AsNoTracking().Where(x => x.Active).OrderBy(x => x.Code).ToListAsync()
+        ? await db.Terminals.AsNoTracking().Where(x => x.Active && x.IsOperatingTerminal).OrderBy(x => x.Code).ToListAsync()
         : await db.Terminals.AsNoTracking().Where(x => x.Id == terminalId).ToListAsync();
     return Results.Ok(new
     {
@@ -3235,7 +3430,7 @@ app.MapGet("/api/admin/users", async (ClaimsPrincipal principal, AppDbContext db
     var q = db.Users.AsNoTracking().Include(x => x.Terminal).AsQueryable();
     if (!IsSuperAdmin(principal)) q = q.Where(x => x.TerminalId == terminalId && x.Role != Roles.SuperAdmin && x.Role != Roles.LegacyAdmin);
     var terminals = IsSuperAdmin(principal)
-        ? await db.Terminals.AsNoTracking().Where(x => x.Active).OrderBy(x => x.Code).ToListAsync()
+        ? await db.Terminals.AsNoTracking().Where(x => x.Active && x.IsOperatingTerminal).OrderBy(x => x.Code).ToListAsync()
         : await db.Terminals.AsNoTracking().Where(x => x.Id == terminalId).ToListAsync();
     return Results.Ok(new
     {
@@ -3350,8 +3545,8 @@ app.MapPost("/api/admin/vehicles", async (
     if (await db.Vehicles.AnyAsync(x => x.VehicleId == idText))
         return Results.Conflict(new { code = "VEHICLE_EXISTS", message = $"Vehicle {idText} already exists." });
 
-    if (!await db.Terminals.AnyAsync(x => x.Id == req.TerminalId))
-        return Results.BadRequest(new { message = "Terminal not found." });
+    if (!await db.Terminals.AnyAsync(x => x.Id == req.TerminalId && x.IsOperatingTerminal && x.Active))
+        return Results.BadRequest(new { message = "Operating terminal not found." });
 
     if (!await db.Transporters.AnyAsync(x => x.Id == req.TransporterId && x.Active))
         return Results.BadRequest(new { message = "Transporter not found." });
@@ -3435,6 +3630,8 @@ app.MapPost("/api/admin/drivers", async (
     AppDbContext db) =>
 {
     if (!CanManageTerminal(principal, req.TerminalId)) return Results.Forbid();
+    if (!await db.Terminals.AnyAsync(x => x.Id == req.TerminalId && x.IsOperatingTerminal && x.Active))
+        return Results.BadRequest(new { message = "Operating terminal not found." });
     var name = req.Name.Trim();
     if (string.IsNullOrWhiteSpace(name))
         return Results.BadRequest(new { message = "Driver name is required." });
@@ -3535,6 +3732,8 @@ app.MapPost("/api/admin/users", async (
         return Results.BadRequest(new { message = "Username and password are required." });
     if (!ValidRole(req.Role)) return Results.BadRequest(new { message = "Invalid role." });
     if (!CanManageTerminal(principal, req.TerminalId)) return Results.Forbid();
+    if (!await db.Terminals.AnyAsync(x => x.Id == req.TerminalId && x.IsOperatingTerminal && x.Active))
+        return Results.BadRequest(new { message = "Operating terminal not found." });
     if (!IsSuperAdmin(principal) && req.Role == Roles.SuperAdmin) return Results.Forbid();
     if (await db.Users.AnyAsync(x => x.Username == username)) return Results.BadRequest(new { message = "Username already exists." });
 
@@ -3567,6 +3766,8 @@ app.MapPut("/api/admin/users/{id:int}", async (
     if (row is null) return Results.NotFound();
     if (!ValidRole(req.Role)) return Results.BadRequest(new { message = "Invalid role." });
     if (!CanManageTerminal(principal, row.TerminalId) || !CanManageTerminal(principal, req.TerminalId)) return Results.Forbid();
+    if (!await db.Terminals.AnyAsync(x => x.Id == req.TerminalId && x.IsOperatingTerminal && x.Active))
+        return Results.BadRequest(new { message = "Operating terminal not found." });
     if (!IsSuperAdmin(principal) && (row.Role == Roles.SuperAdmin || row.Role == Roles.LegacyAdmin || req.Role == Roles.SuperAdmin)) return Results.Forbid();
 
     row.DisplayName = req.DisplayName.Trim();
@@ -3809,6 +4010,35 @@ static void EnsureCompatibilitySchema(AppDbContext db)
             cmd.CommandText = "ALTER TABLE \"Terminals\" ADD COLUMN \"Aliases\" TEXT NOT NULL DEFAULT '';";
             cmd.ExecuteNonQuery();
         }
+        var addedOperatingTerminalColumn = false;
+        if (!terminalColumns.Contains("IsOperatingTerminal"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"Terminals\" ADD COLUMN \"IsOperatingTerminal\" INTEGER NOT NULL DEFAULT 1;";
+            cmd.ExecuteNonQuery();
+            addedOperatingTerminalColumn = true;
+        }
+        if (!terminalColumns.Contains("ScopeTerminalId"))
+        {
+            using var cmd = connection.CreateCommand();
+            cmd.CommandText = "ALTER TABLE \"Terminals\" ADD COLUMN \"ScopeTerminalId\" INTEGER NULL;";
+            cmd.ExecuteNonQuery();
+        }
+
+        // On the first v5.8.6 upgrade classify the old shared terminal list. On later
+        // starts preserve scoped locations even when their display code is SRD/ARE/KRS.
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = addedOperatingTerminalColumn
+                ? "UPDATE \"Terminals\" SET \"IsOperatingTerminal\" = CASE WHEN UPPER(\"Code\") IN ('SRD','ARE','KRS') THEN 1 ELSE 0 END;"
+                : "UPDATE \"Terminals\" SET \"IsOperatingTerminal\" = CASE WHEN \"ScopeTerminalId\" IS NOT NULL THEN 0 WHEN UPPER(\"Code\") IN ('SRD','ARE','KRS') THEN 1 ELSE \"IsOperatingTerminal\" END;";
+            cmd.ExecuteNonQuery();
+        }
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = "CREATE INDEX IF NOT EXISTS \"IX_Terminals_ScopeTerminalId\" ON \"Terminals\" (\"ScopeTerminalId\", \"Active\");";
+            cmd.ExecuteNonQuery();
+        }
 
         var settingsColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         using (var cmd = connection.CreateCommand())
@@ -4013,6 +4243,8 @@ CREATE INDEX IF NOT EXISTS "IX_ReceivedControlWarnings_TerminalAck" ON "Received
 
 static async Task<TerminalSettings> GetTerminalSettings(AppDbContext db, int terminalId, bool tracking = false)
 {
+    if (!await db.Terminals.AsNoTracking().AnyAsync(x => x.Id == terminalId && x.IsOperatingTerminal))
+        throw new InvalidOperationException("Terminal settings are only available for SRD, ARE and KRS.");
     var query = tracking ? db.TerminalSettings.AsQueryable() : db.TerminalSettings.AsNoTracking();
     var existing = await query.FirstOrDefaultAsync(x => x.TerminalId == terminalId);
     if (existing != null) return existing;
@@ -4070,6 +4302,9 @@ static object ToReceivedControlDto(ReceivedControlEntry x) => new
     x.PalletReceiptReceived, x.ReceiptPalletCount, x.ActualPalletCount, x.Result, x.Status, x.CancelledAtUtc, x.CancelReason,
     difference = x.PalletReceiptReceived ? x.ActualPalletCount - (x.ReceiptPalletCount ?? 0) : (int?)null
 };
+
+static bool IsOperatingTerminalCode(string? code) =>
+    (code ?? "").Trim().ToUpperInvariant() is "SRD" or "ARE" or "KRS";
 
 static List<string> ParseTerminalAliases(string? value) =>
     string.IsNullOrWhiteSpace(value)
@@ -4720,6 +4955,106 @@ static object ToReceiptDto(PalletReceipt r) => new
         }).ToList()
 };
 
+static void MigrateLegacyLinehaulLocations(AppDbContext db)
+{
+    var operating = db.Terminals.Where(x => x.IsOperatingTerminal && x.Active).ToList();
+    if (operating.Count == 0) return;
+    var fallback = operating.FirstOrDefault(x => x.Code == "SRD") ?? operating[0];
+    var operatingIds = operating.Select(x => x.Id).ToHashSet();
+
+    // Any legacy non-operating terminal without an owner is assigned based on historical
+    // usage where possible, otherwise to SRD. Historical receipts are then split per owner
+    // so ARE/KRS/SRD may use independent names and aliases going forward.
+    var allTerminals = db.Terminals.ToList();
+    foreach (var location in allTerminals.Where(x => !x.IsOperatingTerminal && !x.ScopeTerminalId.HasValue))
+    {
+        var owner = db.LinehaulReceipts.AsNoTracking()
+            .Where(x => x.FromTerminalId == location.Id || x.ToTerminalId == location.Id)
+            .Select(x => x.OwnerTerminalId)
+            .FirstOrDefault();
+        if (!operatingIds.Contains(owner))
+            owner = db.ReceivedControlEntries.AsNoTracking()
+                .Where(x => x.FromTerminalId == location.Id)
+                .Select(x => x.TerminalId)
+                .FirstOrDefault();
+        location.ScopeTerminalId = operatingIds.Contains(owner) ? owner : fallback.Id;
+    }
+
+    // Old builds may have let users/master data belong to statistical terminals. Keep the
+    // application valid by moving those records to SRD rather than deleting them.
+    var nonOperatingIds = allTerminals.Where(x => !x.IsOperatingTerminal).Select(x => x.Id).ToHashSet();
+    foreach (var user in db.Users.Where(x => nonOperatingIds.Contains(x.TerminalId))) user.TerminalId = fallback.Id;
+    foreach (var vehicle in db.Vehicles.Where(x => nonOperatingIds.Contains(x.TerminalId))) vehicle.TerminalId = fallback.Id;
+    foreach (var driver in db.Drivers.Where(x => nonOperatingIds.Contains(x.TerminalId))) driver.TerminalId = fallback.Id;
+    foreach (var comment in db.LinehaulCommentOptions.Where(x => nonOperatingIds.Contains(x.TerminalId))) comment.TerminalId = fallback.Id;
+    foreach (var receipt in db.LinehaulReceipts.Where(x => nonOperatingIds.Contains(x.OwnerTerminalId))) receipt.OwnerTerminalId = fallback.Id;
+    foreach (var entry in db.ReceivedControlEntries.Where(x => nonOperatingIds.Contains(x.TerminalId))) entry.TerminalId = fallback.Id;
+
+    db.SaveChanges();
+    allTerminals = db.Terminals.ToList();
+    var byId = allTerminals.ToDictionary(x => x.Id);
+    var scoped = allTerminals
+        .Where(x => !x.IsOperatingTerminal && x.ScopeTerminalId.HasValue)
+        .GroupBy(x => (x.ScopeTerminalId!.Value, x.Code.ToUpperInvariant()))
+        .ToDictionary(g => g.Key, g => g.First());
+
+    Terminal GetOrCreateLocation(int ownerId, Terminal source)
+    {
+        if (!source.IsOperatingTerminal && source.ScopeTerminalId == ownerId) return source;
+        var key = (ownerId, source.Code.ToUpperInvariant());
+        if (scoped.TryGetValue(key, out var existing)) return existing;
+        var aliases = ParseTerminalAliases(source.Aliases);
+        if (!aliases.Contains(source.Code, StringComparer.OrdinalIgnoreCase)) aliases.Add(source.Code);
+        if (!aliases.Contains(source.Name, StringComparer.OrdinalIgnoreCase)) aliases.Add(source.Name);
+        var clone = new Terminal
+        {
+            Code = source.Code,
+            Name = source.Name,
+            Aliases = string.Join(", ", aliases.Distinct(StringComparer.OrdinalIgnoreCase)),
+            Active = true,
+            IsOperatingTerminal = false,
+            ScopeTerminalId = ownerId
+        };
+        db.Terminals.Add(clone);
+        db.SaveChanges();
+        scoped[key] = clone;
+        byId[clone.Id] = clone;
+        return clone;
+    }
+
+    foreach (var receipt in db.LinehaulReceipts.ToList())
+    {
+        var ownerId = operatingIds.Contains(receipt.OwnerTerminalId) ? receipt.OwnerTerminalId : fallback.Id;
+        receipt.OwnerTerminalId = ownerId;
+        if (receipt.FromTerminalId != ownerId && byId.TryGetValue(receipt.FromTerminalId, out var fromSource))
+        {
+            var location = GetOrCreateLocation(ownerId, fromSource);
+            receipt.FromTerminalId = location.Id;
+            receipt.FromTerminalSnapshot = location.Code;
+        }
+        if (receipt.ToTerminalId != ownerId && byId.TryGetValue(receipt.ToTerminalId, out var toSource))
+        {
+            var location = GetOrCreateLocation(ownerId, toSource);
+            receipt.ToTerminalId = location.Id;
+            receipt.ToTerminalSnapshot = location.Code;
+        }
+    }
+
+    foreach (var entry in db.ReceivedControlEntries.ToList())
+    {
+        var ownerId = operatingIds.Contains(entry.TerminalId) ? entry.TerminalId : fallback.Id;
+        entry.TerminalId = ownerId;
+        if (byId.TryGetValue(entry.FromTerminalId, out var source))
+        {
+            var location = GetOrCreateLocation(ownerId, source);
+            entry.FromTerminalId = location.Id;
+            entry.FromTerminalSnapshot = location.Code;
+        }
+    }
+
+    db.SaveChanges();
+}
+
 static void Seed(AppDbContext db)
 {
     // Demo/master data is seeded only when the database is genuinely new.
@@ -4741,26 +5076,33 @@ static void Seed(AppDbContext db)
         db.SaveChanges();
     }
 
-    foreach (var terminalId in db.Terminals.Select(x => x.Id).ToList())
+    foreach (var terminalId in db.Terminals.Where(x => x.IsOperatingTerminal).Select(x => x.Id).ToList())
         EnsureTerminalSettings(db, terminalId).GetAwaiter().GetResult();
 
     if (!isFreshDatabase)
     {
-        // v5.4.3 adds ARE as a real terminal. Add it once to existing databases
-        // without recreating any master data that an Admin intentionally deleted.
-        if (!db.Terminals.Any(x => x.Code == "ARE"))
+        // v5.8.6 keeps exactly three operating PalletControl terminals. Statistical
+        // Linehaul/Mottatt locations are separate scoped rows and must not replace these.
+        var requiredOperatingTerminals = new[]
         {
-            db.Terminals.Add(new Terminal { Code = "ARE", Name = "Arendal", Active = true });
-            db.SaveChanges();
+            (Code: "SRD", Name: "Sandefjord"),
+            (Code: "ARE", Name: "Arendal"),
+            (Code: "KRS", Name: "Kristiansand")
+        };
+        foreach (var required in requiredOperatingTerminals)
+        {
+            if (!db.Terminals.Any(x => x.IsOperatingTerminal && x.Code == required.Code))
+                db.Terminals.Add(new Terminal { Code = required.Code, Name = required.Name, Active = true, IsOperatingTerminal = true });
         }
-        foreach (var terminalId in db.Terminals.Select(x => x.Id).ToList())
+        db.SaveChanges();
+        foreach (var terminalId in db.Terminals.Where(x => x.IsOperatingTerminal).Select(x => x.Id).ToList())
             EnsureTerminalSettings(db, terminalId).GetAwaiter().GetResult();
         return;
     }
 
-    var srd = new Terminal { Code = "SRD", Name = "Sandefjord", Active = true };
-    var krs = new Terminal { Code = "KRS", Name = "Kristiansand", Active = true };
-    var are = new Terminal { Code = "ARE", Name = "Arendal", Active = true };
+    var srd = new Terminal { Code = "SRD", Name = "Sandefjord", Active = true, IsOperatingTerminal = true };
+    var krs = new Terminal { Code = "KRS", Name = "Kristiansand", Active = true, IsOperatingTerminal = true };
+    var are = new Terminal { Code = "ARE", Name = "Arendal", Active = true, IsOperatingTerminal = true };
     db.Terminals.AddRange(srd, krs, are);
 
     db.PalletTypes.AddRange(
@@ -5103,6 +5445,11 @@ public class Terminal
     public string Name { get; set; } = "";
     public string Aliases { get; set; } = "";
     public bool Active { get; set; } = true;
+
+    // Only SRD / ARE / KRS are operating PalletControl terminals. Other rows are
+    // Linehaul/Mottatt locations owned by one operating terminal.
+    public bool IsOperatingTerminal { get; set; } = true;
+    public int? ScopeTerminalId { get; set; }
 }
 
 public class Transporter
@@ -5521,6 +5868,8 @@ public record AdminSettingsRequest(
 
 public record AdminTerminalRequest(string? Code, string? Name, string? Aliases);
 public record AdminTerminalUpdateRequest(string? Code, string? Name, string? Aliases, bool Active);
+public record AdminLinehaulLocationRequest(int? TerminalId, string? Code, string? Name, string? Aliases);
+public record AdminLinehaulLocationUpdateRequest(string? Code, string? Name, string? Aliases, bool Active);
 public record AdminLinehaulCommentRequest(int? TerminalId, string? Text);
 public record CreateLinehaulReceiptRequest(string? UnitReference, string? PalletReceiptNumber, int PalletCount, int FromTerminalId, int ToTerminalId, int? CommentOptionId, string? FreeComment, DateOnly? BusinessDate);
 public record CreateReceivedControlRequest(int FromTerminalId, string? UnitReference, string? Comment, bool PalletReceiptReceived, int? ReceiptPalletCount, int ActualPalletCount, DateOnly? BusinessDate);

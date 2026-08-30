@@ -1748,3 +1748,277 @@ html[data-theme="pallet-stealer"] tr.rcBlue > td { color: #172554; }
 html[data-theme="pallet-stealer"] tr.rcRed > td { color: #450a0a; }
 html[data-theme="pallet-stealer"] tr.rcOrange > td { color: #431407; }
 html[data-theme="pallet-stealer"] tr.rcGreen > td { color: #052e16; }
+
+/* =========================================================
+   v5.8.8 - THEME CONSISTENCY / FULL-PAGE CONTRAST FIX
+   Ensures short pages do not expose the normal light canvas
+   and removes legacy white-on-white controls in special themes.
+   ========================================================= */
+
+html,
+body,
+#root {
+    min-height: 100%;
+}
+
+body,
+#root,
+#root > div {
+    min-height: 100vh;
+}
+
+/* Keep the browser canvas itself in the selected theme. */
+html[data-theme="normal"],
+html[data-theme="normal"] body,
+html[data-theme="normal"] #root {
+    background: #f2f5f8;
+    color: #172033;
+}
+
+html[data-theme="dark"],
+html[data-theme="dark"] body,
+html[data-theme="dark"] #root {
+    background: #0b1220;
+    color: #e5e7eb;
+}
+
+html[data-theme="terminal"],
+html[data-theme="terminal"] body,
+html[data-theme="terminal"] #root {
+    background-color: #e8e5d8;
+    background-image:
+            repeating-linear-gradient(0deg, rgba(87,76,54,.035) 0 1px, transparent 1px 26px),
+            repeating-linear-gradient(90deg, rgba(87,76,54,.028) 0 1px, transparent 1px 92px);
+    color: #283128;
+}
+
+html[data-theme="pallet-stealer"],
+html[data-theme="pallet-stealer"] body,
+html[data-theme="pallet-stealer"] #root {
+    background-color: #100d18;
+    background-image: repeating-linear-gradient(135deg, rgba(245,158,11,.025) 0 12px, transparent 12px 28px);
+    color: #f5f3ff;
+}
+
+/* ---------- DARK ---------- */
+html[data-theme="dark"] th,
+html[data-theme="dark"] thead th,
+html[data-theme="dark"] .sortableHeader {
+    background: #172033 !important;
+    color: #f1f5f9 !important;
+    border-color: #334155 !important;
+}
+
+html[data-theme="dark"] .sortableHeader:hover {
+    background: #1e293b !important;
+}
+
+html[data-theme="dark"] .direction button,
+html[data-theme="dark"] .qtyRow button,
+html[data-theme="dark"] .filterActions > button:not(.primary),
+html[data-theme="dark"] .filters button,
+html[data-theme="dark"] .stackForm button,
+html[data-theme="dark"] .tiny,
+html[data-theme="dark"] .receiptStatusFilters button,
+html[data-theme="dark"] .embeddedAdminClose button {
+    background: #111827 !important;
+    color: #e5e7eb !important;
+    border-color: #475569 !important;
+}
+
+html[data-theme="dark"] .direction button.selected,
+html[data-theme="dark"] .receiptStatusFilters button.active {
+    background: #e2e8f0 !important;
+    color: #0f172a !important;
+    border-color: #e2e8f0 !important;
+}
+
+html[data-theme="dark"] .resultCount,
+html[data-theme="dark"] .totalCards > div,
+html[data-theme="dark"] .segmented {
+    background: #172033 !important;
+    color: #e5e7eb !important;
+    border-color: #334155 !important;
+}
+
+html[data-theme="dark"] .checkChoice:hover {
+    background: #1e293b !important;
+}
+
+html[data-theme="dark"] td {
+    border-color: #334155;
+}
+
+/* ---------- TERMINAL ---------- */
+html[data-theme="terminal"] th,
+html[data-theme="terminal"] thead th,
+html[data-theme="terminal"] .sortableHeader {
+    background: #e7dfca !important;
+    color: #283128 !important;
+    border-color: #c6b996 !important;
+}
+
+html[data-theme="terminal"] .sortableHeader:hover {
+    background: #ddd2b8 !important;
+}
+
+html[data-theme="terminal"] .direction button,
+html[data-theme="terminal"] .qtyRow button,
+html[data-theme="terminal"] .filterActions > button:not(.primary),
+html[data-theme="terminal"] .filters button,
+html[data-theme="terminal"] .stackForm button,
+html[data-theme="terminal"] .tiny,
+html[data-theme="terminal"] .receiptStatusFilters button,
+html[data-theme="terminal"] .embeddedAdminClose button {
+    background: #f1eddf !important;
+    color: #283128 !important;
+    border-color: #b9ad8c !important;
+}
+
+html[data-theme="terminal"] .direction button.selected,
+html[data-theme="terminal"] .receiptStatusFilters button.active {
+    background: #3c4b3e !important;
+    color: #fffdf5 !important;
+    border-color: #3c4b3e !important;
+}
+
+html[data-theme="terminal"] .resultCount,
+html[data-theme="terminal"] .totalCards > div,
+html[data-theme="terminal"] .segmented {
+    background: #f1eddf !important;
+    color: #283128 !important;
+    border-color: #cfc7ae !important;
+}
+
+html[data-theme="terminal"] .checkChoice:hover {
+    background: #e7dfca !important;
+}
+
+html[data-theme="terminal"] td {
+    border-color: #d9d0ba;
+}
+
+/* ---------- PALLET STEALER ---------- */
+html[data-theme="pallet-stealer"] th,
+html[data-theme="pallet-stealer"] thead th,
+html[data-theme="pallet-stealer"] .sortableHeader {
+    background: #21192e !important;
+    color: #f5f3ff !important;
+    border-color: #493761 !important;
+}
+
+html[data-theme="pallet-stealer"] .sortableHeader:hover {
+    background: #2b1e3d !important;
+}
+
+html[data-theme="pallet-stealer"] .direction button,
+html[data-theme="pallet-stealer"] .qtyRow button,
+html[data-theme="pallet-stealer"] .filterActions > button:not(.primary),
+html[data-theme="pallet-stealer"] .filters button,
+html[data-theme="pallet-stealer"] .stackForm button,
+html[data-theme="pallet-stealer"] .tiny,
+html[data-theme="pallet-stealer"] .receiptStatusFilters button,
+html[data-theme="pallet-stealer"] .embeddedAdminClose button {
+    background: #1a1523 !important;
+    color: #f5f3ff !important;
+    border-color: #5b4677 !important;
+}
+
+html[data-theme="pallet-stealer"] .direction button.selected,
+html[data-theme="pallet-stealer"] .receiptStatusFilters button.active {
+    background: #7c3aed !important;
+    color: #ffffff !important;
+    border-color: #8b5cf6 !important;
+}
+
+html[data-theme="pallet-stealer"] .resultCount,
+html[data-theme="pallet-stealer"] .totalCards > div,
+html[data-theme="pallet-stealer"] .segmented {
+    background: #21192e !important;
+    color: #f5f3ff !important;
+    border-color: #493761 !important;
+}
+
+html[data-theme="pallet-stealer"] .checkChoice:hover {
+    background: #2b1e3d !important;
+}
+
+html[data-theme="pallet-stealer"] td {
+    border-color: #3c2e50;
+}
+
+/* Preserve deliberately colour-coded MottattKontroll rows. */
+html[data-theme="dark"] tr.rcBlue > td,
+html[data-theme="pallet-stealer"] tr.rcBlue > td { color: #172554 !important; }
+html[data-theme="dark"] tr.rcRed > td,
+html[data-theme="pallet-stealer"] tr.rcRed > td { color: #450a0a !important; }
+html[data-theme="dark"] tr.rcOrange > td,
+html[data-theme="pallet-stealer"] tr.rcOrange > td { color: #431407 !important; }
+html[data-theme="dark"] tr.rcGreen > td,
+html[data-theme="pallet-stealer"] tr.rcGreen > td { color: #052e16 !important; }
+
+/* =========================================================
+   v5.8.9 - BUILD FOOTER VIEWPORT ANCHOR FIX
+   Force the version credit to remain bottom-right regardless
+   of theme or surrounding layout rules.
+   ========================================================= */
+html body .buildFooter {
+    position: fixed !important;
+    inset: auto 12px 10px auto !important;
+    top: auto !important;
+    right: 12px !important;
+    bottom: 10px !important;
+    left: auto !important;
+    margin: 0 !important;
+    width: auto !important;
+    max-width: calc(100vw - 24px);
+    height: auto !important;
+    transform: none !important;
+    white-space: nowrap;
+    line-height: 1.2;
+    z-index: 9999 !important;
+}
+
+@media (max-width: 650px) {
+    html body .buildFooter {
+        inset: auto 8px 6px auto !important;
+        right: 8px !important;
+        bottom: 6px !important;
+        max-width: calc(100vw - 16px);
+        white-space: normal;
+        text-align: right;
+    }
+}
+
+/* =========================================================
+   v5.8.10 - BUILD FOOTER HEIGHT FIX
+   #root > div receives min-height:100vh for full-page theming.
+   BuildFooter is also a direct root child, so explicitly exclude it.
+   ========================================================= */
+#root > .buildFooter,
+html body .buildFooter {
+    min-height: 0 !important;
+    min-width: 0 !important;
+    height: auto !important;
+    width: max-content !important;
+    max-width: calc(100vw - 24px) !important;
+    display: block !important;
+    position: fixed !important;
+    inset: auto 12px 10px auto !important;
+    margin: 0 !important;
+    padding: 5px 9px !important;
+    white-space: nowrap;
+    line-height: 1.2;
+    z-index: 9999 !important;
+}
+
+@media (max-width: 650px) {
+    #root > .buildFooter,
+    html body .buildFooter {
+        inset: auto 8px 6px auto !important;
+        width: auto !important;
+        max-width: calc(100vw - 16px) !important;
+        white-space: normal;
+        text-align: right;
+    }
+}

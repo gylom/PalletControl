@@ -1,70 +1,87 @@
-$base = "http://localhost:5000/api"
+param(
+    [string]$BaseUrl = 'http://localhost:5000/api',
+    [string]$Username = $env:PALLETCONTROL_TEST_USER,
+    [string]$Password = $env:PALLETCONTROL_TEST_PASSWORD
+)
 
-Write-Host "1. Health Check..."
-$health = Invoke-RestMethod -Uri "$base/health"
-if ($health.status -ne "healthy") { throw "Health Check failed" }
-Write-Host "   PASS: API and database healthy"
+$ErrorActionPreference = 'Stop'
+$BaseUrl = $BaseUrl.TrimEnd('/')
 
-Write-Host "2. Logging in as admin..."
-$login = Invoke-RestMethod -Method Post -Uri "$base/auth/login" -ContentType "application/json" -Body (@{username="admin";password="admin123"} | ConvertTo-Json)
-$h = @{Authorization="Bearer $($login.token)"}
-
-Write-Host "3. Loading registration setup..."
-$setup = Invoke-RestMethod -Uri "$base/setup/register" -Headers $h
-if ($setup.vehicles.Count -lt 1) { throw "No vehicles returned" }
-if ($setup.drivers.Count -lt 1) { throw "No drivers returned" }
-if ($setup.palletTypes.Count -lt 1) { throw "No pallet types returned" }
-
-$key = [guid]::NewGuid().ToString()
-$payload = @{
-  idempotencyKey=$key
-  vehicleId=$setup.vehicles[0].id
-  driverId=$setup.drivers[0].id
-  direction="IN"
-  items=@(@{palletTypeId=$setup.palletTypes[0].id;quantity=7})
-  confirmWarnings=$true
+if ([string]::IsNullOrWhiteSpace($Username)) {
+    $Username = Read-Host 'PalletControl test username (SuperAdmin recommended)'
 }
-$body = $payload | ConvertTo-Json -Depth 5
-
-Write-Host "4. Creating receipt..."
-$r1 = Invoke-RestMethod -Method Post -Uri "$base/receipts" -Headers $h -ContentType "application/json" -Body $body
-if (-not $r1.receipt.id) { throw "Receipt was not returned" }
-
-Write-Host "5. Sending exact same request again to test duplicate protection..."
-$r2 = Invoke-RestMethod -Method Post -Uri "$base/receipts" -Headers $h -ContentType "application/json" -Body $body
-if ($r1.receipt.id -ne $r2.receipt.id) { throw "Duplicate protection FAILED" }
-Write-Host "   PASS: same receipt ID returned: $($r1.receipt.receiptNumber)"
-
-Write-Host "6. Checking statistics..."
-$stats = Invoke-RestMethod -Uri "$base/statistics" -Headers $h
-Write-Host "   PASS: statistics endpoint responded with $($stats.rows.Count) row(s)"
-
-Write-Host "7. Checking best-driver leaderboard..."
-$leaders = Invoke-RestMethod -Uri "$base/statistics/best-drivers?period=thisMonth" -Headers $h
-if ($leaders.drivers.Count -lt 1) { throw "Leaderboard returned no rows" }
-Write-Host "   PASS: leaderboard endpoint responded"
-
-Write-Host "8. Cancelling and reversing receipt..."
-$cancel = @{reason="Smoke test cancellation"} | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri "$base/receipts/$($r1.receipt.id)/cancel" -Headers $h -ContentType "application/json" -Body $cancel | Out-Null
-$reverse = @{reason="Smoke test reversal"} | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri "$base/receipts/$($r1.receipt.id)/reverse-cancellation" -Headers $h -ContentType "application/json" -Body $reverse | Out-Null
-Write-Host "   PASS: cancellation + reversal"
-
-Write-Host "9. Checking warning center..."
-$warnings = Invoke-RestMethod -Uri "$base/warnings?unacknowledgedOnly=false" -Headers $h
-Write-Host "   PASS: warning center responded with $($warnings.warnings.Count) warning(s)"
-
-Write-Host "10. Checking normal user cannot access admin..."
-$userLogin = Invoke-RestMethod -Method Post -Uri "$base/auth/login" -ContentType "application/json" -Body (@{username="user";password="user123"} | ConvertTo-Json)
-try {
-  Invoke-RestMethod -Uri "$base/admin/all" -Headers @{Authorization="Bearer $($userLogin.token)"}
-  throw "Role protection FAILED"
-} catch {
-  if ($_.Exception.Response.StatusCode.value__ -eq 403) {
-    Write-Host "   PASS: User received 403 Forbidden"
-  } else { throw }
+if ([string]::IsNullOrWhiteSpace($Password)) {
+    $secure = Read-Host 'Password' -AsSecureString
+    $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { $Password = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
 }
 
-Write-Host ""
-Write-Host "ALL SMOKE TESTS PASSED"
+Write-Host '1. Health check...' -ForegroundColor Cyan
+$health = Invoke-RestMethod -Uri "$BaseUrl/health"
+if ($health.status -ne 'healthy') { throw 'Health check failed.' }
+Write-Host '   PASS: API + SQLite healthy'
+
+Write-Host '2. Backend version...' -ForegroundColor Cyan
+$version = Invoke-RestMethod -Uri "$BaseUrl/version"
+Write-Host "   PASS: backend v$($version.version)"
+
+Write-Host '3. Login...' -ForegroundColor Cyan
+$login = Invoke-RestMethod -Method Post -Uri "$BaseUrl/auth/login" -ContentType 'application/json' -Body (@{
+    username = $Username
+    password = $Password
+} | ConvertTo-Json)
+if (-not $login.token) { throw 'Login did not return a token.' }
+$headers = @{ Authorization = "Bearer $($login.token)" }
+Write-Host "   PASS: $($login.username) / $($login.role) / $($login.terminalCode)"
+
+Write-Host '4. Current-session endpoint...' -ForegroundColor Cyan
+$me = Invoke-RestMethod -Uri "$BaseUrl/me" -Headers $headers
+if ($me.username -ne $login.username) { throw '/api/me returned the wrong user.' }
+Write-Host "   PASS: /api/me -> $($me.terminalCode)"
+
+Write-Host '5. Registration setup endpoint...' -ForegroundColor Cyan
+$setup = Invoke-RestMethod -Uri "$BaseUrl/setup/register" -Headers $headers
+if ($null -eq $setup.palletTypes) { throw 'Registration setup did not return pallet types.' }
+Write-Host "   PASS: vehicles=$($setup.vehicles.Count), drivers=$($setup.drivers.Count), palletTypes=$($setup.palletTypes.Count)"
+Write-Host '   NOTE: zero vehicles/drivers is valid on a clean production database.'
+
+if ($login.role -eq 'SuperAdmin') {
+    Write-Host '6. SuperAdmin System Health...' -ForegroundColor Cyan
+    $system = Invoke-RestMethod -Uri "$BaseUrl/admin/system/overview" -Headers $headers
+    if (-not $system.version) { throw 'System Health did not return a version.' }
+    Write-Host "   PASS: system health v$($system.version)"
+
+    Write-Host '7. SuperAdmin terminal switching...' -ForegroundColor Cyan
+    $terminals = @(Invoke-RestMethod -Uri "$BaseUrl/me/operating-terminals" -Headers $headers)
+    foreach ($terminal in $terminals) {
+        Write-Host "   Checking Admin scope for $($terminal.code)..." -ForegroundColor DarkCyan
+        $terminalSettings = Invoke-RestMethod -Uri "$BaseUrl/admin/terminal-settings?terminalId=$($terminal.id)" -Headers $headers
+        if ([int]$terminalSettings.terminalId -ne [int]$terminal.id) { throw "Terminal settings scope failed for $($terminal.code)." }
+        $adminUsers = Invoke-RestMethod -Uri "$BaseUrl/admin/users?terminalId=$($terminal.id)" -Headers $headers
+        if ([int]$adminUsers.terminalId -ne [int]$terminal.id) { throw "User Admin scope failed for $($terminal.code)." }
+        $adminVehicles = Invoke-RestMethod -Uri "$BaseUrl/admin/vehicles?terminalId=$($terminal.id)" -Headers $headers
+        if ([int]$adminVehicles.terminalId -ne [int]$terminal.id) { throw "Vehicle Admin scope failed for $($terminal.code)." }
+        $adminDrivers = Invoke-RestMethod -Uri "$BaseUrl/admin/drivers?terminalId=$($terminal.id)" -Headers $headers
+        if ([int]$adminDrivers.terminalId -ne [int]$terminal.id) { throw "Driver Admin scope failed for $($terminal.code)." }
+        Write-Host "   PASS: Admin can target $($terminal.code)"
+
+        $switched = Invoke-RestMethod -Method Post -Uri "$BaseUrl/me/terminal" -Headers $headers -ContentType 'application/json' -Body (@{
+            terminalId = [int]$terminal.id
+        } | ConvertTo-Json)
+        if ($switched.terminalCode -ne $terminal.code) {
+            throw "Terminal switch failed for $($terminal.code)."
+        }
+        $headers = @{ Authorization = "Bearer $($switched.token)" }
+        $after = Invoke-RestMethod -Uri "$BaseUrl/me" -Headers $headers
+        if ($after.terminalCode -ne $terminal.code) {
+            throw "/api/me did not preserve active terminal $($terminal.code)."
+        }
+        Write-Host "   PASS: active terminal $($terminal.code)"
+    }
+} else {
+    Write-Host '6-7. Skipped SuperAdmin-only checks (logged-in role is not SuperAdmin).' -ForegroundColor Yellow
+}
+
+Write-Host ''
+Write-Host 'NON-DESTRUCTIVE SMOKE TESTS PASSED' -ForegroundColor Green

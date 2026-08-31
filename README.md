@@ -1,103 +1,303 @@
-# Pallet Control v5.4
+# PalletControl v5.9.1
 
-Full .NET + React/Vite version.
+Production-hardening, monitoring and deployment update based directly on the uploaded `PalletControl-main (4).zip` working v5.8.11 project.
 
-## New in v4
+## v5.9.1 SuperAdmin administration fix
 
-### Health Check (all logged-in users)
-- Always-visible compact Health Check.
-- API status.
-- SQLite database status using a real database read.
-- Overall healthy/unhealthy state.
-- Automatic refresh every 15 seconds + manual refresh button.
+v5.9.1 fixes the SuperAdmin regressions found after the first v5.9.0 test:
 
-### Registration safety
-- Vehicle and driver always reset to **Choose vehicle / Choose driver** after a successful submission.
-- Driver dropdown is ranked by previous use on the selected vehicle, but never auto-selects a driver.
-- Configurable warnings before submission:
-  - Large IN quantity.
-  - Large OUT quantity.
-  - Same vehicle submitted recently.
-  - Same driver submitted recently.
-  - Exact possible duplicate.
-  - Too many rapid submissions from a vehicle.
-  - High same-vehicle daily total.
-- Warnings require user confirmation before submission.
+- the Admin page now has one explicit **Manage terminal** selector for terminal-specific administration
+- SuperAdmin can target SRD, ARE or KRS for Users, Vehicles, Drivers, Transporters, Terminal settings, Linehaul comments and Linehaul/Mottatt locations
+- Users/Vehicles/Drivers Admin APIs now accept and validate an explicit `terminalId` instead of silently falling back to the current session terminal
+- creating a user after selecting ARE/KRS keeps that selected terminal instead of resetting to the first terminal in the returned list
+- the header selector is labelled **Active** to distinguish the operational terminal from the Admin **Manage terminal** selector
+- `/api/version` was added so it is easy to confirm which backend process is actually running
+- startup logs explicitly confirm that `/api/admin/system/overview` was mapped
+- the non-destructive smoke test now checks System Health, Admin scope for every terminal, and SRD/ARE/KRS active-terminal switching
 
-### Warning Center
-- Visible to **Admin + Superuser**.
-- Admin and Superuser can acknowledge warnings.
-- **Only Admin can configure warning rules or thresholds.**
-- Cancellation and cancellation-reversal events can also appear as warnings.
+If the frontend shows v5.9.1 but `/api/version` reports an older version, stop the old `dotnet run` process and restart the backend. A successful `dotnet build` does not replace an already-running process.
 
-### Receipts
-- Receipts tab is available to all roles.
-- User: latest 25 only for selected date; no 50/All buttons.
-- Admin/Superuser: default 25, buttons for 25 / 50 / All on selected date.
-- Newest/oldest timestamp sorting.
-- Cancelled receipt badge and information button.
-- Cancellation history shows who, timestamp and reason.
-- Admin/Superuser can reverse a cancellation.
-- Reversals remain in the audit history.
+## Production/security/monitoring work retained from v5.9.0
 
-### Admin master data
-- Add/delete Transporters.
-- Add/delete Driver names.
-- Add/delete Vehicles.
-- Change a vehicle's Transporter.
-- Receipt snapshots preserve historical Vehicle / Driver / Transporter text even after master data is deleted.
-- Manage pallet types.
-- Create users, edit display name/role/terminal/active state, reset passwords.
+### Production-safe first start
+A fresh database now creates only the minimum structural data needed by the application:
 
-### Statistics
-- Existing date, pallet-type, transporter, vehicle and driver filters.
-- Highest-to-lowest sorting options.
-- **Best Performing Driver** panel:
-  - This week.
-  - This month.
-  - Last month.
-  - Uses current pallet-type filter when selected.
-  - Gold/silver/bronze top three.
+- operating terminals: SRD, ARE and KRS
+- standard pallet types: EUR pallet, Half pallet, One-time pallet
+- one bootstrap `SuperAdmin`
 
-### Submit notifications
-Admin can globally enable/disable:
-- Monthly milestone messages (default every 100 pallets IN).
-- Current monthly balance message.
-- Monthly leaderboard messages.
+It does **not** create demo Admin/Superuser/User accounts, demo transporters, vehicles or driver names.
 
-Each user can also disable their own non-critical milestone / leaderboard / balance messages in **Settings**.
+The login page no longer shows or pre-fills demo credentials.
 
-## Fresh database
-
-v4 uses:
-
-`palletcontrol-v4.db`
-
-This intentionally creates a fresh schema and does not touch the previous dummy `palletcontrol.db`.
-
-## Demo accounts
-
-- Admin: `admin` / `admin123`
-- Superuser: `super` / `super123`
-- User: `user` / `user123`
-
-Change demo passwords and the JWT key before production use.
-
-## Start backend
+The first SuperAdmin defaults to username `superadmin`. Its password is never stored in Git. Before the first startup set:
 
 ```powershell
-cd backend\PalletControl.Api
-dotnet restore
-dotnet run
+$env:BootstrapAdmin__Password = "Your-Strong-Password-Here"
 ```
 
-The API listens on:
+The password must be at least 10 characters and use at least 3 of: lowercase, uppercase, number, special character.
 
-`http://localhost:5000`
+For production use the server setup script. After the first successful login, remove the bootstrap password from the server environment with:
 
-## Start frontend
+```powershell
+.\deploy\Clear-BootstrapPassword.ps1
+```
 
-Open a second terminal:
+Existing databases and existing users are not replaced by the seed process.
+
+### Security hardening
+
+- JWT signing key validation; a development/example key is rejected in Production.
+- JWT roles, terminal and module access are refreshed from the SQLite user record on each authenticated request.
+- Global request rate limiting per client IP.
+- Separate stricter login rate limit.
+- Failed-login lockout by username + client IP.
+- Production exception responses do not expose stack traces.
+- Browser security headers: CSP, `X-Content-Type-Options`, `X-Frame-Options`, referrer policy and permissions policy.
+- Optional/production HTTPS redirection and HSTS.
+- Kestrel server header disabled.
+- Configurable request-body limit.
+- CORS restricted to explicitly configured origins; production is intended to be same-origin through IIS.
+- Stronger password validation for new/reset/self-changed passwords.
+- `AllowedHosts` is no longer `*` in the checked-in configuration.
+
+For initial intranet deployment you can run HTTP while the IIS hostname/certificate is being prepared. Before Internet exposure, use HTTPS and set `Security__RequireHttps=true`. Security hardening reduces risk but no web application can be guaranteed impossible to compromise; keep Windows/.NET/npm dependencies patched and restrict network access as tightly as practical.
+
+### SuperAdmin terminal switching
+
+`SuperAdmin` can switch the active operating terminal between **SRD**, **ARE** and **KRS** from the header without logging out. The selected terminal is stored in the signed session token and revalidated by the backend on every request. It does not change the SuperAdmin account's stored/home terminal and does not affect other logged-in sessions.
+
+Regular Admin, Superuser, User and Viewer accounts remain restricted to their configured scope.
+
+### SuperAdmin System Health
+
+A new **Admin → System health** category is visible only to `SuperAdmin`.
+
+It includes:
+
+- backend uptime
+- CPU usage graph
+- process RAM graph
+- managed memory
+- requests/minute graph
+- average API response-time graph
+- HTTP 4xx / 5xx totals
+- 401 / 403 / 429 security counters
+- active users seen in the last 15 minutes
+- most-used endpoints, average response time and error counts
+- recent server exception summaries
+- SQLite connection and `PRAGMA quick_check`
+- live database path and size
+- backup directory, interval, retention, latest backup and backup count
+- free disk space
+- registrations/activity today
+- current security configuration status
+- OpenTelemetry status
+- manual **Backup now** action
+
+Secrets such as JWT keys and passwords are never returned by the monitoring API.
+
+The built-in graph history is in memory and clears when the backend restarts.
+
+### OpenTelemetry
+
+v5.9.1 uses OpenTelemetry 1.18.0 packages for ASP.NET Core tracing, outgoing HTTP tracing, runtime metrics, OTLP exporting and optional OTLP logging.
+
+No external monitoring server is required for the in-app System Health page. To send telemetry to an OpenTelemetry Collector / Grafana stack later, configure for example:
+
+```text
+OpenTelemetry__OtlpEndpoint=http://127.0.0.1:4317
+```
+
+If no OTLP endpoint is configured, PalletControl still provides its own in-app monitoring graphs.
+
+### Backend code structure
+
+The backend is no longer entirely contained in `Program.cs`.
+
+```text
+backend/PalletControl.Api/
+├── Data/
+│   ├── Contracts.cs
+│   └── DomainModel.cs
+├── Endpoints/
+│   └── SystemEndpoints.cs
+├── Infrastructure/
+│   ├── DatabaseBackup.cs
+│   └── DatabaseConfiguration.cs
+├── Observability/
+│   ├── ObservabilityConfiguration.cs
+│   └── SystemTelemetryService.cs
+├── Security/
+│   └── SecurityConfiguration.cs
+├── Program.cs
+├── appsettings.json
+└── appsettings.Development.json
+```
+
+Operational routes remain in `Program.cs` for this release to avoid a risky all-at-once rewrite of working receipt/statistics/Linehaul logic. New infrastructure is separated, and later endpoint groups can be moved out incrementally.
+
+## GitHub + IIS deployment model
+
+Recommended server layout:
+
+```text
+C:\PalletControl\                   GitHub checkout / source code
+C:\inetpub\PalletControl\          IIS published application
+C:\PalletControlData\              live SQLite data
+    palletcontrol.db
+C:\PalletControlBackups\           SQLite backups
+```
+
+The database and backups are outside both Git and the IIS publish directory. A normal application update therefore cannot overwrite the live database.
+
+### Server requirements
+
+Install on the Windows Server:
+
+1. Git
+2. Node.js / npm
+3. .NET 10 SDK
+4. ASP.NET Core 10 Hosting Bundle
+5. IIS + IIS Management Tools
+
+The .NET SDK is needed because the update script performs `dotnet publish` on the server. The Hosting Bundle is needed for IIS hosting.
+
+## First server setup
+
+Clone the GitHub repository to:
+
+```powershell
+C:\PalletControl
+```
+
+Open **PowerShell as Administrator** and run:
+
+```powershell
+cd C:\PalletControl
+Set-ExecutionPolicy -Scope Process Bypass
+
+.\deploy\Setup-Server.ps1 -HostName "palletcontrol.your-internal-domain"
+```
+
+The script:
+
+- checks IIS/.NET/Git/Node requirements
+- creates the source, publish, database and backup directories
+- generates a random JWT signing key
+- asks securely for the first SuperAdmin password
+- configures production database/backup paths as server environment settings
+- sets `AllowedHosts`
+- creates the IIS application pool and HTTP site
+
+Then deploy the current GitHub version:
+
+```powershell
+.\deploy\Update-PalletControl.ps1
+```
+
+Sign in once as:
+
+```text
+Username: superadmin
+Password: the password entered during Setup-Server.ps1
+```
+
+After confirming that login works:
+
+```powershell
+.\deploy\Clear-BootstrapPassword.ps1
+```
+
+This removes the bootstrap password from the machine environment. It does not change or delete the created SuperAdmin account.
+
+## Updating PalletControl through GitHub
+
+Normal development PC workflow:
+
+```powershell
+git add .
+git commit -m "Describe update"
+git push origin main
+```
+
+On the PalletControl server:
+
+```powershell
+cd C:\PalletControl
+.\deploy\Update-PalletControl.ps1
+```
+
+The update script performs:
+
+```text
+git fetch / pull --ff-only
+        ↓
+npm ci
+npm run build
+        ↓
+frontend/dist → backend/wwwroot
+        ↓
+dotnet publish -c Release
+        ↓
+stop PalletControl IIS app pool
+        ↓
+replace C:\inetpub\PalletControl
+        ↓
+start app pool
+```
+
+It deliberately refuses to pull if the server Git checkout contains uncommitted local changes.
+
+## Production configuration
+
+Do not put production secrets in GitHub.
+
+Important environment settings:
+
+```text
+ASPNETCORE_ENVIRONMENT=Production
+ConnectionStrings__Default=Data Source=C:\PalletControlData\palletcontrol.db;Cache=Shared
+Database__BackupDirectory=C:\PalletControlBackups
+Jwt__Key=<random secret generated on server>
+AllowedHosts=<your IIS hostname>
+Security__RequireHttps=false   # initial intranet HTTP only
+OpenTelemetry__OtlpEndpoint=  # optional
+```
+
+Once IIS has a trusted HTTPS certificate/binding:
+
+```powershell
+[Environment]::SetEnvironmentVariable('Security__RequireHttps','true','Machine')
+iisreset
+```
+
+For external Internet exposure also restrict Windows Firewall/network access as appropriate and use a trusted HTTPS certificate. Do not expose SQLite files or backup folders as IIS content.
+
+## Non-destructive smoke test
+
+The old smoke test no longer contains demo usernames/passwords and no longer creates/cancels receipts. Run it with a real account after the backend is running:
+
+```powershell
+.\smoke-test.ps1 -BaseUrl "http://localhost:5000/api"
+```
+
+For a SuperAdmin it also verifies System Health and switches through every active operating terminal, confirming that `/api/me` preserves each selection.
+
+## Local development
+
+The project uses Development mode from `Properties/launchSettings.json` and a development-only JWT key.
+
+For a brand-new local database, set the first SuperAdmin password in the same PowerShell process:
+
+```powershell
+.\deploy\Set-DevelopmentBootstrap.ps1
+
+dotnet run --project .\backend\PalletControl.Api\PalletControl.Api.csproj
+```
+
+In another terminal:
 
 ```powershell
 cd frontend
@@ -105,47 +305,18 @@ npm install
 npm run dev
 ```
 
-Vite starts on port 5173, or the next free port (for example 5174). The `/api` proxy points to `http://localhost:5000`.
+Vite runs on port 5173 and proxies `/api` to the development API at `http://localhost:5000`.
 
-## Optional smoke test
+## Important database note
 
-With the backend running:
+Do not delete or replace the production database during updates:
 
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\smoke-test.ps1
+```text
+C:\PalletControlData\palletcontrol.db
 ```
 
-`-Scope Process` only changes PowerShell policy for that terminal window. Closing the terminal restores the previous policy automatically.
+The GitHub repository ignores SQLite database/WAL/SHM files and backup directories.
 
+## Build version
 
-## v5.1 receipt UI update
-
-- Receipt pallet quantities are shown in the same information row as Transporter, Vehicle, Driver and Direction.
-- Regular Users see the latest 25 receipts across dates with no date, sort or limit controls.
-- Admin/Superuser keep Date, sort and 25/50/All controls.
-- The backend enforces the regular-user 25-receipt limit.
-
-
-## v5.4 additions
-- Admin/Superuser receipt filters: All, Active, Cancelled, Reversed.
-- Reversed receipts retain a visible history badge and receipt audit history.
-- Warnings page search across receipt number, vehicle, driver, transporter, warning type/message and users.
-- Admin/Superuser can choose the business date when registering a receipt. Normal users remain locked to today.
-- Manual/backdated receipt dates are audit logged with receipt number, chosen business date, actual UTC submission time, vehicle, driver, transporter and submitting user.
-
-
-## v5.4
-- Added receipt search for Admin and Superuser only.
-- Search works together with date, status, sort and 25/50/All controls.
-- Search is performed before the result limit and can match receipt number, vehicle, driver, transporter, direction, status, cancellation reason, pallet type/quantity, and receipt action users/reasons.
-- Regular Users remain restricted to their latest 25 receipts and cannot use receipt search.
-
-
-## v5.4 Admin category update
-
-- Admin opens as a category menu instead of one long settings page.
-- Categories: Users, Vehicles, Driver names, Transporters, Pallet types, Warning rules, Notifications & general.
-- No master-data/settings payload is loaded when the Admin page first opens.
-- Only the selected category is requested from the backend and rendered.
-- Warning configuration and notification/general settings are separated into their own pages.
+Backend and frontend: **5.9.1**

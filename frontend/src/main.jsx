@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import './styles.css'
 
 const API = '/api'
-const BUILD_VERSION = '5.8.11'
+const BUILD_VERSION = '5.9.1'
 const BUILD_CREDIT = 'Developed by Gytis Lukosevicius'
 
 const THEME_OPTIONS = [
@@ -153,13 +153,28 @@ function accountScopeLabel(me) {
 
 function App() {
   const [me, setMe] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('me')) } catch { return null }
+    try {
+      const cached = JSON.parse(localStorage.getItem('me'))
+      if (cached?.token) {
+        delete cached.token
+        localStorage.setItem('me', JSON.stringify(cached))
+      }
+      return cached
+    } catch { return null }
   })
 
   function logout() {
     localStorage.removeItem('token')
     localStorage.removeItem('me')
     setMe(null)
+  }
+
+  function updateSession(next) {
+    const { token, ...session } = next || {}
+    if (token) localStorage.setItem('token', token)
+    localStorage.setItem('me', JSON.stringify(session))
+    applyTheme(session?.theme || 'normal')
+    setMe(session)
   }
 
   useEffect(() => {
@@ -201,7 +216,7 @@ function App() {
   }, [Boolean(me)])
 
   return <>
-    {me ? <Shell me={me} logout={logout} /> : <Login onLogin={setMe} />}
+    {me ? <Shell me={me} logout={logout} onSessionUpdate={updateSession} /> : <Login onLogin={setMe} />}
     <BuildFooter />
   </>
 }
@@ -211,8 +226,8 @@ function BuildFooter() {
 }
 
 function Login({ onLogin }) {
-  const [username, setUsername] = useState('admin')
-  const [password, setPassword] = useState('admin123')
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   const [forgotPassword, setForgotPassword] = useState(false)
@@ -224,10 +239,11 @@ function Login({ onLogin }) {
       const result = await api('/auth/login', {
         method: 'POST', body: JSON.stringify({ username, password })
       })
-      localStorage.setItem('token', result.token)
-      localStorage.setItem('me', JSON.stringify(result))
-      applyTheme(result.theme || 'normal')
-      onLogin(result)
+      const { token, ...session } = result
+      localStorage.setItem('token', token)
+      localStorage.setItem('me', JSON.stringify(session))
+      applyTheme(session.theme || 'normal')
+      onLogin(session)
     } catch (e) {
       setError(`Login failed: ${e.message}`)
     } finally { setBusy(false) }
@@ -258,12 +274,11 @@ function Login({ onLogin }) {
       <button type="button" className="forgotPasswordLink" onClick={() => { setForgotPassword(true); setError('') }}>Forgot password?</button>
       {error && <div className="error">{error}</div>}
       <button className="primary big" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
-      <div className="demo">Demo: admin/admin123 · super/super123 · user/user123</div>
     </form>
   </div>
 }
 
-function Shell({ me, logout }) {
+function Shell({ me, logout, onSessionUpdate }) {
   const [tab, setTab] = useState(() => firstAllowedTab(me))
   const isSuperAdmin = me.role === 'SuperAdmin'
   const isTerminalAdmin = me.role === 'Admin' || me.role === 'TerminalAdmin'
@@ -299,7 +314,11 @@ function Shell({ me, logout }) {
   return <div>
     <header>
       <div className="headerBrand"><b>📦 Pallet Control</b><span className="terminal">{scopeLabel}</span></div>
-      <div className="userline">{me.displayName} · {me.role}<button className="linkbtn" onClick={logout}>Log out</button></div>
+      <div className="userline">
+        {isSuperAdmin && <SuperAdminTerminalSwitcher me={me} onSessionUpdate={onSessionUpdate} />}
+        <span>{me.displayName} · {me.role}</span>
+        <button className="linkbtn" onClick={logout}>Log out</button>
+      </div>
     </header>
 
     <nav className="moduleNav">
@@ -370,8 +389,8 @@ function Shell({ me, logout }) {
       {tab === 'receivedExport' && hasReceivedControl && <ReceivedControlExport key={`rc-exp-${terminalKey}`} me={me} />}
       {tab === 'receivedImport' && hasReceivedControl && adminAccess && <ReceivedControlImport key={`rc-imp-${terminalKey}`} me={me} />}
 
-      {tab === 'settings' && !isViewer && <UserSettings me={me} />}
-      {tab === 'admin' && isSuperAdmin && <Admin me={me} />}
+      {tab === 'settings' && !isViewer && <UserSettings key={`settings-${terminalKey}`} me={me} />}
+      {tab === 'admin' && isSuperAdmin && <Admin key={`admin-${terminalKey}`} me={me} />}
     </main>
   </div>
 }
@@ -380,15 +399,55 @@ function NavButton({ id, tab, setTab, children }) {
   return <button className={tab === id ? 'active' : ''} onClick={() => setTab(id)}>{children}</button>
 }
 
+function SuperAdminTerminalSwitcher({ me, onSessionUpdate }) {
+  const [terminals, setTerminals] = useState([])
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let cancelled = false
+    api('/me/operating-terminals')
+      .then(rows => { if (!cancelled) setTerminals(rows || []) })
+      .catch(e => { if (!cancelled) setError(e.message) })
+    return () => { cancelled = true }
+  }, [])
+
+  async function changeTerminal(e) {
+    const terminalId = Number(e.target.value)
+    if (!terminalId || terminalId === Number(me.terminalId)) return
+    setBusy(true)
+    setError('')
+    try {
+      const next = await api('/me/terminal', {
+        method: 'POST',
+        body: JSON.stringify({ terminalId })
+      })
+      onSessionUpdate(next)
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return <div className="superAdminTerminalSwitch" title={error || 'Change active operating terminal'}>
+    <span>Active</span>
+    <select value={String(me.terminalId)} onChange={changeTerminal} disabled={busy || terminals.length === 0}>
+      {terminals.length === 0 && <option value={String(me.terminalId)}>{me.terminalCode}</option>}
+      {terminals.map(t => <option key={t.id} value={String(t.id)}>{t.code}</option>)}
+    </select>
+    {busy && <span className="terminalSwitchBusy">…</span>}
+    {error && <span className="terminalSwitchError">!</span>}
+  </div>
+}
+
 function HealthCheck() {
   const [health, setHealth] = useState({
     api: 'checking',
     database: 'checking',
     integrity: 'checking',
     overall: 'checking',
-    checked: null,
-    latestBackupUtc: null,
-    backupCount: 0
+    checked: null
   })
 
   async function check() {
@@ -400,9 +459,7 @@ function HealthCheck() {
         database: body?.database?.status === 'online' ? 'online' : 'offline',
         integrity: body?.database?.quickCheck === 'ok' ? 'online' : 'offline',
         overall: res.ok && body?.status === 'healthy' ? 'healthy' : 'unhealthy',
-        checked: new Date(),
-        latestBackupUtc: body?.database?.latestBackupUtc || null,
-        backupCount: Number(body?.database?.backupCount || 0)
+        checked: new Date()
       })
     } catch {
       setHealth({
@@ -410,9 +467,7 @@ function HealthCheck() {
         database: 'unknown',
         integrity: 'unknown',
         overall: 'unhealthy',
-        checked: new Date(),
-        latestBackupUtc: null,
-        backupCount: 0
+        checked: new Date()
       })
     }
   }
@@ -423,19 +478,14 @@ function HealthCheck() {
     return () => clearInterval(timer)
   }, [])
 
-  const backupText = health.latestBackupUtc
-      ? `Backup: ${formatTimestamp(health.latestBackupUtc)}`
-      : 'Backup: none yet'
-
   return <div
       className={`healthCheck ${health.overall}`}
-      title={`Real SQLite quick_check · ${backupText} · ${health.backupCount} backup(s)`}
+      title="Real SQLite connection + PRAGMA quick_check. Detailed server information is available to SuperAdmin in System health."
   >
     <b>Health Check</b>
     <HealthDot label="API" value={health.api} />
     <HealthDot label="Database" value={health.database} />
     <HealthDot label="Integrity" value={health.integrity} />
-    <span className="healthTime">{backupText}</span>
     <span className="healthTime">{health.checked ? health.checked.toLocaleTimeString('nb-NO', { hour: '2-digit', minute: '2-digit', second: '2-digit' }) : 'checking…'}</span>
     <button className="tiny" onClick={check}>↻</button>
   </div>
@@ -1825,7 +1875,7 @@ function UserSettings({ me }) {
     e.preventDefault()
     setMessage(''); setError('')
     if (!currentPassword) { setError('Enter your current password.'); return }
-    if (newPassword.length < 6) { setError('New password must be at least 6 characters.'); return }
+    if (newPassword.length < 10) { setError('New password must be at least 10 characters.'); return }
     if (newPassword !== confirmPassword) { setError('The new passwords do not match.'); return }
     setChangingPassword(true)
     try {
@@ -2051,6 +2101,7 @@ function Admin({ me, embedded = false }) {
   const activeCategoryRef=useRef('')
   const adminLoadSequence=useRef(0)
   const [targetTerminalId,setTargetTerminalId]=useState(String(me.terminalId))
+  const [adminTerminals,setAdminTerminals]=useState(() => [{ id: me.terminalId, code: me.terminalCode, name: me.terminalCode }])
   const [transporterName,setTransporterName]=useState(''),[palletName,setPalletName]=useState(''),[linehaulComment,setLinehaulComment]=useState('')
   const [terminalForm,setTerminalForm]=useState({code:'',name:'',aliases:''})
   const [vehicleForm,setVehicleForm]=useState({vehicleId:'',terminalId:String(me.terminalId),transporterId:''})
@@ -2070,11 +2121,21 @@ function Admin({ me, embedded = false }) {
       {id:'pallets',icon:'📦',title:'Pallet types',description:'Global pallet type master list.'},
       {id:'holidays',icon:'📅',title:'Global holidays',description:'Non-working days applied across terminals.'},
       {id:'globalSettings',icon:'🌐',title:'Global defaults',description:'SuperAdmin-only defaults used when new terminal settings are created.'},
-      {id:'database',icon:'🗄️',title:'Database & backup',description:'Database status and consistent SQLite backups.'}
+      {id:'database',icon:'🗄️',title:'Database & backup',description:'Database status and consistent SQLite backups.'},
+      {id:'system',icon:'📈',title:'System health',description:'SuperAdmin monitoring, security, performance and telemetry graphs.'}
     ]:[])
   ]
 
-  function endpoint(cat, terminalId=targetTerminalId){const q=`?terminalId=${terminalId}`;return {users:'/admin/users',vehicles:'/admin/vehicles',drivers:'/admin/drivers',terminalSettings:'/admin/terminal-settings'+q,linehaulComments:'/admin/linehaul-comments'+q,locations:'/admin/linehaul-locations'+q,transporters:'/admin/transporters'+q,pallets:'/admin/pallet-types',holidays:'/admin/holidays',globalSettings:'/admin/settings',database:'/admin/database/status'}[cat]}
+  const showManageTerminal = superAdmin && !['pallets','holidays','globalSettings','database','system'].includes(category)
+
+  function terminalIdForAdmin(response, requestedId) {
+    const requested = Number(requestedId)
+    if (response?.terminals?.some(t => Number(t.id) === requested)) return requested
+    if (Number(response?.terminalId)) return Number(response.terminalId)
+    return Number(me.terminalId)
+  }
+
+  function endpoint(cat, terminalId=targetTerminalId){const q=`?terminalId=${terminalId}`;return {users:'/admin/users'+q,vehicles:'/admin/vehicles'+q,drivers:'/admin/drivers'+q,terminalSettings:'/admin/terminal-settings'+q,linehaulComments:'/admin/linehaul-comments'+q,locations:'/admin/linehaul-locations'+q,transporters:'/admin/transporters'+q,pallets:'/admin/pallet-types',holidays:'/admin/holidays',globalSettings:'/admin/settings',database:'/admin/database/status',system:'/admin/system/overview'}[cat]}
   async function load(cat=activeCategoryRef.current||category, terminalId=targetTerminalId){
     if(!cat)return
     const seq=++adminLoadSequence.current
@@ -2086,16 +2147,49 @@ function Admin({ me, embedded = false }) {
       const r=await api(url)
       if(seq!==adminLoadSequence.current||activeCategoryRef.current!==requestedCategory)return
       setData(r);setLoadedCategory(requestedCategory)
-      if(requestedCategory==='vehicles'&&r.terminals?.length&&!vehicleForm.transporterId)setVehicleForm(f=>{const terminalId=String(r.terminals?.find(t=>String(t.id)===String(f.terminalId))?.id||r.terminals[0].id||me.terminalId);const transporter=r.transporters?.find(t=>t.active&&Number(t.terminalId)===Number(terminalId));return {...f,terminalId,transporterId:String(transporter?.id||'')}})
-      if(requestedCategory==='users'&&r.terminals?.[0])setUserForm(f=>({...f,terminalId:String(r.terminals[0].id)}))
-      if(requestedCategory==='drivers'&&r.terminals?.[0])setDriverForm(f=>({...f,terminalId:String(r.terminals[0].id)}))
-    }catch(e){if(seq===adminLoadSequence.current&&activeCategoryRef.current===requestedCategory)setError(e.message)}finally{if(seq===adminLoadSequence.current&&activeCategoryRef.current===requestedCategory)setLoading(false)}
+      if(requestedCategory==='vehicles'&&r.terminals?.length)setVehicleForm(f=>{const selectedTerminalId=String(terminalIdForAdmin(r,terminalId));const transporter=r.transporters?.find(t=>t.active&&Number(t.terminalId)===Number(selectedTerminalId));return {...f,terminalId:selectedTerminalId,transporterId:String(transporter?.id||'')}})
+      if(requestedCategory==='users'&&r.terminals?.length)setUserForm(f=>({...f,terminalId:String(terminalIdForAdmin(r,terminalId))}))
+      if(requestedCategory==='drivers'&&r.terminals?.length)setDriverForm(f=>({...f,terminalId:String(terminalIdForAdmin(r,terminalId))}))
+    }catch(e){if(seq===adminLoadSequence.current&&activeCategoryRef.current===requestedCategory){const message=requestedCategory==='system'&&e.status===404?'System Health endpoint was not found. Stop the old backend, start v5.9.1, and verify /api/version reports 5.9.1.':e.message;setError(message)}}finally{if(seq===adminLoadSequence.current&&activeCategoryRef.current===requestedCategory)setLoading(false)}
   }
+  useEffect(()=>{
+    let cancelled=false
+    if(!superAdmin){
+      setAdminTerminals([{id:me.terminalId,code:me.terminalCode,name:me.terminalCode}])
+      setTargetTerminalId(String(me.terminalId))
+      return ()=>{cancelled=true}
+    }
+
+    api('/admin/terminals')
+      .then(r=>{
+        if(cancelled)return
+        const rows=r?.terminals||[]
+        setAdminTerminals(rows)
+        if(rows.length&&!rows.some(t=>String(t.id)===String(targetTerminalId))){
+          setTargetTerminalId(String(rows.find(t=>String(t.id)===String(me.terminalId))?.id||rows[0].id))
+        }
+      })
+      .catch(e=>{if(!cancelled)setError(e.message)})
+
+    return()=>{cancelled=true}
+  },[superAdmin,me.terminalId,me.terminalCode])
+
+  useEffect(()=>{
+    setVehicleForm(f=>({...f,terminalId:String(targetTerminalId),transporterId:''}))
+    setDriverForm(f=>({...f,terminalId:String(targetTerminalId)}))
+    setUserForm(f=>({...f,terminalId:String(targetTerminalId)}))
+  },[targetTerminalId])
+
   useEffect(()=>{
     activeCategoryRef.current=category
     adminLoadSequence.current+=1
     setData(null);setLoadedCategory('');setMessage('');setError('')
     if(category)load(category,targetTerminalId);else setLoading(false)
+  },[category,targetTerminalId])
+  useEffect(()=>{
+    if(category!=='system')return
+    const timer=setInterval(()=>load('system',targetTerminalId),15000)
+    return()=>clearInterval(timer)
   },[category,targetTerminalId])
   async function action(fn,ok='Saved.'){
     const actionCategory=activeCategoryRef.current
@@ -2117,7 +2211,8 @@ function Admin({ me, embedded = false }) {
 
   function closeCategory(){activeCategoryRef.current='';adminLoadSequence.current+=1;setData(null);setLoadedCategory('');setLoading(false);setError('');setMessage('');setCategory('')}
 
-  return <section className={embedded?'embeddedAdmin':''}>{!embedded&&<div className="pageTitle"><div><h1>{superAdmin?'SuperAdmin':'Admin'} · {me.terminalCode}</h1><p>{superAdmin?'Global administration plus every operating terminal.':'Administration is restricted to your assigned terminal.'}</p></div>{category&&<button onClick={closeCategory}>Close category</button>}</div>}
+  return <section className={embedded?'embeddedAdmin':''}>{!embedded&&<div className="pageTitle"><div><h1>{superAdmin?'SuperAdmin':'Admin'} · {me.terminalCode}</h1><p>{superAdmin?'Global administration plus every operating terminal. Choose which terminal you want to manage below.':'Administration is restricted to your assigned terminal.'}</p></div>{category&&<button onClick={closeCategory}>Close category</button>}</div>}
+    {showManageTerminal&&<div className="card superAdminManageTerminal"><div><b>Manage terminal</b><p className="muted small">This controls terminal-specific Admin categories. It is separate from the active operational terminal in the top header.</p></div><select value={targetTerminalId} onChange={e=>setTargetTerminalId(e.target.value)}>{adminTerminals.map(t=><option key={t.id} value={String(t.id)}>{t.code} — {t.name}</option>)}</select></div>}
     {embedded&&category&&<div className="embeddedAdminClose"><button onClick={closeCategory}>← Back to terminal administration</button></div>}
     <div className="adminCategoryGrid">{categories.map(c=><button key={c.id} className={`adminCategoryCard ${category===c.id?'active':''}`} onClick={()=>choose(c.id)}><span className="adminCategoryIcon">{c.icon}</span><span className="adminCategoryText"><b>{c.title}</b><small>{c.description}</small></span><span className="adminCategoryArrow">›</span></button>)}</div>
     {message&&<div className="success adminFeedback">{message}</div>}{error&&<div className="error adminFeedback">{error}</div>}
@@ -2127,7 +2222,7 @@ function Admin({ me, embedded = false }) {
       {category==='transporters'&&<AdminSection title={`Transporters · ${data.terminalCode}`} subtitle="Transporters are terminal-specific. Changes here affect only this operating terminal.">{superAdmin&&<label className="adminTerminalPicker">Operating terminal<select value={targetTerminalId} onChange={e=>setTargetTerminalId(e.target.value)}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code} — {t.name}</option>)}</select></label>}<div className="inlineForm"><input placeholder="Transporter name" value={transporterName} onChange={e=>setTransporterName(e.target.value)}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/transporters',{method:'POST',body:JSON.stringify({name:transporterName,terminalId:Number(targetTerminalId)})});setTransporterName('')},'Transporter added.')}>Add transporter</button></div><div className="adminRows">{data.transporters.map(t=><div className="adminRow" key={t.id}><b>{t.name}</b><span>{t.active?'Active':'Inactive'}</span><button className="dangerGhost" onClick={()=>{if(window.confirm(`Delete ${t.name} from ${data.terminalCode}? Vehicles using it will become unassigned.`))action(()=>api(`/admin/transporters/${t.id}`,{method:'DELETE'}),'Transporter deleted.')}}>Delete</button></div>)}</div></AdminSection>}
       {category==='pallets'&&<AdminSection title="Global pallet types"><div className="inlineForm"><input placeholder="New pallet type" value={palletName} onChange={e=>setPalletName(e.target.value)}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/pallet-types',{method:'POST',body:JSON.stringify({name:palletName,userSelectable:true})});setPalletName('')},'Pallet type added.')}>Add pallet type</button></div><div className="adminRows">{data.palletTypes.map(p=><PalletAdminRow key={p.id} row={p} save={next=>action(()=>api(`/admin/pallet-types/${p.id}`,{method:'PUT',body:JSON.stringify(next)}))}/>)}</div></AdminSection>}
       {category==='holidays'&&<AdminSection title="Global holidays / non-working days" subtitle="These remain global and can only be changed by SuperAdmin."><div className="inlineForm three"><input type="date" value={holidayForm.date} onChange={e=>setHolidayForm({...holidayForm,date:e.target.value})}/><input placeholder="Name" value={holidayForm.name} onChange={e=>setHolidayForm({...holidayForm,name:e.target.value})}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/holidays',{method:'POST',body:JSON.stringify(holidayForm)});setHolidayForm({date:dateInput(),name:''})},'Holiday added.')}>Add</button></div><div className="adminRows">{data.holidays.map(h=><div className="adminRow" key={h.id}><b>{formatDate(h.date)}</b><span>{h.name}</span><button className="dangerGhost" onClick={()=>action(()=>api(`/admin/holidays/${h.id}`,{method:'DELETE'}),'Holiday removed.')}>Delete</button></div>)}</div></AdminSection>}
-      {category==='vehicles'&&<AdminSection title={`Vehicles · ${data.terminals?.[0]?.code||me.terminalCode}`} subtitle={superAdmin?'SuperAdmin can assign vehicles to any operating terminal. Admin only sees and changes their own terminal.':'Only vehicles belonging to your terminal are shown.'}><div className="inlineForm three"><input placeholder="Vehicle ID" value={vehicleForm.vehicleId} onChange={e=>setVehicleForm({...vehicleForm,vehicleId:e.target.value.toUpperCase()})}/><select value={vehicleForm.terminalId} onChange={e=>setVehicleForm({...vehicleForm,terminalId:e.target.value,transporterId:''})}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select><select value={vehicleForm.transporterId} onChange={e=>setVehicleForm({...vehicleForm,transporterId:e.target.value})}><option value="">Choose transporter</option>{activeTransporters.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select><button className="primary" onClick={()=>action(async()=>{await api('/admin/vehicles',{method:'POST',body:JSON.stringify({vehicleId:vehicleForm.vehicleId,terminalId:Number(vehicleForm.terminalId),transporterId:Number(vehicleForm.transporterId)})});setVehicleForm({...vehicleForm,vehicleId:''})},'Vehicle added.')}>Add vehicle</button></div><div className="adminRows">{data.vehicles.map(v=><VehicleAdminRow key={v.id} row={v} transporters={data.transporters.filter(t=>!t.terminalId||Number(t.terminalId)===Number(v.terminalId))} saveTransporter={transporterId=>action(()=>api(`/admin/vehicles/${v.id}/transporter`,{method:'PUT',body:JSON.stringify({transporterId})}),'Transporter changed.')} saveSchedule={days=>action(()=>api(`/admin/vehicles/${v.id}/schedule`,{method:'PUT',body:JSON.stringify({days})}),'Operating days saved.')} remove={()=>{if(window.confirm(`Delete ${v.vehicleId}? Historical receipts keep snapshots.`))action(()=>api(`/admin/vehicles/${v.id}`,{method:'DELETE'}),'Vehicle deleted.')}}/>)}</div></AdminSection>}
+      {category==='vehicles'&&<AdminSection title={`Vehicles · ${data.terminalCode||me.terminalCode}`} subtitle={superAdmin?'SuperAdmin can assign vehicles to any operating terminal. Admin only sees and changes their own terminal.':'Only vehicles belonging to your terminal are shown.'}><div className="inlineForm three"><input placeholder="Vehicle ID" value={vehicleForm.vehicleId} onChange={e=>setVehicleForm({...vehicleForm,vehicleId:e.target.value.toUpperCase()})}/><select value={vehicleForm.terminalId} onChange={e=>setVehicleForm({...vehicleForm,terminalId:e.target.value,transporterId:''})}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select><select value={vehicleForm.transporterId} onChange={e=>setVehicleForm({...vehicleForm,transporterId:e.target.value})}><option value="">Choose transporter</option>{activeTransporters.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select><button className="primary" onClick={()=>action(async()=>{await api('/admin/vehicles',{method:'POST',body:JSON.stringify({vehicleId:vehicleForm.vehicleId,terminalId:Number(vehicleForm.terminalId),transporterId:Number(vehicleForm.transporterId)})});setVehicleForm({...vehicleForm,vehicleId:''})},'Vehicle added.')}>Add vehicle</button></div><div className="adminRows">{data.vehicles.map(v=><VehicleAdminRow key={v.id} row={v} transporters={data.transporters.filter(t=>!t.terminalId||Number(t.terminalId)===Number(v.terminalId))} saveTransporter={transporterId=>action(()=>api(`/admin/vehicles/${v.id}/transporter`,{method:'PUT',body:JSON.stringify({transporterId})}),'Transporter changed.')} saveSchedule={days=>action(()=>api(`/admin/vehicles/${v.id}/schedule`,{method:'PUT',body:JSON.stringify({days})}),'Operating days saved.')} remove={()=>{if(window.confirm(`Delete ${v.vehicleId}? Historical receipts keep snapshots.`))action(()=>api(`/admin/vehicles/${v.id}`,{method:'DELETE'}),'Vehicle deleted.')}}/>)}</div></AdminSection>}
       {category==='drivers'&&<AdminSection title="Driver names" subtitle="Remove only hides a name from future registration; historical statistics remain."><div className="inlineForm"><input placeholder="Driver name" value={driverForm.name} onChange={e=>setDriverForm({...driverForm,name:e.target.value})}/><select value={driverForm.terminalId} onChange={e=>setDriverForm({...driverForm,terminalId:e.target.value})}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select><button className="primary" onClick={()=>action(async()=>{await api('/admin/drivers',{method:'POST',body:JSON.stringify({name:driverForm.name,terminalId:Number(driverForm.terminalId)})});setDriverForm({...driverForm,name:''})},'Driver added/restored.')}>Add driver</button></div><div className="adminRows">{data.drivers.map(d=><div className="adminRow driverAdmin" key={d.id}><b>{d.name}</b><span>{d.terminal}</span><span>{d.active?'Active':'Removed'}</span>{d.active?<button className="dangerGhost" onClick={()=>{if(window.confirm(`Remove ${d.name} from future selection? Historical receipts stay.`))action(()=>api(`/admin/drivers/${d.id}`,{method:'DELETE'}),'Driver removed.')}}>Remove</button>:<button onClick={()=>action(()=>api(`/admin/drivers/${d.id}/active`,{method:'PUT',body:JSON.stringify({active:true})}),'Driver restored.')}>Restore</button>}</div>)}</div></AdminSection>}
       {category==='users'&&<AdminSection title="Users & module access" subtitle={superAdmin ? 'SuperAdmin can assign a Viewer to one or more transporters across SRD, ARE and KRS. Other roles keep normal terminal/module access.' : 'Admin can manage users in this terminal. Viewer assignments outside this terminal are protected and can only be changed by SuperAdmin.'}>
         <div className="userCreateCard">
@@ -2158,9 +2253,108 @@ function Admin({ me, embedded = false }) {
       {category==='terminalSettings'&&<AdminSettingsScope title="Terminal settings" data={data} targetTerminalId={targetTerminalId} setTargetTerminalId={setTargetTerminalId} showTerminalSelect={superAdmin} save={next=>action(()=>api(`/admin/terminal-settings?terminalId=${targetTerminalId}`,{method:'PUT',body:JSON.stringify(next)}),'Terminal settings saved.')}/>}
       {category==='globalSettings'&&<AdminOperationalSettings title="Global defaults" subtitle="SuperAdmin only. These values are copied when a new terminal gets its own settings; existing terminal settings remain independent." settings={data} save={next=>action(()=>api('/admin/settings',{method:'PUT',body:JSON.stringify(next)}),'Global defaults saved.')}/>}
       {category==='linehaulComments'&&<AdminSection title={`Linehaul selectable comments · ${data.terminalCode}`} subtitle="These texts belong to the selected user terminal and appear regardless of which From/To terminal is chosen on Linehaul registration.">{superAdmin&&<label className="adminTerminalPicker">Terminal<select value={targetTerminalId} onChange={e=>setTargetTerminalId(e.target.value)}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code} — {t.name}</option>)}</select></label>}<div className="inlineForm"><input placeholder="Selectable comment" value={linehaulComment} onChange={e=>setLinehaulComment(e.target.value)}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/linehaul-comments',{method:'POST',body:JSON.stringify({terminalId:Number(targetTerminalId),text:linehaulComment})});setLinehaulComment('')},'Linehaul comment added.')}>Add comment</button></div><div className="adminRows">{data.comments.map(c=><div className="adminRow" key={c.id}><b>{c.text}</b><span>{c.active?'Active':'Inactive'}</span><button onClick={()=>action(()=>api(`/admin/linehaul-comments/${c.id}/active`,{method:'PUT',body:JSON.stringify({active:!c.active})}),c.active?'Comment disabled.':'Comment enabled.')}>{c.active?'Disable':'Enable'}</button></div>)}</div></AdminSection>}
+      {category==='system'&&<SystemMonitoring data={data} refresh={()=>load('system',targetTerminalId)} createBackup={()=>action(()=>api('/admin/system/backup',{method:'POST',body:'{}'}),'Database backup created.')}/>}
       {category==='database'&&<AdminSection title="Database & backup" subtitle="All modules use this same SQLite database, so Linehaul and MottattKontroll are included in every backup."><div className="detailGrid"><span><small>Database file</small><b>{data.databasePath}</b></span><span><small>Database size</small>{Math.round(Number(data.databaseSizeBytes||0)/1024)} KB</span><span><small>Backup folder</small><b>{data.backupDirectory}</b></span><span><small>Automatic backup</small>Every {data.backupIntervalHours} hour(s)</span><span><small>Retention</small>{data.backupRetentionDays} days</span><span><small>Backup count</small>{data.backupCount}</span><span><small>Latest backup</small>{data.latestBackupUtc?formatTimestamp(data.latestBackupUtc):'No backup yet'}</span></div><button className="primary" onClick={()=>action(()=>api('/admin/database/backup',{method:'POST',body:'{}'}),'Database backup created.')}>Create backup now</button></AdminSection>}
     </div>}
   </section>
+}
+
+function bytes(value) {
+  const n = Number(value || 0)
+  if (!Number.isFinite(n) || n <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  const index = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)))
+  return `${(n / Math.pow(1024, index)).toFixed(index >= 3 ? 1 : 0)} ${units[index]}`
+}
+
+function uptimeText(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds || 0)))
+  const days = Math.floor(total / 86400)
+  const hours = Math.floor((total % 86400) / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  return `${days ? `${days}d ` : ''}${hours}h ${minutes}m`
+}
+
+function MiniLineGraph({ title, samples, field, suffix = '', transform = v => Number(v || 0) }) {
+  const values = (samples || []).map(x => transform(x[field])).filter(Number.isFinite)
+  const max = Math.max(1, ...values)
+  const min = Math.min(0, ...values)
+  const range = Math.max(1, max - min)
+  const points = values.map((value, index) => {
+    const x = values.length <= 1 ? 0 : index / (values.length - 1) * 100
+    const y = 36 - ((value - min) / range * 32)
+    return `${x.toFixed(2)},${y.toFixed(2)}`
+  }).join(' ')
+  const latest = values.length ? values[values.length - 1] : 0
+  return <div className="systemGraph card">
+    <div className="systemGraphHead"><div><b>{title}</b><small>Rolling history</small></div><strong>{latest.toFixed(latest >= 100 ? 0 : 1)}{suffix}</strong></div>
+    <svg viewBox="0 0 100 40" preserveAspectRatio="none" aria-label={title}><polyline points={points || '0,36 100,36'} fill="none" vectorEffect="non-scaling-stroke" /></svg>
+  </div>
+}
+
+function SystemMonitoring({ data, refresh, createBackup }) {
+  const t = data.telemetry || {}
+  const history = t.history || []
+  const diskPercent = data.disk?.totalBytes ? Math.round((Number(data.disk.freeBytes || 0) / Number(data.disk.totalBytes)) * 100) : null
+  return <div className="systemMonitoring">
+    <div className="systemMonitoringTop">
+      <div><h2>System health · v{data.version}</h2><p className="muted">Live server performance, application security and OpenTelemetry status. Refreshes automatically every 15 seconds.</p></div>
+      <div className="systemMonitoringActions"><button onClick={refresh}>Refresh</button><button className="primary" onClick={createBackup}>Backup now</button></div>
+    </div>
+    <div className="systemMetricGrid">
+      <SystemMetric label="Uptime" value={uptimeText(t.uptimeSeconds)} />
+      <SystemMetric label="CPU" value={`${Number(t.cpuPercent || 0).toFixed(1)}%`} />
+      <SystemMetric label="Process RAM" value={bytes(t.processMemoryBytes)} />
+      <SystemMetric label="Requests/min" value={t.requestsLastMinute || 0} />
+      <SystemMetric label="Avg response" value={`${Number(t.averageResponseMs || 0).toFixed(1)} ms`} />
+      <SystemMetric label="Active users · 15m" value={t.activeUsersLast15Minutes || 0} />
+      <SystemMetric label="HTTP 5xx" value={t.http5xx || 0} tone={Number(t.http5xx || 0) > 0 ? 'bad' : 'good'} />
+      <SystemMetric label="Disk free" value={diskPercent == null ? 'Unavailable' : `${diskPercent}% · ${bytes(data.disk.freeBytes)}`} tone={diskPercent != null && diskPercent < 15 ? 'bad' : 'good'} />
+    </div>
+    <div className="systemGraphs">
+      <MiniLineGraph title="CPU usage" samples={history} field="cpuPercent" suffix="%" />
+      <MiniLineGraph title="Process RAM" samples={history} field="processMemoryBytes" transform={v => Number(v || 0) / 1024 / 1024} suffix=" MB" />
+      <MiniLineGraph title="Requests / minute" samples={history} field="requestsPerMinute" />
+      <MiniLineGraph title="Average API response" samples={history} field="averageResponseMs" suffix=" ms" />
+    </div>
+    <div className="systemDetailColumns">
+      <AdminSection title="Security status" subtitle="Configuration only. Secrets and passwords are never returned to the browser.">
+        <div className="detailGrid systemDetailGrid">
+          <span><small>HTTPS required</small><b>{data.security?.requireHttps ? 'Yes' : 'No'}</b></span>
+          <span><small>JWT lifetime</small><b>{data.security?.jwtLifetimeMinutes} min</b></span>
+          <span><small>API rate limit</small><b>{data.security?.apiRequestsPerMinute}/min/IP</b></span>
+          <span><small>Login rate limit</small><b>{data.security?.loginRequestsPerMinute}/min/IP</b></span>
+          <span><small>Failed login lockout</small><b>{data.security?.loginFailureLimit} attempts / {data.security?.loginLockoutMinutes} min</b></span>
+          <span><small>Max request body</small><b>{data.security?.maxRequestBodyMb} MB</b></span>
+          <span><small>401 Unauthorized</small><b>{t.unauthorized401 || 0}</b></span>
+          <span><small>403 Forbidden</small><b>{t.forbidden403 || 0}</b></span>
+          <span><small>429 Rate limited</small><b>{t.rateLimited429 || 0}</b></span>
+        </div>
+      </AdminSection>
+      <AdminSection title="Database & deployment" subtitle="Production database and backups should stay outside the GitHub checkout and IIS publish folder.">
+        <div className="detailGrid systemDetailGrid">
+          <span><small>Database</small><b className="pathValue">{data.database?.path}</b></span>
+          <span><small>SQLite quick check</small><b>{data.database?.quickCheck}</b></span>
+          <span><small>Database size</small><b>{bytes(data.database?.sizeBytes)}</b></span>
+          <span><small>Backup folder</small><b className="pathValue">{data.backup?.directory}</b></span>
+          <span><small>Latest backup</small><b>{data.backup?.latestBackupUtc ? formatTimestamp(data.backup.latestBackupUtc) : 'No backup yet'}</b></span>
+          <span><small>Backups</small><b>{data.backup?.count || 0} · {data.backup?.retentionDays} day retention</b></span>
+          <span><small>Environment</small><b>{data.environment}</b></span>
+          <span><small>OpenTelemetry</small><b>{data.openTelemetry?.enabled ? 'OTLP configured' : 'Local monitoring only'}</b></span>
+        </div>
+      </AdminSection>
+    </div>
+    <AdminSection title="Endpoint performance" subtitle="Most-used API routes since the backend started.">
+      <div className="systemEndpointTable"><div className="systemEndpointHeader"><span>Endpoint</span><span>Requests</span><span>Average</span><span>Errors</span><span>Last status</span></div>{(t.endpoints || []).map(row => <div className="systemEndpointRow" key={row.path}><code>{row.path}</code><span>{row.requests}</span><span>{Number(row.averageMs || 0).toFixed(1)} ms</span><span>{row.errors}</span><span>{row.lastStatusCode}</span></div>)}{!(t.endpoints || []).length && <div className="empty">No API request data yet.</div>}</div>
+    </AdminSection>
+    <AdminSection title="Recent server errors" subtitle="Recent exception messages and paths are kept only in memory and clear when the backend restarts.">
+      <div className="systemErrorList">{(t.recentErrors || []).map((e, index) => <div className="systemErrorRow" key={`${e.timestampUtc}-${index}`}><span>{formatTimestamp(e.timestampUtc)}</span><code>{e.path}</code><b>{e.message}</b></div>)}{!(t.recentErrors || []).length && <div className="success">No server exceptions recorded since startup.</div>}</div>
+    </AdminSection>
+  </div>
+}
+
+function SystemMetric({ label, value, tone = '' }) {
+  return <div className={`systemMetric ${tone}`}><small>{label}</small><strong>{value}</strong></div>
 }
 
 function TerminalAdminRow({ row, save, remove }) {

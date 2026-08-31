@@ -19,3 +19,13 @@ frontend/dist/
 .idea/
 *.DotSettings.user
 .vs/
+
+# Production/publish output and local server configuration
+**/publish/
+**/wwwroot/assets/
+backend/PalletControl.Api/wwwroot/
+appsettings.Production.local.json
+*.pfx
+*.p12
+*.key
+*.pem

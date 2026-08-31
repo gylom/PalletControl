@@ -1,0 +1,61 @@
+PalletControl v5.9.1 validation
+================================
+
+Purpose of this revision
+------------------------
+- Fix SuperAdmin SRD / ARE / KRS administration regression.
+- Keep active operational terminal switching separate from Admin target terminal.
+- Ensure System Health endpoint is present in the backend source/package.
+- Make stale-running-backend diagnosis easy with /api/version.
+
+Checks performed in this environment
+------------------------------------
+PASS  Frontend main.jsx parsed/transpiled with the installed TypeScript JSX parser: 0 diagnostics.
+PASS  frontend/src/styles.css opening/closing brace count matches.
+PASS  backend/PalletControl.Api/Program.cs opening/closing brace count matches.
+PASS  JSON parse: frontend/package.json.
+PASS  JSON parse: backend appsettings.json.
+PASS  JSON parse: backend appsettings.Development.json.
+PASS  JSON parse: backend Properties/launchSettings.json.
+PASS  Backend route scan: no duplicate HTTP method/path registrations found.
+PASS  /api/admin/system/overview exists exactly once.
+PASS  app.MapSystemEndpoints() is present.
+PASS  /api/me/operating-terminals exists exactly once.
+PASS  POST /api/me/terminal exists exactly once.
+PASS  /api/admin/users, /api/admin/vehicles and /api/admin/drivers accept explicit terminalId targeting.
+PASS  /api/version exists and backend/frontend version strings are both 5.9.1.
+PASS  Known CS8110 pattern scan: no UserId(principal) or TerminalId(principal) calls directly inside single-line EF Where/Select expressions.
+PASS  Old demo credentials/data strings are absent: admin123, super123, user123, Test Driver, John Smith, Demo:.
+PASS  smoke-test.ps1 now checks System Health, Admin target scope for every operating terminal and active terminal switching.
+
+Build limitation
+----------------
+The .NET SDK is not installed in this execution environment, so a real `dotnet build` cannot be run here.
+An attempted npm dependency install timed out because external package retrieval is unavailable here, so a full Vite build also cannot be run in this environment.
+
+Run on the Rider PC
+-------------------
+IMPORTANT: stop any old `dotnet run` process before testing. `dotnet build` does not replace code already loaded by a running backend process.
+
+1. Stop the currently running backend (Ctrl+C in its terminal).
+2. Replace/sync the v5.9.1 files.
+3. From backend/PalletControl.Api:
+   dotnet clean
+   dotnet build
+   dotnet run
+4. In a browser or PowerShell verify:
+   http://localhost:5000/api/version
+   It must report 5.9.1.
+5. From frontend:
+   npm install
+   npm run build
+   npm run dev
+6. Run the non-destructive smoke test from the project root:
+   .\smoke-test.ps1
+
+Expected SuperAdmin behavior
+----------------------------
+- Header `Active` selector switches the live operational context SRD / ARE / KRS.
+- Admin `Manage terminal` selector independently chooses which terminal is being administered.
+- Users, Vehicles, Drivers, Transporters, Terminal settings, Linehaul comments and Linehaul/Mottatt locations follow Manage terminal.
+- System Health is global/SuperAdmin-only and does not depend on Manage terminal.

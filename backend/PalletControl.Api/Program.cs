@@ -7,6 +7,7 @@ using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
@@ -14,171 +15,33 @@ using ClosedXML.Excel;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Resolve the SQLite file to an absolute path based on the API project/content root.
-// This makes the database location deterministic even when the app is started by Rider,
-// PowerShell, IIS or a Windows service from a different working directory.
-var configuredConnectionString = builder.Configuration.GetConnectionString("Default")
-                                 ?? "Data Source=palletcontrol-v5.db";
-var sqliteConnectionBuilder = new SqliteConnectionStringBuilder(configuredConnectionString);
-
-if (string.IsNullOrWhiteSpace(sqliteConnectionBuilder.DataSource))
-    throw new InvalidOperationException("SQLite Data Source is missing.");
-
-var databasePath = sqliteConnectionBuilder.DataSource;
-if (!Path.IsPathRooted(databasePath))
-    databasePath = Path.GetFullPath(Path.Combine(builder.Environment.ContentRootPath, databasePath));
-
-Directory.CreateDirectory(Path.GetDirectoryName(databasePath) ?? builder.Environment.ContentRootPath);
-sqliteConnectionBuilder.DataSource = databasePath;
-
-var configuredBackupDirectory = builder.Configuration["Database:BackupDirectory"] ?? "Backups";
-var backupDirectory = Path.IsPathRooted(configuredBackupDirectory)
-    ? configuredBackupDirectory
-    : Path.GetFullPath(Path.Combine(builder.Environment.ContentRootPath, configuredBackupDirectory));
-
-Directory.CreateDirectory(backupDirectory);
-
-var databaseStorage = new DatabaseStorageOptions(
-    databasePath,
-    sqliteConnectionBuilder.ConnectionString,
-    backupDirectory,
-    Math.Clamp(builder.Configuration.GetValue<int?>("Database:BackupIntervalHours") ?? 24, 1, 168),
-    Math.Clamp(builder.Configuration.GetValue<int?>("Database:BackupRetentionDays") ?? 30, 1, 3650));
-
-builder.Services.AddSingleton(databaseStorage);
-builder.Services.AddSingleton<DatabaseBackupManager>();
-builder.Services.AddHostedService<DatabaseBackupHostedService>();
-
-builder.Services.AddDbContext<AppDbContext>(o =>
-    o.UseSqlite(
-        databaseStorage.ConnectionString,
-        sqlite => sqlite.UseQuerySplittingBehavior(QuerySplittingBehavior.SplitQuery)));
-
-builder.Services.AddCors(o => o.AddPolicy("ui", p =>
-    p.SetIsOriginAllowed(origin =>
-        {
-            if (!Uri.TryCreate(origin, UriKind.Absolute, out var uri))
-                return false;
-
-            var host = uri.Host;
-            return host.Equals("localhost", StringComparison.OrdinalIgnoreCase)
-                   || host == "127.0.0.1"
-                   || host.StartsWith("192.168.", StringComparison.Ordinal)
-                   || host.StartsWith("10.", StringComparison.Ordinal);
-        })
-        .AllowAnyHeader()
-        .AllowAnyMethod()));
-
-var jwtKey = builder.Configuration["Jwt:Key"]
-             ?? throw new InvalidOperationException("Jwt:Key is missing.");
-var jwtIssuer = builder.Configuration["Jwt:Issuer"] ?? "PalletControl";
-var jwtAudience = builder.Configuration["Jwt:Audience"] ?? "PalletControl";
-
-builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
-    .AddJwtBearer(o =>
-    {
-        o.TokenValidationParameters = new TokenValidationParameters
-        {
-            ValidateIssuer = true,
-            ValidIssuer = jwtIssuer,
-            ValidateAudience = true,
-            ValidAudience = jwtAudience,
-            ValidateLifetime = true,
-            ValidateIssuerSigningKey = true,
-            IssuerSigningKey = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey)),
-            ClockSkew = TimeSpan.FromMinutes(1)
-        };
-
-        // The token proves who the user is, but role/terminal are refreshed from
-        // the database on every authenticated request. If an Admin changes a user's
-        // terminal (for example ARE -> SRD), the next request immediately uses SRD
-        // without requiring that user to log out and back in.
-        o.Events = new JwtBearerEvents
-        {
-            OnTokenValidated = async context =>
-            {
-                var principal = context.Principal;
-                var userIdText = principal?.FindFirstValue(ClaimTypes.NameIdentifier)
-                                 ?? principal?.FindFirstValue(JwtRegisteredClaimNames.Sub);
-
-                if (!int.TryParse(userIdText, out var userId))
-                {
-                    context.Fail("Invalid user id.");
-                    return;
-                }
-
-                var db = context.HttpContext.RequestServices.GetRequiredService<AppDbContext>();
-                var currentUser = await db.Users
-                    .AsNoTracking()
-                    .Include(x => x.Terminal)
-                    .SingleOrDefaultAsync(x => x.Id == userId && x.Active);
-
-                if (currentUser is null)
-                {
-                    context.Fail("User is inactive or no longer exists.");
-                    return;
-                }
-
-                if (principal?.Identity is not ClaimsIdentity identity)
-                {
-                    context.Fail("Invalid identity.");
-                    return;
-                }
-
-                foreach (var claim in identity.FindAll(ClaimTypes.Role).ToList())
-                    identity.RemoveClaim(claim);
-                foreach (var claim in identity.FindAll("terminalId").ToList())
-                    identity.RemoveClaim(claim);
-                foreach (var claim in identity.FindAll("terminalCode").ToList())
-                    identity.RemoveClaim(claim);
-                foreach (var claim in identity.FindAll("moduleInternal").ToList())
-                    identity.RemoveClaim(claim);
-                foreach (var claim in identity.FindAll("moduleLinehaul").ToList())
-                    identity.RemoveClaim(claim);
-                foreach (var claim in identity.FindAll("moduleReceivedControl").ToList())
-                    identity.RemoveClaim(claim);
-
-                identity.AddClaim(new Claim(ClaimTypes.Role, currentUser.Role));
-                identity.AddClaim(new Claim("terminalId", currentUser.TerminalId.ToString(CultureInfo.InvariantCulture)));
-                identity.AddClaim(new Claim("terminalCode", currentUser.Terminal?.Code ?? ""));
-                var currentIsViewer = currentUser.Role == Roles.Viewer;
-                identity.AddClaim(new Claim("moduleInternal", currentIsViewer || currentUser.HasInternalPalletAccounting ? "1" : "0"));
-                identity.AddClaim(new Claim("moduleLinehaul", !currentIsViewer && currentUser.HasLinehaul ? "1" : "0"));
-                identity.AddClaim(new Claim("moduleReceivedControl", !currentIsViewer && currentUser.HasReceivedControl ? "1" : "0"));
-            }
-        };
-    });
-
-builder.Services.AddAuthorization(options =>
-{
-    options.AddPolicy("InternalModule", policy => policy.RequireClaim("moduleInternal", "1"));
-    options.AddPolicy("InternalWrite", policy => policy.RequireAssertion(ctx =>
-        ctx.User.FindFirstValue("moduleInternal") == "1" &&
-        !ctx.User.IsInRole(Roles.Viewer)));
-    options.AddPolicy("InternalElevated", policy => policy.RequireAssertion(ctx =>
-        ctx.User.FindFirstValue("moduleInternal") == "1" &&
-        (ctx.User.IsInRole(Roles.SuperAdmin) || ctx.User.IsInRole(Roles.Admin) || ctx.User.IsInRole(Roles.LegacyTerminalAdmin) || ctx.User.IsInRole(Roles.Superuser))));
-    options.AddPolicy("LinehaulModule", policy => policy.RequireClaim("moduleLinehaul", "1"));
-    options.AddPolicy("LinehaulAdmin", policy => policy.RequireAssertion(ctx =>
-        ctx.User.FindFirstValue("moduleLinehaul") == "1" &&
-        (ctx.User.IsInRole(Roles.SuperAdmin) || ctx.User.IsInRole(Roles.Admin) || ctx.User.IsInRole(Roles.LegacyTerminalAdmin))));
-    options.AddPolicy("ReceivedControlModule", policy => policy.RequireClaim("moduleReceivedControl", "1"));
-    options.AddPolicy("ReceivedControlAdmin", policy => policy.RequireAssertion(ctx =>
-        ctx.User.FindFirstValue("moduleReceivedControl") == "1" &&
-        (ctx.User.IsInRole(Roles.SuperAdmin) || ctx.User.IsInRole(Roles.Admin) || ctx.User.IsInRole(Roles.LegacyTerminalAdmin))));
-});
+const string BuildVersion = "5.9.1";
+builder.Services.AddPalletDatabase(builder.Configuration, builder.Environment);
+builder.AddPalletSecurity();
+builder.AddPalletObservability(BuildVersion);
 
 var app = builder.Build();
-app.UseCors("ui");
-app.UseAuthentication();
-app.UseAuthorization();
+var telemetry = app.Services.GetRequiredService<SystemTelemetryService>();
+// Wrap the full request pipeline so 401/403/429 responses from security middleware
+// are included in the SuperAdmin monitoring counters as well.
+app.Use((context, next) => telemetry.InvokeAsync(context, next));
+app.UsePalletSecurity();
+
+var webRoot = app.Environment.WebRootPath ?? Path.Combine(app.Environment.ContentRootPath, "wwwroot");
+var hasFrontendBuild = File.Exists(Path.Combine(webRoot, "index.html"));
+if (hasFrontendBuild)
+{
+    app.UseDefaultFiles();
+    app.UseStaticFiles();
+}
+
 
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
     db.Database.EnsureCreated();
     EnsureCompatibilitySchema(db);
-    Seed(db);
+    Seed(db, app.Configuration);
     MigrateLegacyLinehaulLocations(db);
     MigrateLegacyTransporters(db);
     EnsureUserSettingsRows(db);
@@ -188,15 +51,18 @@ app.MapGet("/", () => Results.Ok(new
 {
     name = "Pallet Control API",
     status = "running",
-    version = "5.8.11"
+    version = BuildVersion
+}));
+
+app.MapGet("/api/version", () => Results.Ok(new
+{
+    name = "Pallet Control API",
+    version = BuildVersion
 }));
 
 // Public health endpoint. This performs a real SQLite connection, real table read,
 // and SQLite PRAGMA quick_check. It also reports whether a real backup exists.
-app.MapGet("/api/health", async (
-    AppDbContext db,
-    DatabaseStorageOptions storage,
-    DatabaseBackupManager backupManager) =>
+app.MapGet("/api/health", async (AppDbContext db) =>
 {
     var started = DateTime.UtcNow;
     try
@@ -231,10 +97,10 @@ app.MapGet("/api/health", async (
             await db.Database.CloseConnectionAsync();
         }
 
-        var dbFile = new FileInfo(storage.DatabasePath);
-        var backupStatus = backupManager.GetStatus();
         var healthy = string.Equals(quickCheck, "ok", StringComparison.OrdinalIgnoreCase);
 
+        // Keep the anonymous health response deliberately small. Detailed database paths,
+        // backup information, disk status and error details are SuperAdmin-only.
         var payload = new
         {
             status = healthy ? "healthy" : "unhealthy",
@@ -242,13 +108,7 @@ app.MapGet("/api/health", async (
             database = new
             {
                 status = healthy ? "online" : "unhealthy",
-                provider = "SQLite",
-                file = dbFile.Name,
-                exists = dbFile.Exists,
-                sizeBytes = dbFile.Exists ? dbFile.Length : 0,
-                quickCheck,
-                latestBackupUtc = backupStatus.LatestBackupUtc,
-                backupCount = backupStatus.BackupCount
+                quickCheck = healthy ? "ok" : "failed"
             },
             checkedAtUtc = DateTime.UtcNow,
             responseMs = Math.Round((DateTime.UtcNow - started).TotalMilliseconds, 1)
@@ -258,62 +118,52 @@ app.MapGet("/api/health", async (
             ? Results.Ok(payload)
             : Results.Json(payload, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
-    catch (Exception ex)
+    catch
     {
         return Results.Json(new
         {
             status = "unhealthy",
             api = new { status = "online" },
-            database = new { status = "offline", message = ex.Message },
+            database = new { status = "offline" },
             checkedAtUtc = DateTime.UtcNow,
             responseMs = Math.Round((DateTime.UtcNow - started).TotalMilliseconds, 1)
         }, statusCode: StatusCodes.Status503ServiceUnavailable);
     }
 });
 
-app.MapPost("/api/auth/login", async (LoginRequest req, AppDbContext db) =>
+app.MapPost("/api/auth/login", async (LoginRequest req, HttpContext http, AppDbContext db, LoginAttemptGuard loginGuard, JwtTokenService tokenService) =>
 {
     var username = req.Username.Trim().ToLowerInvariant();
+    var clientKey = http.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+    if (loginGuard.IsBlocked(username, clientKey, out var retryAfter))
+        return Results.Json(new { message = "Too many failed login attempts.", retryAfterSeconds = Math.Ceiling(retryAfter.TotalSeconds) }, statusCode: StatusCodes.Status429TooManyRequests);
+
     var user = await db.Users
         .Include(x => x.Terminal)
         .SingleOrDefaultAsync(x => x.Username == username && x.Active);
 
     if (user is null)
+    {
+        loginGuard.RecordFailure(username, clientKey);
         return Results.Unauthorized();
+    }
 
     var hasher = new PasswordHasher<AppUser>();
     var verification = hasher.VerifyHashedPassword(user, user.PasswordHash, req.Password);
     if (verification == PasswordVerificationResult.Failed)
-        return Results.Unauthorized();
-
-    var claims = new List<Claim>
     {
-        new(JwtRegisteredClaimNames.Sub, user.Id.ToString()),
-        new(ClaimTypes.NameIdentifier, user.Id.ToString()),
-        new(ClaimTypes.Name, user.Username),
-        new(ClaimTypes.Role, user.Role),
-        new("terminalId", user.TerminalId.ToString()),
-        new("terminalCode", user.Terminal?.Code ?? ""),
-        new("moduleInternal", user.Role == Roles.Viewer || user.HasInternalPalletAccounting ? "1" : "0"),
-        new("moduleLinehaul", user.Role != Roles.Viewer && user.HasLinehaul ? "1" : "0"),
-        new("moduleReceivedControl", user.Role != Roles.Viewer && user.HasReceivedControl ? "1" : "0")
-    };
+        loginGuard.RecordFailure(username, clientKey);
+        return Results.Unauthorized();
+    }
 
-    var creds = new SigningCredentials(
-        new SymmetricSecurityKey(Encoding.UTF8.GetBytes(jwtKey)),
-        SecurityAlgorithms.HmacSha256);
+    loginGuard.RecordSuccess(username, clientKey);
 
-    var token = new JwtSecurityToken(
-        jwtIssuer,
-        jwtAudience,
-        claims,
-        expires: DateTime.UtcNow.AddHours(12),
-        signingCredentials: creds);
+    var token = tokenService.CreateToken(user);
 
     var userSettings = await GetUserSettings(db, user.Id);
     var viewerScopeLabel = await GetViewerScopeLabel(db, user);
     return Results.Ok(new LoginResponse(
-        new JwtSecurityTokenHandler().WriteToken(token),
+        token,
         user.Username,
         user.DisplayName,
         user.Role,
@@ -326,7 +176,7 @@ app.MapPost("/api/auth/login", async (LoginRequest req, AppDbContext db) =>
         user.Role != Roles.Viewer && user.HasReceivedControl,
         userSettings.Theme,
         viewerScopeLabel));
-});
+}).RequireRateLimiting("login");
 
 app.MapGet("/api/me", async (ClaimsPrincipal principal, AppDbContext db) =>
 {
@@ -334,14 +184,23 @@ app.MapGet("/api/me", async (ClaimsPrincipal principal, AppDbContext db) =>
     var user = await db.Users.Include(x => x.Terminal).SingleAsync(x => x.Id == id);
     var userSettings = await GetUserSettings(db, id);
     var viewerScopeLabel = await GetViewerScopeLabel(db, user);
+
+    // SuperAdmin's active operating terminal is session-scoped in the validated JWT.
+    // Do not overwrite it with the account's stored/home terminal during the periodic
+    // frontend /api/me refresh.
+    var activeTerminalId = user.Role == Roles.SuperAdmin ? TerminalId(principal) : user.TerminalId;
+    var activeTerminalCode = user.Role == Roles.SuperAdmin
+        ? principal.FindFirstValue("terminalCode") ?? user.Terminal?.Code ?? ""
+        : user.Terminal?.Code ?? "";
+
     return Results.Ok(new
     {
         user.Id,
         user.Username,
         user.DisplayName,
         user.Role,
-        user.TerminalId,
-        terminalCode = user.Terminal?.Code ?? "",
+        terminalId = activeTerminalId,
+        terminalCode = activeTerminalCode,
         user.ShowDriverStatisticsTab,
         user.ShowDailyCheckTab,
         hasInternalPalletAccounting = user.Role == Roles.Viewer || user.HasInternalPalletAccounting,
@@ -352,11 +211,65 @@ app.MapGet("/api/me", async (ClaimsPrincipal principal, AppDbContext db) =>
     });
 }).RequireAuthorization();
 
+app.MapGet("/api/me/operating-terminals", async (ClaimsPrincipal principal, AppDbContext db) =>
+{
+    if (Role(principal) != Roles.SuperAdmin) return Results.Forbid();
+
+    var terminals = await db.Terminals.AsNoTracking()
+        .Where(x => x.IsOperatingTerminal && x.Active)
+        .OrderBy(x => x.Code)
+        .Select(x => new { x.Id, x.Code, x.Name })
+        .ToListAsync();
+
+    return Results.Ok(terminals);
+}).RequireAuthorization(new AuthorizeAttribute { Roles = Roles.SuperAdmin });
+
+app.MapPost("/api/me/terminal", async (
+    SwitchTerminalRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db,
+    JwtTokenService tokenService) =>
+{
+    if (Role(principal) != Roles.SuperAdmin) return Results.Forbid();
+
+    var userId = UserId(principal);
+    var user = await db.Users.Include(x => x.Terminal)
+        .SingleOrDefaultAsync(x => x.Id == userId && x.Active);
+    if (user is null || user.Role != Roles.SuperAdmin) return Results.Forbid();
+
+    var target = await db.Terminals.AsNoTracking()
+        .SingleOrDefaultAsync(x => x.Id == req.TerminalId && x.IsOperatingTerminal && x.Active);
+    if (target is null)
+        return Results.BadRequest(new { message = "Operating terminal not found or inactive." });
+
+    var token = tokenService.CreateToken(user, target);
+    var userSettings = await GetUserSettings(db, user.Id);
+    var viewerScopeLabel = await GetViewerScopeLabel(db, user);
+
+    await Audit(db, principal, "SUPERADMIN_TERMINAL_SWITCH", $"Switched active terminal to {target.Code} ({target.Id}).");
+
+    return Results.Ok(new LoginResponse(
+        token,
+        user.Username,
+        user.DisplayName,
+        user.Role,
+        target.Id,
+        target.Code,
+        user.ShowDriverStatisticsTab,
+        user.ShowDailyCheckTab,
+        user.HasInternalPalletAccounting,
+        user.HasLinehaul,
+        user.HasReceivedControl,
+        userSettings.Theme,
+        viewerScopeLabel));
+}).RequireAuthorization(new AuthorizeAttribute { Roles = Roles.SuperAdmin });
+
 app.MapGet("/api/me/settings", async (ClaimsPrincipal principal, AppDbContext db) =>
 {
     var user = await db.Users.FindAsync(UserId(principal));
     if (user is null) return Results.NotFound();
-    var terminalSettings = await GetTerminalSettings(db, user.TerminalId);
+    var settingsTerminalId = user.Role == Roles.SuperAdmin ? TerminalId(principal) : user.TerminalId;
+    var terminalSettings = await GetTerminalSettings(db, settingsTerminalId);
     var userSettings = await GetUserSettings(db, user.Id);
 
     return Results.Ok(new
@@ -392,7 +305,8 @@ app.MapPut("/api/me/settings", async (
     user.ShowBalanceNotifications = userSettings.ShowBalanceNotifications;
     await db.SaveChangesAsync();
 
-    var terminalSettings = await GetTerminalSettings(db, user.TerminalId);
+    var settingsTerminalId = user.Role == Roles.SuperAdmin ? TerminalId(principal) : user.TerminalId;
+    var terminalSettings = await GetTerminalSettings(db, settingsTerminalId);
     return Results.Ok(new
     {
         userSettings.ShowMilestoneNotifications,
@@ -417,8 +331,9 @@ app.MapPut("/api/me/password", async (
 
     if (string.IsNullOrWhiteSpace(req.CurrentPassword))
         return Results.BadRequest(new { message = "Current password is required." });
-    if (string.IsNullOrWhiteSpace(req.NewPassword) || req.NewPassword.Length < 6)
-        return Results.BadRequest(new { message = "New password must be at least 6 characters." });
+    var newPasswordError = PasswordSecurity.Validate(req.NewPassword);
+    if (newPasswordError is not null)
+        return Results.BadRequest(new { message = newPasswordError });
 
     var hasher = new PasswordHasher<AppUser>();
     var verification = hasher.VerifyHashedPassword(user, user.PasswordHash, req.CurrentPassword);
@@ -521,8 +436,8 @@ app.MapPost("/api/drivers/quick-add", async (
     if (!settings.AllowUsersAddDrivers)
         return Results.Forbid();
 
-    // Quick-add is always scoped to the terminal assigned to the logged-in user.
-    // The client is intentionally not allowed to choose another terminal here.
+    // Quick-add is scoped to the validated active terminal. SuperAdmin may switch
+    // active operating terminal; other roles remain locked to their assigned terminal.
     var name = req.Name.Trim();
     if (string.IsNullOrWhiteSpace(name))
         return Results.BadRequest(new { message = "Driver name is required." });
@@ -3608,20 +3523,42 @@ app.MapGet("/api/admin/transporters", async (
     });
 }).RequireAuthorization(AdminOnly());
 
-app.MapGet("/api/admin/vehicles", async (ClaimsPrincipal principal, AppDbContext db) =>
+app.MapGet("/api/admin/vehicles", async (
+    int? terminalId,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
 {
-    var terminalId = TerminalId(principal);
-    var q = db.Vehicles.AsNoTracking().Include(x => x.Terminal).Include(x => x.Transporter).AsQueryable();
-    if (!IsSuperAdmin(principal)) q = q.Where(x => x.TerminalId == terminalId);
-    var vehicles = await q.OrderBy(x => x.VehicleId).ToListAsync();
+    var targetTerminalId = ResolveAdminTerminal(principal, terminalId);
+    if (!CanManageTerminal(principal, targetTerminalId)) return Results.Forbid();
+
+    var targetTerminal = await db.Terminals.AsNoTracking()
+        .FirstOrDefaultAsync(x => x.Id == targetTerminalId && x.Active && x.IsOperatingTerminal);
+    if (targetTerminal is null)
+        return Results.NotFound(new { message = "Operating terminal not found." });
+
+    var vehicles = await db.Vehicles
+        .AsNoTracking()
+        .Include(x => x.Terminal)
+        .Include(x => x.Transporter)
+        .Where(x => x.TerminalId == targetTerminalId)
+        .OrderBy(x => x.VehicleId)
+        .ToListAsync();
+
     var terminals = IsSuperAdmin(principal)
         ? await db.Terminals.AsNoTracking().Where(x => x.Active && x.IsOperatingTerminal).OrderBy(x => x.Code).ToListAsync()
-        : await db.Terminals.AsNoTracking().Where(x => x.Id == terminalId).ToListAsync();
-    var transporterQuery = db.Transporters.AsNoTracking().AsQueryable();
-    if (!IsSuperAdmin(principal)) transporterQuery = transporterQuery.Where(x => x.TerminalId == terminalId);
-    var transporters = await transporterQuery.OrderBy(x => x.Name).Select(x => new { x.Id, x.Name, x.Active, x.TerminalId }).ToListAsync();
+        : await db.Terminals.AsNoTracking().Where(x => x.Id == targetTerminalId).ToListAsync();
+
+    var transporters = await db.Transporters
+        .AsNoTracking()
+        .Where(x => x.TerminalId == targetTerminalId)
+        .OrderBy(x => x.Name)
+        .Select(x => new { x.Id, x.Name, x.Active, x.TerminalId })
+        .ToListAsync();
+
     return Results.Ok(new
     {
+        terminalId = targetTerminalId,
+        terminalCode = targetTerminal.Code,
         terminals,
         transporters,
         vehicles = vehicles.Select(x => new
@@ -3633,18 +3570,37 @@ app.MapGet("/api/admin/vehicles", async (ClaimsPrincipal principal, AppDbContext
     });
 }).RequireAuthorization(AdminOnly());
 
-app.MapGet("/api/admin/drivers", async (ClaimsPrincipal principal, AppDbContext db) =>
+app.MapGet("/api/admin/drivers", async (
+    int? terminalId,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
 {
-    var terminalId = TerminalId(principal);
-    var q = db.Drivers.AsNoTracking().Include(x => x.Terminal).AsQueryable();
-    if (!IsSuperAdmin(principal)) q = q.Where(x => x.TerminalId == terminalId);
+    var targetTerminalId = ResolveAdminTerminal(principal, terminalId);
+    if (!CanManageTerminal(principal, targetTerminalId)) return Results.Forbid();
+
+    var targetTerminal = await db.Terminals.AsNoTracking()
+        .FirstOrDefaultAsync(x => x.Id == targetTerminalId && x.Active && x.IsOperatingTerminal);
+    if (targetTerminal is null)
+        return Results.NotFound(new { message = "Operating terminal not found." });
+
     var terminals = IsSuperAdmin(principal)
         ? await db.Terminals.AsNoTracking().Where(x => x.Active && x.IsOperatingTerminal).OrderBy(x => x.Code).ToListAsync()
-        : await db.Terminals.AsNoTracking().Where(x => x.Id == terminalId).ToListAsync();
+        : await db.Terminals.AsNoTracking().Where(x => x.Id == targetTerminalId).ToListAsync();
+
+    var drivers = await db.Drivers
+        .AsNoTracking()
+        .Include(x => x.Terminal)
+        .Where(x => x.TerminalId == targetTerminalId)
+        .OrderBy(x => x.Name)
+        .Select(x => new { x.Id, x.Name, x.Active, x.TerminalId, terminal = x.Terminal!.Code })
+        .ToListAsync();
+
     return Results.Ok(new
     {
+        terminalId = targetTerminalId,
+        terminalCode = targetTerminal.Code,
         terminals,
-        drivers = await q.OrderBy(x => x.Name).Select(x => new { x.Id, x.Name, x.Active, x.TerminalId, terminal = x.Terminal!.Code }).ToListAsync()
+        drivers
     });
 }).RequireAuthorization(AdminOnly());
 
@@ -3656,18 +3612,29 @@ app.MapGet("/api/admin/pallet-types", async (AppDbContext db) =>
     });
 }).RequireAuthorization(SuperAdminOnly());
 
-app.MapGet("/api/admin/users", async (ClaimsPrincipal principal, AppDbContext db) =>
+app.MapGet("/api/admin/users", async (
+    int? terminalId,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
 {
-    var terminalId = TerminalId(principal);
     var superAdmin = IsSuperAdmin(principal);
+    var targetTerminalId = ResolveAdminTerminal(principal, terminalId);
+    if (!CanManageTerminal(principal, targetTerminalId)) return Results.Forbid();
+
+    var targetTerminal = await db.Terminals.AsNoTracking()
+        .FirstOrDefaultAsync(x => x.Id == targetTerminalId && x.Active && x.IsOperatingTerminal);
+    if (targetTerminal is null)
+        return Results.NotFound(new { message = "Operating terminal not found." });
 
     var q = db.Users.AsNoTracking().Include(x => x.Terminal).AsQueryable();
-    if (!superAdmin)
-        q = q.Where(x => x.TerminalId == terminalId && x.Role != Roles.SuperAdmin);
+    if (superAdmin)
+        q = q.Where(x => x.TerminalId == targetTerminalId || x.Role == Roles.SuperAdmin);
+    else
+        q = q.Where(x => x.TerminalId == targetTerminalId && x.Role != Roles.SuperAdmin);
 
     var terminals = superAdmin
         ? await db.Terminals.AsNoTracking().Where(x => x.Active && x.IsOperatingTerminal).OrderBy(x => x.Code).ToListAsync()
-        : await db.Terminals.AsNoTracking().Where(x => x.Id == terminalId).ToListAsync();
+        : await db.Terminals.AsNoTracking().Where(x => x.Id == targetTerminalId).ToListAsync();
 
     var userRows = await q.OrderBy(x => x.Username).Select(x => new
     {
@@ -3694,7 +3661,7 @@ app.MapGet("/api/admin/users", async (ClaimsPrincipal principal, AppDbContext db
         .Where(x => x.Active);
 
     if (!superAdmin)
-        viewerTransporterQuery = viewerTransporterQuery.Where(x => x.TerminalId == terminalId);
+        viewerTransporterQuery = viewerTransporterQuery.Where(x => x.TerminalId == targetTerminalId);
 
     var viewerTransporters = await viewerTransporterQuery
         .Join(db.Terminals.AsNoTracking(), t => t.TerminalId, terminal => terminal.Id,
@@ -3724,11 +3691,13 @@ app.MapGet("/api/admin/users", async (ClaimsPrincipal principal, AppDbContext db
             .ToList(),
         viewerExternalTransporterCount = superAdmin
             ? 0
-            : assignmentRows.Count(a => a.UserId == x.Id && a.TerminalId != terminalId)
+            : assignmentRows.Count(a => a.UserId == x.Id && a.TerminalId != targetTerminalId)
     }).ToList();
 
     return Results.Ok(new
     {
+        terminalId = targetTerminalId,
+        terminalCode = targetTerminal.Code,
         terminals,
         users,
         viewerTransporters
@@ -4065,6 +4034,9 @@ app.MapPost("/api/admin/users", async (
     }
 
     var isViewer = req.Role == Roles.Viewer;
+    var createPasswordError = PasswordSecurity.Validate(req.Password);
+    if (createPasswordError is not null) return Results.BadRequest(new { message = createPasswordError });
+
     var row = new AppUser
     {
         Username = username,
@@ -4269,8 +4241,9 @@ app.MapPost("/api/admin/users/{id:int}/password", async (
     ClaimsPrincipal principal,
     AppDbContext db) =>
 {
-    if (string.IsNullOrWhiteSpace(req.Password) || req.Password.Length < 6)
-        return Results.BadRequest(new { message = "Password must be at least 6 characters." });
+    var passwordError = PasswordSecurity.Validate(req.Password);
+    if (passwordError is not null)
+        return Results.BadRequest(new { message = passwordError });
 
     var row = await db.Users.FindAsync(id);
     if (row is null) return Results.NotFound();
@@ -4324,7 +4297,13 @@ app.MapPut("/api/admin/settings", async (
     return Results.Ok(s);
 }).RequireAuthorization(SuperAdminOnly());
 
-app.Run("http://0.0.0.0:5000");
+app.MapSystemEndpoints();
+app.Logger.LogInformation("PalletControl {Version}: SuperAdmin system endpoint mapped at /api/admin/system/overview", BuildVersion);
+
+if (hasFrontendBuild)
+    app.MapFallbackToFile("index.html");
+
+app.Run();
 
 // ---------------- HELPERS ----------------
 
@@ -5699,860 +5678,77 @@ static void MigrateLegacyLinehaulLocations(AppDbContext db)
     db.SaveChanges();
 }
 
-static void Seed(AppDbContext db)
+static void Seed(AppDbContext db, IConfiguration configuration)
 {
-    // Demo/master data is seeded only when the database is genuinely new.
-    // This is important because Admin is allowed to delete vehicles, drivers and
-    // transporters. A deleted master record must stay deleted after an app restart.
-    var isFreshDatabase = !db.Terminals.Any()
-                          && !db.Users.Any()
-                          && !db.Vehicles.Any()
-                          && !db.Drivers.Any()
-                          && !db.Transporters.Any()
-                          && !db.PalletTypes.Any();
-
-    // Settings are application configuration rather than demo data. Ensure that the
-    // singleton exists even for an existing database, but never recreate deleted
-    // master data just to satisfy the seed routine.
+    // Production-safe seed: only structural rows plus one bootstrap SuperAdmin.
+    // No demo users, transporters, vehicles or driver names are created.
     if (!db.Settings.Any())
     {
         db.Settings.Add(new AppSettings());
         db.SaveChanges();
     }
 
+    var requiredOperatingTerminals = new[]
+    {
+        (Code: "SRD", Name: "Sandefjord"),
+        (Code: "ARE", Name: "Arendal"),
+        (Code: "KRS", Name: "Kristiansand")
+    };
+
+    foreach (var required in requiredOperatingTerminals)
+    {
+        if (!db.Terminals.Any(x => x.IsOperatingTerminal && x.Code == required.Code))
+            db.Terminals.Add(new Terminal { Code = required.Code, Name = required.Name, Active = true, IsOperatingTerminal = true });
+    }
+    db.SaveChanges();
+
     foreach (var terminalId in db.Terminals.Where(x => x.IsOperatingTerminal).Select(x => x.Id).ToList())
         EnsureTerminalSettings(db, terminalId).GetAwaiter().GetResult();
 
-    if (!isFreshDatabase)
+    // Pallet types are structural defaults needed by the registration UI. Do not
+    // recreate them later if an administrator intentionally changes/deletes them.
+    if (!db.PalletTypes.Any())
     {
-        // v5.8.6 keeps exactly three operating PalletControl terminals. Statistical
-        // Linehaul/Mottatt locations are separate scoped rows and must not replace these.
-        var requiredOperatingTerminals = new[]
-        {
-            (Code: "SRD", Name: "Sandefjord"),
-            (Code: "ARE", Name: "Arendal"),
-            (Code: "KRS", Name: "Kristiansand")
-        };
-        foreach (var required in requiredOperatingTerminals)
-        {
-            if (!db.Terminals.Any(x => x.IsOperatingTerminal && x.Code == required.Code))
-                db.Terminals.Add(new Terminal { Code = required.Code, Name = required.Name, Active = true, IsOperatingTerminal = true });
-        }
+        db.PalletTypes.AddRange(
+            new PalletType { Name = "EUR pallet", Active = true, UserSelectable = true },
+            new PalletType { Name = "Half pallet", Active = true, UserSelectable = true },
+            new PalletType { Name = "One-time pallet", Active = true, UserSelectable = true });
         db.SaveChanges();
-        foreach (var terminalId in db.Terminals.Where(x => x.IsOperatingTerminal).Select(x => x.Id).ToList())
-            EnsureTerminalSettings(db, terminalId).GetAwaiter().GetResult();
-        return;
     }
 
-    var srd = new Terminal { Code = "SRD", Name = "Sandefjord", Active = true, IsOperatingTerminal = true };
-    var krs = new Terminal { Code = "KRS", Name = "Kristiansand", Active = true, IsOperatingTerminal = true };
-    var are = new Terminal { Code = "ARE", Name = "Arendal", Active = true, IsOperatingTerminal = true };
-    db.Terminals.AddRange(srd, krs, are);
-    db.SaveChanges(); // IDs are required by terminal-scoped transporters/settings.
+    if (db.Users.Any()) return;
 
-    db.PalletTypes.AddRange(
-        new PalletType { Name = "EUR pallet", Active = true, UserSelectable = true },
-        new PalletType { Name = "Half pallet", Active = true, UserSelectable = true },
-        new PalletType { Name = "One-time pallet", Active = true, UserSelectable = true });
-
-    var telemark = new Transporter { Name = "Telemark TransportService", Active = true, TerminalId = srd.Id };
-    var frode = new Transporter { Name = "Frode Bjønnes", Active = true, TerminalId = srd.Id };
-    db.Transporters.AddRange(telemark, frode);
-
-    db.SaveChanges();
-    EnsureTerminalSettings(db, srd.Id).GetAwaiter().GetResult();
-    EnsureTerminalSettings(db, krs.Id).GetAwaiter().GetResult();
-    EnsureTerminalSettings(db, are.Id).GetAwaiter().GetResult();
-
-    db.Vehicles.AddRange(
-        new Vehicle { VehicleId = "VTM3241", TerminalId = srd.Id, TransporterId = telemark.Id, Active = true },
-        new Vehicle { VehicleId = "VTM3755", TerminalId = srd.Id, TransporterId = telemark.Id, Active = true },
-        new Vehicle { VehicleId = "VTA3754", TerminalId = srd.Id, TransporterId = telemark.Id, Active = true },
-        new Vehicle { VehicleId = "VTM3771", TerminalId = srd.Id, TransporterId = frode.Id, Active = true });
-
-    db.Drivers.AddRange(
-        new Driver { Name = "Test Driver", TerminalId = srd.Id, Active = true },
-        new Driver { Name = "John Smith", TerminalId = srd.Id, Active = true });
-
-    AddUser("admin", "Administrator", Roles.SuperAdmin, "admin123");
-    AddUser("super", "Super User", Roles.Superuser, "super123");
-    AddUser("user", "Terminal User", Roles.User, "user123");
-
-    db.SaveChanges();
-
-    void AddUser(string username, string displayName, string role, string password)
+    var password = configuration["BootstrapAdmin:Password"];
+    var passwordError = PasswordSecurity.Validate(password);
+    if (passwordError is not null)
     {
-        var u = new AppUser
-        {
-            Username = username,
-            DisplayName = displayName,
-            Role = role,
-            TerminalId = srd.Id,
-            Active = true
-        };
-        u.PasswordHash = new PasswordHasher<AppUser>().HashPassword(u, password);
-        db.Users.Add(u);
-    }
-}
-
-// ---------------- DATABASE STORAGE / BACKUP ----------------
-
-public sealed record DatabaseStorageOptions(
-    string DatabasePath,
-    string ConnectionString,
-    string BackupDirectory,
-    int BackupIntervalHours,
-    int BackupRetentionDays);
-
-public sealed record DatabaseBackupInfo(string Path, DateTime CreatedAtUtc, long SizeBytes);
-public sealed record DatabaseBackupStatus(int BackupCount, string? LatestBackupPath, DateTime? LatestBackupUtc);
-
-public sealed class DatabaseBackupManager
-{
-    private readonly DatabaseStorageOptions _options;
-    private readonly ILogger<DatabaseBackupManager> _logger;
-    private readonly SemaphoreSlim _backupLock = new(1, 1);
-
-    public DatabaseBackupManager(
-        DatabaseStorageOptions options,
-        ILogger<DatabaseBackupManager> logger)
-    {
-        _options = options;
-        _logger = logger;
+        throw new InvalidOperationException(
+            "No users exist. Set BootstrapAdmin__Password before first startup. " + passwordError);
     }
 
-    public DatabaseBackupStatus GetStatus()
+    var username = (configuration["BootstrapAdmin:Username"] ?? "superadmin").Trim().ToLowerInvariant();
+    var displayName = (configuration["BootstrapAdmin:DisplayName"] ?? "Super Administrator").Trim();
+    if (string.IsNullOrWhiteSpace(username))
+        throw new InvalidOperationException("BootstrapAdmin:Username cannot be empty.");
+
+    var primaryTerminal = db.Terminals.Single(x => x.IsOperatingTerminal && x.Code == "SRD");
+    var admin = new AppUser
     {
-        Directory.CreateDirectory(_options.BackupDirectory);
-
-        var backups = new DirectoryInfo(_options.BackupDirectory)
-            .GetFiles("PalletControlBackup_*.db")
-            .OrderByDescending(x => x.LastWriteTimeUtc)
-            .ToList();
-
-        var latest = backups.FirstOrDefault();
-        return new DatabaseBackupStatus(
-            backups.Count,
-            latest?.FullName,
-            latest?.LastWriteTimeUtc);
-    }
-
-    public async Task<DatabaseBackupInfo> CreateBackupAsync(CancellationToken cancellationToken = default)
-    {
-        await _backupLock.WaitAsync(cancellationToken);
-        try
-        {
-            Directory.CreateDirectory(_options.BackupDirectory);
-
-            var stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture);
-            var backupPath = Path.Combine(_options.BackupDirectory, $"PalletControlBackup_{stamp}.db");
-
-            await using var source = new SqliteConnection(_options.ConnectionString);
-            await source.OpenAsync(cancellationToken);
-
-            var destinationBuilder = new SqliteConnectionStringBuilder
-            {
-                DataSource = backupPath,
-                Mode = SqliteOpenMode.ReadWriteCreate
-            };
-
-            await using var destination = new SqliteConnection(destinationBuilder.ConnectionString);
-            await destination.OpenAsync(cancellationToken);
-
-            // SQLite's native online backup API gives a consistent snapshot even while
-            // the web app is being used.
-            source.BackupDatabase(destination);
-
-            var cutoff = DateTime.UtcNow.AddDays(-_options.BackupRetentionDays);
-            foreach (var oldBackup in new DirectoryInfo(_options.BackupDirectory)
-                         .GetFiles("PalletControlBackup_*.db")
-                         .Where(x => x.LastWriteTimeUtc < cutoff))
-            {
-                try
-                {
-                    oldBackup.Delete();
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Could not delete old database backup {Backup}", oldBackup.FullName);
-                }
-            }
-
-            var file = new FileInfo(backupPath);
-            _logger.LogInformation("SQLite backup created: {BackupPath}", backupPath);
-            return new DatabaseBackupInfo(file.FullName, file.LastWriteTimeUtc, file.Length);
-        }
-        finally
-        {
-            _backupLock.Release();
-        }
-    }
-}
-
-public sealed class DatabaseBackupHostedService : BackgroundService
-{
-    private readonly DatabaseBackupManager _backupManager;
-    private readonly DatabaseStorageOptions _options;
-    private readonly ILogger<DatabaseBackupHostedService> _logger;
-
-    public DatabaseBackupHostedService(
-        DatabaseBackupManager backupManager,
-        DatabaseStorageOptions options,
-        ILogger<DatabaseBackupHostedService> logger)
-    {
-        _backupManager = backupManager;
-        _options = options;
-        _logger = logger;
-    }
-
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            try
-            {
-                var status = _backupManager.GetStatus();
-                var due = status.LatestBackupUtc is null ||
-                          DateTime.UtcNow - status.LatestBackupUtc.Value >= TimeSpan.FromHours(_options.BackupIntervalHours);
-
-                if (due)
-                    await _backupManager.CreateBackupAsync(stoppingToken);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Automatic SQLite backup failed.");
-            }
-
-            try
-            {
-                // Check hourly whether a backup is due. Actual backup cadence is controlled
-                // by BackupIntervalHours.
-                await Task.Delay(TimeSpan.FromHours(1), stoppingToken);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
-            {
-                break;
-            }
-        }
-    }
-}
-
-// ---------------- TYPES ----------------
-
-public sealed record ExportTable(string Name, List<string> Headers, List<List<object?>> Rows);
-
-public static class Roles
-{
-    public const string SuperAdmin = "SuperAdmin";
-    public const string Admin = "Admin";
-    public const string LegacyTerminalAdmin = "TerminalAdmin";
-    public const string Superuser = "Superuser";
-    public const string Viewer = "Viewer";
-    public const string User = "User";
-}
-
-public static class ReceiptStatus
-{
-    public const string Active = "ACTIVE";
-    public const string Cancelled = "CANCELLED";
-}
-
-public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(options)
-{
-    public DbSet<AppUser> Users => Set<AppUser>();
-    public DbSet<Terminal> Terminals => Set<Terminal>();
-    public DbSet<Transporter> Transporters => Set<Transporter>();
-    public DbSet<Vehicle> Vehicles => Set<Vehicle>();
-    public DbSet<Driver> Drivers => Set<Driver>();
-    public DbSet<PalletType> PalletTypes => Set<PalletType>();
-    public DbSet<PalletReceipt> Receipts => Set<PalletReceipt>();
-    public DbSet<PalletReceiptItem> ReceiptItems => Set<PalletReceiptItem>();
-    public DbSet<ReceiptAction> ReceiptActions => Set<ReceiptAction>();
-    public DbSet<WarningEvent> WarningEvents => Set<WarningEvent>();
-    public DbSet<AuditLog> AuditLogs => Set<AuditLog>();
-    public DbSet<AppSettings> Settings => Set<AppSettings>();
-    public DbSet<TerminalSettings> TerminalSettings => Set<TerminalSettings>();
-    public DbSet<UserSettingsRecord> UserSettings => Set<UserSettingsRecord>();
-    public DbSet<ViewerTransporterAssignment> ViewerTransporterAssignments => Set<ViewerTransporterAssignment>();
-    public DbSet<Holiday> Holidays => Set<Holiday>();
-    public DbSet<LinehaulReceipt> LinehaulReceipts => Set<LinehaulReceipt>();
-    public DbSet<LinehaulCommentOption> LinehaulCommentOptions => Set<LinehaulCommentOption>();
-    public DbSet<ReceivedControlEntry> ReceivedControlEntries => Set<ReceivedControlEntry>();
-    public DbSet<ReceivedControlWarning> ReceivedControlWarnings => Set<ReceivedControlWarning>();
-
-    protected override void OnModelCreating(ModelBuilder b)
-    {
-        b.Entity<AppUser>().HasIndex(x => x.Username).IsUnique();
-        b.Entity<Vehicle>().HasIndex(x => x.VehicleId).IsUnique();
-        b.Entity<Transporter>().HasIndex(x => new { x.TerminalId, x.Name }).IsUnique();
-        b.Entity<PalletType>().HasIndex(x => x.Name).IsUnique();
-        b.Entity<PalletReceipt>().HasIndex(x => x.ReceiptNumber).IsUnique();
-        b.Entity<PalletReceipt>().HasIndex(x => x.IdempotencyKey).IsUnique();
-        b.Entity<WarningEvent>().HasIndex(x => new { x.TerminalId, x.AcknowledgedAtUtc, x.CreatedAtUtc });
-        b.Entity<Holiday>().HasIndex(x => x.Date).IsUnique();
-        b.Entity<TerminalSettings>().HasIndex(x => x.TerminalId).IsUnique();
-        b.Entity<UserSettingsRecord>().ToTable("UserSettings");
-        b.Entity<UserSettingsRecord>().HasIndex(x => x.UserId).IsUnique();
-        b.Entity<UserSettingsRecord>().HasOne(x => x.User).WithOne().HasForeignKey<UserSettingsRecord>(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
-        b.Entity<ViewerTransporterAssignment>().HasKey(x => new { x.UserId, x.TransporterId });
-        b.Entity<ViewerTransporterAssignment>().HasOne(x => x.User).WithMany().HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
-        b.Entity<ViewerTransporterAssignment>().HasOne(x => x.Transporter).WithMany().HasForeignKey(x => x.TransporterId).OnDelete(DeleteBehavior.Cascade);
-        b.Entity<LinehaulReceipt>().HasIndex(x => x.ReceiptNumber).IsUnique();
-        b.Entity<LinehaulReceipt>().HasIndex(x => x.PalletReceiptNumber);
-        b.Entity<LinehaulReceipt>().HasIndex(x => new { x.FromTerminalId, x.ToTerminalId, x.BusinessDate });
-        b.Entity<LinehaulCommentOption>().HasIndex(x => x.TerminalId);
-        b.Entity<ReceivedControlEntry>().HasIndex(x => x.ControlNumber).IsUnique();
-        b.Entity<ReceivedControlEntry>().HasIndex(x => new { x.TerminalId, x.FromTerminalId, x.BusinessDate });
-        b.Entity<ReceivedControlWarning>().HasIndex(x => new { x.TerminalId, x.AcknowledgedAtUtc, x.CreatedAtUtc });
-        b.Entity<Vehicle>().Property(x => x.OperatingDays).HasDefaultValue("1,2,3,4,5");
-
-        b.Entity<Vehicle>()
-            .HasOne(x => x.Transporter)
-            .WithMany(x => x.Vehicles)
-            .HasForeignKey(x => x.TransporterId)
-            .OnDelete(DeleteBehavior.SetNull);
-
-        b.Entity<PalletReceipt>()
-            .HasOne(x => x.Vehicle)
-            .WithMany()
-            .HasForeignKey(x => x.VehicleId)
-            .OnDelete(DeleteBehavior.SetNull);
-
-        b.Entity<PalletReceipt>()
-            .HasOne(x => x.Driver)
-            .WithMany()
-            .HasForeignKey(x => x.DriverId)
-            .OnDelete(DeleteBehavior.SetNull);
-
-        b.Entity<PalletReceipt>()
-            .HasOne(x => x.SubmittedByUser)
-            .WithMany()
-            .HasForeignKey(x => x.SubmittedByUserId)
-            .OnDelete(DeleteBehavior.Restrict);
-
-        b.Entity<PalletReceipt>()
-            .HasMany(x => x.Actions)
-            .WithOne(x => x.Receipt)
-            .HasForeignKey(x => x.ReceiptId)
-            .OnDelete(DeleteBehavior.Cascade);
-
-        b.Entity<ReceiptAction>()
-            .HasOne(x => x.User)
-            .WithMany()
-            .HasForeignKey(x => x.UserId)
-            .OnDelete(DeleteBehavior.Restrict);
-
-        b.Entity<WarningEvent>()
-            .HasOne(x => x.Receipt)
-            .WithMany()
-            .HasForeignKey(x => x.ReceiptId)
-            .OnDelete(DeleteBehavior.SetNull);
-
-        b.Entity<WarningEvent>()
-            .HasOne(x => x.TriggeredByUser)
-            .WithMany()
-            .HasForeignKey(x => x.TriggeredByUserId)
-            .OnDelete(DeleteBehavior.Restrict);
-
-        b.Entity<WarningEvent>()
-            .HasOne(x => x.AcknowledgedByUser)
-            .WithMany()
-            .HasForeignKey(x => x.AcknowledgedByUserId)
-            .OnDelete(DeleteBehavior.Restrict);
-    }
-}
-
-public class AppUser
-{
-    public int Id { get; set; }
-    public string Username { get; set; } = "";
-    public string DisplayName { get; set; } = "";
-    public string PasswordHash { get; set; } = "";
-    public string Role { get; set; } = Roles.User;
-    public bool Active { get; set; } = true;
-    public int TerminalId { get; set; }
-
-    public bool ShowMilestoneNotifications { get; set; } = true;
-    public bool ShowLeaderboardNotifications { get; set; } = true;
-    public bool ShowBalanceNotifications { get; set; } = true;
-
-    // Per-user navigation/data access controlled from Admin -> Tab access.
-    public bool ShowDriverStatisticsTab { get; set; } = true;
-    public bool ShowDailyCheckTab { get; set; } = true;
-
-    // Operational modules can be combined freely on one user.
-    public bool HasInternalPalletAccounting { get; set; } = true;
-    public bool HasLinehaul { get; set; } = false;
-    public bool HasReceivedControl { get; set; } = false;
-
-    [JsonIgnore] public Terminal? Terminal { get; set; }
-}
-
-public class ViewerTransporterAssignment
-{
-    public int UserId { get; set; }
-    public int TransporterId { get; set; }
-
-    [JsonIgnore] public AppUser? User { get; set; }
-    [JsonIgnore] public Transporter? Transporter { get; set; }
-}
-
-public class Terminal
-{
-    public int Id { get; set; }
-    public string Code { get; set; } = "";
-    public string Name { get; set; } = "";
-    public string Aliases { get; set; } = "";
-    public bool Active { get; set; } = true;
-
-    // Only SRD / ARE / KRS are operating PalletControl terminals. Other rows are
-    // Linehaul/Mottatt locations owned by one operating terminal.
-    public bool IsOperatingTerminal { get; set; } = true;
-    public int? ScopeTerminalId { get; set; }
-}
-
-public class Transporter
-{
-    public int Id { get; set; }
-    public string Name { get; set; } = "";
-    public bool Active { get; set; } = true;
-    public int TerminalId { get; set; }
-    [JsonIgnore] public List<Vehicle> Vehicles { get; set; } = [];
-}
-
-public class Vehicle
-{
-    public int Id { get; set; }
-    public string VehicleId { get; set; } = "";
-    public bool Active { get; set; } = true;
-    public int TerminalId { get; set; }
-    public string OperatingDays { get; set; } = "1,2,3,4,5";
-    [JsonIgnore] public Terminal? Terminal { get; set; }
-    public int? TransporterId { get; set; }
-    [JsonIgnore] public Transporter? Transporter { get; set; }
-}
-
-public class Holiday
-{
-    public int Id { get; set; }
-    public DateOnly Date { get; set; }
-    public string Name { get; set; } = "";
-}
-
-public class Driver
-{
-    public int Id { get; set; }
-    public string Name { get; set; } = "";
-    public bool Active { get; set; } = true;
-    public int TerminalId { get; set; }
-    [JsonIgnore] public Terminal? Terminal { get; set; }
-}
-
-public class PalletType
-{
-    public int Id { get; set; }
-    public string Name { get; set; } = "";
-    public bool Active { get; set; } = true;
-    public bool UserSelectable { get; set; } = true;
-}
-
-public class PalletReceipt
-{
-    public int Id { get; set; }
-    public string ReceiptNumber { get; set; } = "";
-    public int TerminalId { get; set; }
-    public Terminal? Terminal { get; set; }
-
-    public int? VehicleId { get; set; }
-    [JsonIgnore] public Vehicle? Vehicle { get; set; }
-    public int? DriverId { get; set; }
-    [JsonIgnore] public Driver? Driver { get; set; }
-
-    public string VehicleSnapshot { get; set; } = "";
-    public string DriverSnapshot { get; set; } = "";
-    public string TransporterSnapshot { get; set; } = "";
-
-    public string Direction { get; set; } = "";
-    public DateOnly BusinessDate { get; set; }
-    public DateTime SubmittedAtUtc { get; set; }
-
-    public int SubmittedByUserId { get; set; }
-    public AppUser? SubmittedByUser { get; set; }
-
-    public string IdempotencyKey { get; set; } = "";
-    public string Status { get; set; } = ReceiptStatus.Active;
-    public DateTime? CancelledAtUtc { get; set; }
-    public int? CancelledByUserId { get; set; }
-    public string? CancelReason { get; set; }
-
-    public List<PalletReceiptItem> Items { get; set; } = [];
-    public List<ReceiptAction> Actions { get; set; } = [];
-}
-
-public class PalletReceiptItem
-{
-    public int Id { get; set; }
-    public int PalletReceiptId { get; set; }
-    [JsonIgnore] public PalletReceipt? PalletReceipt { get; set; }
-    public int PalletTypeId { get; set; }
-    public PalletType? PalletType { get; set; }
-    public int Quantity { get; set; }
-}
-
-public class ReceiptAction
-{
-    public int Id { get; set; }
-    public int ReceiptId { get; set; }
-    [JsonIgnore] public PalletReceipt? Receipt { get; set; }
-    public string Action { get; set; } = "";
-    public string Reason { get; set; } = "";
-    public DateTime CreatedAtUtc { get; set; }
-    public int UserId { get; set; }
-    public AppUser? User { get; set; }
-}
-
-public class WarningEvent
-{
-    public int Id { get; set; }
-    public string Type { get; set; } = "";
-    public string Severity { get; set; } = "warning";
-    public string Message { get; set; } = "";
-    public DateTime CreatedAtUtc { get; set; }
-    public int TerminalId { get; set; }
-
-    public int? ReceiptId { get; set; }
-    public PalletReceipt? Receipt { get; set; }
-
-    public int TriggeredByUserId { get; set; }
-    public AppUser? TriggeredByUser { get; set; }
-
-    public DateTime? AcknowledgedAtUtc { get; set; }
-    public int? AcknowledgedByUserId { get; set; }
-    public AppUser? AcknowledgedByUser { get; set; }
-}
-
-public class AuditLog
-{
-    public int Id { get; set; }
-    public int UserId { get; set; }
-    public AppUser? User { get; set; }
-    public string Action { get; set; } = "";
-    public string Details { get; set; } = "";
-    public DateTime CreatedAtUtc { get; set; }
-}
-
-
-public class UserSettingsRecord
-{
-    public int Id { get; set; }
-    public int UserId { get; set; }
-    public string Theme { get; set; } = "normal";
-    public bool ShowMilestoneNotifications { get; set; } = true;
-    public bool ShowLeaderboardNotifications { get; set; } = true;
-    public bool ShowBalanceNotifications { get; set; } = true;
-    [JsonIgnore] public AppUser? User { get; set; }
-}
-
-public class TerminalSettings
-{
-    public int Id { get; set; }
-    public int TerminalId { get; set; }
-    public bool AllowUsersAddDrivers { get; set; } = true;
-    public bool LargeInEnabled { get; set; } = true;
-    public int LargeInThreshold { get; set; } = 20;
-    public bool LargeOutEnabled { get; set; } = true;
-    public int LargeOutThreshold { get; set; } = 20;
-    public bool RecentVehicleEnabled { get; set; } = true;
-    public int RecentVehicleMinutes { get; set; } = 5;
-    public bool RecentDriverEnabled { get; set; } = true;
-    public int RecentDriverMinutes { get; set; } = 5;
-    public bool DuplicateEnabled { get; set; } = true;
-    public int DuplicateMinutes { get; set; } = 5;
-    public bool RapidSubmissionsEnabled { get; set; } = true;
-    public int RapidSubmissionCount { get; set; } = 3;
-    public int RapidSubmissionMinutes { get; set; } = 10;
-    public bool DailyTotalEnabled { get; set; } = true;
-    public int DailyTotalThreshold { get; set; } = 60;
-    public bool CancellationWarningEnabled { get; set; } = true;
-    public bool CancellationReversedWarningEnabled { get; set; } = true;
-    public bool MilestoneNotificationsEnabled { get; set; } = true;
-    public int MonthlyMilestoneStep { get; set; } = 100;
-    public bool LeaderboardNotificationsEnabled { get; set; } = true;
-    public bool BalanceNotificationsEnabled { get; set; } = true;
-    public int DriverUnmatchedInDeduction { get; set; } = 15;
-
-    public static TerminalSettings FromGlobal(int terminalId, AppSettings g) => new()
-    {
-        TerminalId = terminalId,
-        AllowUsersAddDrivers = g.AllowUsersAddDrivers,
-        LargeInEnabled = g.LargeInEnabled, LargeInThreshold = g.LargeInThreshold,
-        LargeOutEnabled = g.LargeOutEnabled, LargeOutThreshold = g.LargeOutThreshold,
-        RecentVehicleEnabled = g.RecentVehicleEnabled, RecentVehicleMinutes = g.RecentVehicleMinutes,
-        RecentDriverEnabled = g.RecentDriverEnabled, RecentDriverMinutes = g.RecentDriverMinutes,
-        DuplicateEnabled = g.DuplicateEnabled, DuplicateMinutes = g.DuplicateMinutes,
-        RapidSubmissionsEnabled = g.RapidSubmissionsEnabled, RapidSubmissionCount = g.RapidSubmissionCount, RapidSubmissionMinutes = g.RapidSubmissionMinutes,
-        DailyTotalEnabled = g.DailyTotalEnabled, DailyTotalThreshold = g.DailyTotalThreshold,
-        CancellationWarningEnabled = g.CancellationWarningEnabled, CancellationReversedWarningEnabled = g.CancellationReversedWarningEnabled,
-        MilestoneNotificationsEnabled = g.MilestoneNotificationsEnabled, MonthlyMilestoneStep = g.MonthlyMilestoneStep,
-        LeaderboardNotificationsEnabled = g.LeaderboardNotificationsEnabled, BalanceNotificationsEnabled = g.BalanceNotificationsEnabled,
-        DriverUnmatchedInDeduction = g.DriverUnmatchedInDeduction
+        Username = username,
+        DisplayName = displayName,
+        Role = Roles.SuperAdmin,
+        TerminalId = primaryTerminal.Id,
+        Active = true,
+        HasInternalPalletAccounting = true,
+        HasLinehaul = true,
+        HasReceivedControl = true,
+        ShowDriverStatisticsTab = true,
+        ShowDailyCheckTab = true
     };
+    admin.PasswordHash = new PasswordHasher<AppUser>().HashPassword(admin, password!);
+    db.Users.Add(admin);
+    db.SaveChanges();
 }
 
-public class LinehaulCommentOption
-{
-    public int Id { get; set; }
-    public int TerminalId { get; set; }
-    public string Text { get; set; } = "";
-    public bool Active { get; set; } = true;
-}
-
-public class LinehaulReceipt
-{
-    public int Id { get; set; }
-    public string ReceiptNumber { get; set; } = "";
-    public int OwnerTerminalId { get; set; }
-    public int FromTerminalId { get; set; }
-    public int ToTerminalId { get; set; }
-    public string FromTerminalSnapshot { get; set; } = "";
-    public string ToTerminalSnapshot { get; set; } = "";
-    public string UnitReference { get; set; } = "";
-    public string PalletReceiptNumber { get; set; } = "";
-    public int PalletCount { get; set; }
-    public string CommentOptionSnapshot { get; set; } = "";
-    public string FreeComment { get; set; } = "";
-    public DateOnly BusinessDate { get; set; }
-    public DateTime SubmittedAtUtc { get; set; }
-    public int SubmittedByUserId { get; set; }
-    public string Status { get; set; } = ReceiptStatus.Active;
-    public DateTime? CancelledAtUtc { get; set; }
-    public int? CancelledByUserId { get; set; }
-    public string? CancelReason { get; set; }
-}
-
-public static class ReceivedControlStatus
-{
-    public const string NoReceipt = "NO_RECEIPT";
-    public const string ReceiptHigher = "RECEIPT_HIGHER";
-    public const string ReceiptLower = "RECEIPT_LOWER";
-    public const string Exact = "EXACT";
-    public static string Resolve(bool received, int? receiptQty, int actualQty)
-    {
-        if (!received) return NoReceipt;
-        if ((receiptQty ?? 0) > actualQty) return ReceiptHigher;
-        if ((receiptQty ?? 0) < actualQty) return ReceiptLower;
-        return Exact;
-    }
-}
-
-public class ReceivedControlEntry
-{
-    public int Id { get; set; }
-    public string ControlNumber { get; set; } = "";
-    public int TerminalId { get; set; }
-    public int FromTerminalId { get; set; }
-    public string FromTerminalSnapshot { get; set; } = "";
-    public string UnitReference { get; set; } = "";
-    public string Comment { get; set; } = "";
-    public bool PalletReceiptReceived { get; set; }
-    public int? ReceiptPalletCount { get; set; }
-    public int ActualPalletCount { get; set; }
-    public string Result { get; set; } = ReceivedControlStatus.NoReceipt;
-    public DateOnly BusinessDate { get; set; }
-    public DateTime SubmittedAtUtc { get; set; }
-    public int SubmittedByUserId { get; set; }
-    public string Status { get; set; } = ReceiptStatus.Active;
-    public DateTime? CancelledAtUtc { get; set; }
-    public int? CancelledByUserId { get; set; }
-    public string? CancelReason { get; set; }
-}
-
-public class ReceivedControlWarning
-{
-    public int Id { get; set; }
-    public int TerminalId { get; set; }
-    public int EntryId { get; set; }
-    public string Message { get; set; } = "";
-    public DateTime CreatedAtUtc { get; set; }
-    public DateTime? AcknowledgedAtUtc { get; set; }
-    public int? AcknowledgedByUserId { get; set; }
-}
-
-public class AppSettings
-{
-    public int Id { get; set; } = 1;
-    public bool AllowUsersAddDrivers { get; set; } = true;
-
-    public bool LargeInEnabled { get; set; } = true;
-    public int LargeInThreshold { get; set; } = 20;
-    public bool LargeOutEnabled { get; set; } = true;
-    public int LargeOutThreshold { get; set; } = 20;
-
-    public bool RecentVehicleEnabled { get; set; } = true;
-    public int RecentVehicleMinutes { get; set; } = 5;
-    public bool RecentDriverEnabled { get; set; } = true;
-    public int RecentDriverMinutes { get; set; } = 5;
-
-    public bool DuplicateEnabled { get; set; } = true;
-    public int DuplicateMinutes { get; set; } = 5;
-
-    public bool RapidSubmissionsEnabled { get; set; } = true;
-    public int RapidSubmissionCount { get; set; } = 3;
-    public int RapidSubmissionMinutes { get; set; } = 10;
-
-    public bool DailyTotalEnabled { get; set; } = true;
-    public int DailyTotalThreshold { get; set; } = 60;
-
-    public bool CancellationWarningEnabled { get; set; } = true;
-    public bool CancellationReversedWarningEnabled { get; set; } = true;
-
-    public bool MilestoneNotificationsEnabled { get; set; } = true;
-    public int MonthlyMilestoneStep { get; set; } = 100;
-    public bool LeaderboardNotificationsEnabled { get; set; } = true;
-    public bool BalanceNotificationsEnabled { get; set; } = true;
-
-    // Driver statistics adjustment: every unmatched IN receipt deducts this many pallets.
-    public int DriverUnmatchedInDeduction { get; set; } = 15;
-}
-
-public class VehicleComplianceRow
-{
-    public DateOnly Date { get; set; }
-    public int VehicleId { get; set; }
-    public string Vehicle { get; set; } = "";
-    public string Transporter { get; set; } = "";
-    public List<int> InDriverIds { get; set; } = [];
-    public List<int> OutDriverIds { get; set; } = [];
-    public List<string> InDrivers { get; set; } = [];
-    public List<string> OutDrivers { get; set; } = [];
-    public bool HasIn { get; set; }
-    public bool HasOut { get; set; }
-    public bool Complete { get; set; }
-    public bool IsToday { get; set; }
-    public string Status { get; set; } = "";
-}
-
-public class StatisticsRow
-{
-    public string Transporter { get; set; } = "";
-    public string Vehicle { get; set; } = "";
-    public string PalletType { get; set; } = "";
-    public int InQty { get; set; }
-    public int OutQty { get; set; }
-    public int Balance { get; set; }
-    public int Movement { get; set; }
-}
-
-public class DriverStatisticsRow
-{
-    public int DriverId { get; set; }
-    public string Driver { get; set; } = "";
-    public string Vehicles { get; set; } = "";
-    public int InReceipts { get; set; }
-    public int OutReceipts { get; set; }
-    public int UnmatchedInReceipts { get; set; }
-    public int InQty { get; set; }
-    public int OutQty { get; set; }
-    public int RawBalance { get; set; }
-    public int Deduction { get; set; }
-    public int AdjustedBalance { get; set; }
-    public int Movement { get; set; }
-}
-
-public class DriverAdjustmentDetail
-{
-    public int DriverId { get; set; }
-    public string Driver { get; set; } = "";
-    public string Vehicle { get; set; } = "";
-    public DateOnly Date { get; set; }
-    public int InReceipts { get; set; }
-    public int OutReceipts { get; set; }
-    public int UnmatchedInReceipts { get; set; }
-    public int Deduction { get; set; }
-}
-
-public class DriverLeaderboardRow
-{
-    public int Rank { get; set; }
-    public int DriverId { get; set; }
-    public string Driver { get; set; } = "";
-    public string Vehicle { get; set; } = "";
-    public int InQty { get; set; }
-    public int OutQty { get; set; }
-    public int Balance { get; set; }
-    public int Movement { get; set; }
-}
-
-public record SubmissionWarningDto(string Type, string Severity, string Message);
-public record ReceiptValidation(string? Error, Vehicle? Vehicle, Driver? Driver, List<ReceiptItemRequest> PositiveItems)
-{
-    public static ReceiptValidation Fail(string error) => new(error, null, null, []);
-}
-
-public record LoginRequest(string Username, string Password);
-public record LoginResponse(string Token, string Username, string DisplayName, string Role, int TerminalId, string TerminalCode, bool ShowDriverStatisticsTab, bool ShowDailyCheckTab, bool HasInternalPalletAccounting, bool HasLinehaul, bool HasReceivedControl, string Theme, string ViewerScopeLabel);
-public record QuickDriverRequest(string Name);
-public record ReceiptItemRequest(int PalletTypeId, int Quantity);
-public record CreateReceiptRequest(string IdempotencyKey, int VehicleId, int DriverId, string Direction, List<ReceiptItemRequest> Items, bool ConfirmWarnings = false, DateOnly? BusinessDate = null);
-public record CancelRequest(string Reason);
-public record ReverseCancellationRequest(string? Reason);
-public record UserPreferenceRequest(bool ShowMilestoneNotifications, bool ShowLeaderboardNotifications, bool ShowBalanceNotifications, string Theme);
-public record SelfPasswordRequest(string CurrentPassword, string NewPassword);
-
-public record AdminTransporterRequest(string Name, int? TerminalId = null);
-public record AdminVehicleRequest(string VehicleId, int TerminalId, int TransporterId);
-public record VehicleTransporterRequest(int TransporterId);
-public record VehicleScheduleRequest(List<int>? Days);
-public record AdminHolidayRequest(DateOnly Date, string? Name);
-public record AdminDriverRequest(string Name, int TerminalId);
-public record AdminPalletTypeRequest(string Name, bool UserSelectable);
-public record AdminPalletTypeUpdate(bool Active, bool UserSelectable);
-public record AdminUserRequest(string Username, string DisplayName, string Password, string Role, int TerminalId, bool HasInternalPalletAccounting, bool HasLinehaul, bool HasReceivedControl, bool ShowDriverStatisticsTab = true, bool ShowDailyCheckTab = true, List<int>? ViewerTransporterIds = null);
-public record AdminUserUpdateRequest(string DisplayName, string Role, int TerminalId, bool Active, bool HasInternalPalletAccounting, bool HasLinehaul, bool HasReceivedControl, bool ShowDriverStatisticsTab = true, bool ShowDailyCheckTab = true, List<int>? ViewerTransporterIds = null);
-public record AdminPasswordRequest(string Password);
-public record AdminTabAccessRequest(bool ShowDriverStatisticsTab, bool ShowDailyCheckTab);
-public record AdminActiveRequest(bool Active);
-public record AdminSettingsRequest(
-    bool AllowUsersAddDrivers,
-    bool LargeInEnabled,
-    int LargeInThreshold,
-    bool LargeOutEnabled,
-    int LargeOutThreshold,
-    bool RecentVehicleEnabled,
-    int RecentVehicleMinutes,
-    bool RecentDriverEnabled,
-    int RecentDriverMinutes,
-    bool DuplicateEnabled,
-    int DuplicateMinutes,
-    bool RapidSubmissionsEnabled,
-    int RapidSubmissionCount,
-    int RapidSubmissionMinutes,
-    bool DailyTotalEnabled,
-    int DailyTotalThreshold,
-    bool CancellationWarningEnabled,
-    bool CancellationReversedWarningEnabled,
-    bool MilestoneNotificationsEnabled,
-    int MonthlyMilestoneStep,
-    bool LeaderboardNotificationsEnabled,
-    bool BalanceNotificationsEnabled,
-    int? DriverUnmatchedInDeduction);
-
-
-public record AdminTerminalRequest(string? Code, string? Name, string? Aliases);
-public record AdminTerminalUpdateRequest(string? Code, string? Name, string? Aliases, bool Active);
-public record AdminLinehaulLocationRequest(int? TerminalId, string? Code, string? Name, string? Aliases);
-public record AdminLinehaulLocationUpdateRequest(string? Code, string? Name, string? Aliases, bool Active);
-public record AdminLinehaulCommentRequest(int? TerminalId, string? Text);
-public record CreateLinehaulReceiptRequest(string? UnitReference, string? PalletReceiptNumber, int PalletCount, int FromTerminalId, int ToTerminalId, int? CommentOptionId, string? FreeComment, DateOnly? BusinessDate);
-public record CreateReceivedControlRequest(int FromTerminalId, string? UnitReference, string? Comment, bool PalletReceiptReceived, int? ReceiptPalletCount, int ActualPalletCount, DateOnly? BusinessDate);
-public sealed record ImportIssue(int Row, string Message);
-public sealed record ImportDataRow(int RowNumber, Dictionary<string, string> Values);
-public sealed record ImportGrid(List<string> Headers, List<ImportDataRow> Rows);
-public sealed record PendingLinehaulImport(int RowNumber, DateOnly BusinessDate, string UnitReference, string PalletReceiptNumber, int PalletCount, int FromTerminalId, int ToTerminalId, string FromTerminalCode, string ToTerminalCode, string StandardComment, string FreeComment, string DuplicateKey);
-public sealed record PendingReceivedControlImport(int RowNumber, DateOnly BusinessDate, int FromTerminalId, string FromTerminalCode, string UnitReference, bool PalletReceiptReceived, int? ReceiptPalletCount, int ActualPalletCount, string Comment, string DuplicateKey);
 
 public partial class Program { }

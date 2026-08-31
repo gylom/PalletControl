@@ -58,7 +58,40 @@ header b {
 
 .userline {
     font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
 }
+
+.superAdminTerminalSwitch {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 7px;
+    border: 1px solid #475569;
+    border-radius: 8px;
+    background: #0f172a;
+}
+
+.superAdminTerminalSwitch > span:first-child {
+    color: #cbd5e1;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+}
+
+.superAdminTerminalSwitch select {
+    min-width: 68px;
+    padding: 3px 26px 3px 7px;
+    border: 1px solid #64748b;
+    border-radius: 6px;
+    background: #fff;
+    color: #111827;
+    font-weight: 700;
+}
+
+.terminalSwitchBusy { color: #cbd5e1; }
+.terminalSwitchError { color: #fca5a5; font-weight: 800; }
 
 .linkbtn {
     background: none;
@@ -155,13 +188,6 @@ h2 {
 
 .login label {
     margin: 14px 0;
-}
-
-.demo {
-    font-size: 12px;
-    color: #64748b;
-    margin-top: 14px;
-    text-align: center;
 }
 
 /* FORM ELEMENTS */
@@ -754,6 +780,12 @@ This avoids the old issue where KRS/SRD took almost the entire width.
 
     .userline {
         text-align: right;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+    }
+
+    .superAdminTerminalSwitch > span:first-child {
+        display: none;
     }
 
     nav {
@@ -2081,4 +2113,54 @@ html body .buildFooter {
 @media (max-width: 800px) {
     .passwordChangeGrid { grid-template-columns: 1fr; }
     .viewerScopeHead { flex-direction: column; }
+}
+
+/* v5.9.0 SuperAdmin system monitoring */
+.systemMonitoring{display:grid;gap:16px}
+.systemMonitoringTop{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;padding:4px 2px}
+.systemMonitoringTop h2{margin:0 0 4px}
+.systemMonitoringActions{display:flex;gap:8px;flex-wrap:wrap}
+.systemMetricGrid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.systemMetric{background:var(--card,#fff);border:1px solid var(--border,#dfe4ea);border-radius:14px;padding:14px;display:flex;flex-direction:column;gap:6px;min-width:0}
+.systemMetric small{color:var(--muted,#6b7280);font-size:12px}
+.systemMetric strong{font-size:21px;line-height:1.15;overflow-wrap:anywhere}
+.systemMetric.good{box-shadow:inset 0 3px 0 rgba(28,151,90,.45)}
+.systemMetric.bad{box-shadow:inset 0 3px 0 rgba(204,55,55,.55)}
+.systemGraphs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.systemGraph{padding:14px;min-height:180px}
+.systemGraphHead{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:8px}
+.systemGraphHead>div{display:flex;flex-direction:column;gap:2px}
+.systemGraphHead small{color:var(--muted,#6b7280)}
+.systemGraphHead strong{font-size:20px}
+.systemGraph svg{width:100%;height:120px;display:block;overflow:visible;border-bottom:1px solid var(--border,#dfe4ea)}
+.systemGraph polyline{stroke:currentColor;stroke-width:2}
+.systemDetailColumns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.systemDetailGrid{grid-template-columns:repeat(2,minmax(0,1fr))}
+.pathValue{font-size:12px;overflow-wrap:anywhere;word-break:break-word}
+.systemEndpointTable{display:grid;gap:0;border:1px solid var(--border,#dfe4ea);border-radius:12px;overflow:hidden}
+.systemEndpointHeader,.systemEndpointRow{display:grid;grid-template-columns:minmax(260px,2.5fr) repeat(4,minmax(80px,.7fr));gap:12px;align-items:center;padding:10px 12px}
+.systemEndpointHeader{font-weight:700;background:rgba(127,127,127,.08)}
+.systemEndpointRow{border-top:1px solid var(--border,#dfe4ea)}
+.systemEndpointRow code{overflow-wrap:anywhere;white-space:normal}
+.systemErrorList{display:grid;gap:8px}
+.systemErrorRow{display:grid;grid-template-columns:170px minmax(160px,.8fr) minmax(260px,2fr);gap:12px;align-items:start;padding:10px;border:1px solid var(--border,#dfe4ea);border-radius:10px}
+.systemErrorRow code,.systemErrorRow b{overflow-wrap:anywhere;white-space:normal}
+@media (max-width:1100px){.systemMetricGrid{grid-template-columns:repeat(2,minmax(0,1fr))}.systemDetailColumns{grid-template-columns:1fr}.systemEndpointHeader,.systemEndpointRow{grid-template-columns:minmax(220px,2fr) repeat(4,minmax(70px,.7fr))}}
+@media (max-width:760px){.systemMonitoringTop{flex-direction:column}.systemMetricGrid,.systemGraphs{grid-template-columns:1fr}.systemDetailGrid{grid-template-columns:1fr}.systemEndpointTable{overflow-x:auto}.systemEndpointHeader,.systemEndpointRow{min-width:720px}.systemErrorRow{grid-template-columns:1fr}}
+
+
+.superAdminManageTerminal {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 16px;
+}
+
+.superAdminManageTerminal p { margin: 4px 0 0; }
+.superAdminManageTerminal select { min-width: 220px; }
+
+@media (max-width: 720px) {
+  .superAdminManageTerminal { align-items: stretch; flex-direction: column; }
+  .superAdminManageTerminal select { width: 100%; min-width: 0; }
 }

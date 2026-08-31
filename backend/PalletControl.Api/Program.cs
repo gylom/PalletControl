@@ -47,12 +47,6 @@ using (var scope = app.Services.CreateScope())
     EnsureUserSettingsRows(db);
 }
 
-app.MapGet("/", () => Results.Ok(new
-{
-    name = "Pallet Control API",
-    status = "running",
-    version = BuildVersion
-}));
 
 app.MapGet("/api/version", () => Results.Ok(new
 {

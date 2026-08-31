@@ -141,9 +141,10 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
                 identity.AddClaim(new Claim(ClaimTypes.Role, currentUser.Role));
                 identity.AddClaim(new Claim("terminalId", currentUser.TerminalId.ToString(CultureInfo.InvariantCulture)));
                 identity.AddClaim(new Claim("terminalCode", currentUser.Terminal?.Code ?? ""));
-                identity.AddClaim(new Claim("moduleInternal", currentUser.HasInternalPalletAccounting ? "1" : "0"));
-                identity.AddClaim(new Claim("moduleLinehaul", currentUser.HasLinehaul ? "1" : "0"));
-                identity.AddClaim(new Claim("moduleReceivedControl", currentUser.HasReceivedControl ? "1" : "0"));
+                var currentIsViewer = currentUser.Role == Roles.Viewer;
+                identity.AddClaim(new Claim("moduleInternal", currentIsViewer || currentUser.HasInternalPalletAccounting ? "1" : "0"));
+                identity.AddClaim(new Claim("moduleLinehaul", !currentIsViewer && currentUser.HasLinehaul ? "1" : "0"));
+                identity.AddClaim(new Claim("moduleReceivedControl", !currentIsViewer && currentUser.HasReceivedControl ? "1" : "0"));
             }
         };
     });
@@ -151,6 +152,9 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 builder.Services.AddAuthorization(options =>
 {
     options.AddPolicy("InternalModule", policy => policy.RequireClaim("moduleInternal", "1"));
+    options.AddPolicy("InternalWrite", policy => policy.RequireAssertion(ctx =>
+        ctx.User.FindFirstValue("moduleInternal") == "1" &&
+        !ctx.User.IsInRole(Roles.Viewer)));
     options.AddPolicy("InternalElevated", policy => policy.RequireAssertion(ctx =>
         ctx.User.FindFirstValue("moduleInternal") == "1" &&
         (ctx.User.IsInRole(Roles.SuperAdmin) || ctx.User.IsInRole(Roles.Admin) || ctx.User.IsInRole(Roles.LegacyTerminalAdmin) || ctx.User.IsInRole(Roles.Superuser))));
@@ -184,7 +188,7 @@ app.MapGet("/", () => Results.Ok(new
 {
     name = "Pallet Control API",
     status = "running",
-    version = "5.8.7"
+    version = "5.8.11"
 }));
 
 // Public health endpoint. This performs a real SQLite connection, real table read,
@@ -290,9 +294,9 @@ app.MapPost("/api/auth/login", async (LoginRequest req, AppDbContext db) =>
         new(ClaimTypes.Role, user.Role),
         new("terminalId", user.TerminalId.ToString()),
         new("terminalCode", user.Terminal?.Code ?? ""),
-        new("moduleInternal", user.HasInternalPalletAccounting ? "1" : "0"),
-        new("moduleLinehaul", user.HasLinehaul ? "1" : "0"),
-        new("moduleReceivedControl", user.HasReceivedControl ? "1" : "0")
+        new("moduleInternal", user.Role == Roles.Viewer || user.HasInternalPalletAccounting ? "1" : "0"),
+        new("moduleLinehaul", user.Role != Roles.Viewer && user.HasLinehaul ? "1" : "0"),
+        new("moduleReceivedControl", user.Role != Roles.Viewer && user.HasReceivedControl ? "1" : "0")
     };
 
     var creds = new SigningCredentials(
@@ -307,6 +311,7 @@ app.MapPost("/api/auth/login", async (LoginRequest req, AppDbContext db) =>
         signingCredentials: creds);
 
     var userSettings = await GetUserSettings(db, user.Id);
+    var viewerScopeLabel = await GetViewerScopeLabel(db, user);
     return Results.Ok(new LoginResponse(
         new JwtSecurityTokenHandler().WriteToken(token),
         user.Username,
@@ -316,10 +321,11 @@ app.MapPost("/api/auth/login", async (LoginRequest req, AppDbContext db) =>
         user.Terminal?.Code ?? "",
         user.ShowDriverStatisticsTab,
         user.ShowDailyCheckTab,
-        user.HasInternalPalletAccounting,
-        user.HasLinehaul,
-        user.HasReceivedControl,
-        userSettings.Theme));
+        user.Role == Roles.Viewer || user.HasInternalPalletAccounting,
+        user.Role != Roles.Viewer && user.HasLinehaul,
+        user.Role != Roles.Viewer && user.HasReceivedControl,
+        userSettings.Theme,
+        viewerScopeLabel));
 });
 
 app.MapGet("/api/me", async (ClaimsPrincipal principal, AppDbContext db) =>
@@ -327,6 +333,7 @@ app.MapGet("/api/me", async (ClaimsPrincipal principal, AppDbContext db) =>
     var id = UserId(principal);
     var user = await db.Users.Include(x => x.Terminal).SingleAsync(x => x.Id == id);
     var userSettings = await GetUserSettings(db, id);
+    var viewerScopeLabel = await GetViewerScopeLabel(db, user);
     return Results.Ok(new
     {
         user.Id,
@@ -337,10 +344,11 @@ app.MapGet("/api/me", async (ClaimsPrincipal principal, AppDbContext db) =>
         terminalCode = user.Terminal?.Code ?? "",
         user.ShowDriverStatisticsTab,
         user.ShowDailyCheckTab,
-        user.HasInternalPalletAccounting,
-        user.HasLinehaul,
-        user.HasReceivedControl,
-        theme = userSettings.Theme
+        hasInternalPalletAccounting = user.Role == Roles.Viewer || user.HasInternalPalletAccounting,
+        hasLinehaul = user.Role != Roles.Viewer && user.HasLinehaul,
+        hasReceivedControl = user.Role != Roles.Viewer && user.HasReceivedControl,
+        theme = userSettings.Theme,
+        viewerScopeLabel
     });
 }).RequireAuthorization();
 
@@ -395,6 +403,34 @@ app.MapPut("/api/me/settings", async (
     });
 }).RequireAuthorization();
 
+app.MapPut("/api/me/password", async (
+    SelfPasswordRequest req,
+    ClaimsPrincipal principal,
+    AppDbContext db) =>
+{
+    var user = await db.Users.FindAsync(UserId(principal));
+    if (user is null) return Results.NotFound();
+
+    var selfPasswordRole = Role(principal);
+    if (selfPasswordRole != Roles.User && selfPasswordRole != Roles.Superuser)
+        return Results.Forbid();
+
+    if (string.IsNullOrWhiteSpace(req.CurrentPassword))
+        return Results.BadRequest(new { message = "Current password is required." });
+    if (string.IsNullOrWhiteSpace(req.NewPassword) || req.NewPassword.Length < 6)
+        return Results.BadRequest(new { message = "New password must be at least 6 characters." });
+
+    var hasher = new PasswordHasher<AppUser>();
+    var verification = hasher.VerifyHashedPassword(user, user.PasswordHash, req.CurrentPassword);
+    if (verification == PasswordVerificationResult.Failed)
+        return Results.BadRequest(new { message = "Current password is incorrect." });
+
+    user.PasswordHash = hasher.HashPassword(user, req.NewPassword);
+    await db.SaveChangesAsync();
+    await Audit(db, principal, "SELF_PASSWORD_CHANGE", $"User {user.Username} changed their own password");
+    return Results.Ok(new { message = "Password changed." });
+}).RequireAuthorization();
+
 app.MapGet("/api/setup/register", async (ClaimsPrincipal principal, AppDbContext db) =>
 {
     var terminalId = TerminalId(principal);
@@ -436,7 +472,7 @@ app.MapGet("/api/setup/register", async (ClaimsPrincipal principal, AppDbContext
         palletTypes,
         settings.AllowUsersAddDrivers
     });
-}).RequireAuthorization("InternalModule");
+}).RequireAuthorization("InternalWrite");
 
 app.MapGet("/api/drivers/for-vehicle/{vehicleId:int}", async (
     int vehicleId,
@@ -473,7 +509,7 @@ app.MapGet("/api/drivers/for-vehicle/{vehicleId:int}", async (
         .ToList();
 
     return Results.Ok(sorted);
-}).RequireAuthorization("InternalModule");
+}).RequireAuthorization("InternalWrite");
 
 app.MapPost("/api/drivers/quick-add", async (
     QuickDriverRequest req,
@@ -509,7 +545,7 @@ app.MapPost("/api/drivers/quick-add", async (
     await db.SaveChangesAsync();
     await Audit(db, principal, "DRIVER_QUICK_ADD", $"Added driver {driver.Name}");
     return Results.Ok(new { driver.Id, driver.Name });
-}).RequireAuthorization("InternalModule");
+}).RequireAuthorization("InternalWrite");
 
 app.MapPost("/api/receipts/check", async (
     CreateReceiptRequest req,
@@ -528,7 +564,7 @@ app.MapPost("/api/receipts/check", async (
         db);
 
     return Results.Ok(new { warnings });
-}).RequireAuthorization("InternalModule");
+}).RequireAuthorization("InternalWrite");
 
 app.MapPost("/api/receipts", async (
     CreateReceiptRequest req,
@@ -658,10 +694,12 @@ app.MapPost("/api/receipts", async (
         warnings,
         notifications = submitNotifications
     });
-}).RequireAuthorization("InternalModule");
+}).RequireAuthorization("InternalWrite");
 
 app.MapGet("/api/receipts", async (
     DateOnly? date,
+    DateOnly? from,
+    DateOnly? to,
     int? limit,
     string? sort,
     string? status,
@@ -671,20 +709,28 @@ app.MapGet("/api/receipts", async (
 {
     var role = Role(principal);
     var terminalId = TerminalId(principal);
+    var userId = UserId(principal);
     var isRegularUser = role == Roles.User;
+    var isViewer = role == Roles.Viewer;
+    var canFilter = !isRegularUser;
 
-    // Regular users always see the latest 25 receipts for their terminal,
-    // regardless of date/limit/sort query parameters sent by the browser.
-    // Admins and Superusers keep the selected-date + 25/50/All controls.
-    var selectedDate = isRegularUser
-        ? (DateOnly?)null
-        : date ?? DateOnly.FromDateTime(DateTime.Today);
+    // Backward compatibility: an older frontend may still send ?date=YYYY-MM-DD.
+    if (date.HasValue && !from.HasValue && !to.HasValue)
+    {
+        from = date;
+        to = date;
+    }
 
+    if (from.HasValue && to.HasValue && to.Value < from.Value)
+        return Results.BadRequest(new { message = "To date cannot be before From date." });
+
+    // Always open on only the latest 10 receipts. Admin/Superuser/Viewer/SuperAdmin
+    // may then widen the result set or apply a date range.
     var effectiveLimit = isRegularUser
-        ? 25
+        ? 10
         : limit switch
         {
-            null => 25,
+            null => 10,
             <= 0 => 0,
             > 5000 => 5000,
             _ => limit.Value
@@ -692,21 +738,34 @@ app.MapGet("/api/receipts", async (
 
     IQueryable<PalletReceipt> query = db.Receipts
         .AsNoTracking()
+        .Include(x => x.Vehicle)
+        .Include(x => x.Terminal)
         .Include(x => x.Items).ThenInclude(x => x.PalletType)
         .Include(x => x.Actions).ThenInclude(x => x.User);
 
-    // Operational data is always isolated by the user's currently assigned terminal.
-    query = query.Where(x => x.TerminalId == terminalId);
-
-    if (isRegularUser)
+    // Viewer is scoped by explicitly assigned transporters and may span terminals.
+    // Every other role remains isolated to its currently selected operating terminal.
+    if (isViewer)
     {
-        query = query
-            .OrderByDescending(x => x.SubmittedAtUtc)
-            .Take(25);
+        var allowedTransporterIds = await GetViewerTransporterIds(db, userId);
+        query = allowedTransporterIds.Count == 0
+            ? query.Where(_ => false)
+            : query.Where(x =>
+                x.Vehicle != null &&
+                x.Vehicle.TransporterId != null &&
+                allowedTransporterIds.Contains(x.Vehicle.TransporterId.Value));
     }
     else
     {
-        query = query.Where(x => x.BusinessDate == selectedDate!.Value);
+        query = query.Where(x => x.TerminalId == terminalId);
+    }
+
+    if (canFilter)
+    {
+        if (from.HasValue)
+            query = query.Where(x => x.BusinessDate >= from.Value);
+        if (to.HasValue)
+            query = query.Where(x => x.BusinessDate <= to.Value);
 
         var statusFilter = (status ?? "all").Trim().ToLowerInvariant();
         query = statusFilter switch
@@ -717,9 +776,6 @@ app.MapGet("/api/receipts", async (
             _ => query
         };
 
-        // Receipt search is intentionally available only to Admin/Superuser.
-        // Search happens before the 25/50 limit so matches are not hidden simply
-        // because they are outside the first page of the selected date.
         var searchTerm = (search ?? "").Trim();
         if (searchTerm.Length > 0)
         {
@@ -757,15 +813,23 @@ app.MapGet("/api/receipts", async (
         if (effectiveLimit > 0)
             query = query.Take(effectiveLimit);
     }
+    else
+    {
+        query = query
+            .OrderByDescending(x => x.SubmittedAtUtc)
+            .Take(10);
+    }
 
     var receipts = await query.ToListAsync();
     return Results.Ok(new
     {
-        date = selectedDate,
+        from,
+        to,
         limit = effectiveLimit == 0 ? "all" : effectiveLimit.ToString(CultureInfo.InvariantCulture),
         receipts = receipts.Select(ToReceiptDto).ToList()
     });
 }).RequireAuthorization("InternalModule");
+
 
 app.MapPost("/api/receipts/{id:int}/cancel", async (
     int id,
@@ -891,21 +955,56 @@ app.MapPost("/api/receipts/{id:int}/reverse-cancellation", async (
 app.MapGet("/api/statistics/options", async (ClaimsPrincipal principal, AppDbContext db) =>
 {
     var terminalId = TerminalId(principal);
+    var role = Role(principal);
+    var isViewer = role == Roles.Viewer;
+    var viewerTransporterIds = isViewer
+        ? await GetViewerTransporterIds(db, UserId(principal))
+        : [];
 
-    var vehicleQuery = db.Vehicles
+    IQueryable<Vehicle> vehicleQuery = db.Vehicles
         .AsNoTracking()
-        .Where(x => x.Active && x.TransporterId != null && x.TerminalId == terminalId)
-        .Include(x => x.Transporter)
-        .AsQueryable();
+        .Where(x => x.Active && x.TransporterId != null)
+        .Include(x => x.Transporter);
+
+    IQueryable<Driver> driverQuery = db.Drivers
+        .AsNoTracking();
+
+    if (isViewer)
+    {
+        vehicleQuery = viewerTransporterIds.Count == 0
+            ? vehicleQuery.Where(_ => false)
+            : vehicleQuery.Where(x =>
+                x.TransporterId != null &&
+                viewerTransporterIds.Contains(x.TransporterId.Value));
+
+        // Viewer must not learn unrelated driver names merely because they share a terminal.
+        // Only expose drivers that actually occur on receipts for an assigned transporter.
+        var viewerDriverIds = viewerTransporterIds.Count == 0
+            ? []
+            : await db.Receipts
+                .AsNoTracking()
+                .Where(r =>
+                    r.DriverId != null &&
+                    r.Vehicle != null &&
+                    r.Vehicle.TransporterId != null &&
+                    viewerTransporterIds.Contains(r.Vehicle.TransporterId.Value))
+                .Select(r => r.DriverId!.Value)
+                .Distinct()
+                .ToListAsync();
+
+        driverQuery = viewerDriverIds.Count == 0
+            ? driverQuery.Where(_ => false)
+            : driverQuery.Where(x => viewerDriverIds.Contains(x.Id));
+    }
+    else
+    {
+        vehicleQuery = vehicleQuery.Where(x => x.TerminalId == terminalId);
+        driverQuery = driverQuery.Where(x => x.TerminalId == terminalId);
+    }
 
     // Statistics keep inactive/removed driver names available so historical receipts
     // can still be filtered after an Admin removes a name from future registration.
-    var driverQuery = db.Drivers
-        .AsNoTracking()
-        .Where(x => x.TerminalId == terminalId)
-        .AsQueryable();
-
-    var transporterIdsForTerminal = await vehicleQuery
+    var transporterIdsForScope = await vehicleQuery
         .Where(x => x.TransporterId != null)
         .Select(x => x.TransporterId!.Value)
         .Distinct()
@@ -913,11 +1012,23 @@ app.MapGet("/api/statistics/options", async (ClaimsPrincipal principal, AppDbCon
 
     var transporterQuery = db.Transporters
         .AsNoTracking()
-        .Where(x => x.Active && transporterIdsForTerminal.Contains(x.Id));
+        .Where(x => x.Active && transporterIdsForScope.Contains(x.Id));
+
+    if (isViewer)
+        transporterQuery = transporterQuery.Where(x => viewerTransporterIds.Contains(x.Id));
 
     var transporters = await transporterQuery
-        .OrderBy(x => x.Name)
-        .Select(x => new { x.Id, x.Name })
+        .Join(db.Terminals.AsNoTracking(), t => t.TerminalId, terminal => terminal.Id,
+            (t, terminal) => new
+            {
+                t.Id,
+                t.Name,
+                t.TerminalId,
+                terminalCode = terminal.Code,
+                label = terminal.Code + " · " + t.Name
+            })
+        .OrderBy(x => x.terminalCode)
+        .ThenBy(x => x.Name)
         .ToListAsync();
 
     var vehicles = await vehicleQuery
@@ -927,13 +1038,14 @@ app.MapGet("/api/statistics/options", async (ClaimsPrincipal principal, AppDbCon
             x.Id,
             x.VehicleId,
             x.TransporterId,
+            x.TerminalId,
             transporter = x.Transporter != null ? x.Transporter.Name : "Not assigned"
         })
         .ToListAsync();
 
     var drivers = await driverQuery
         .OrderBy(x => x.Name)
-        .Select(x => new { x.Id, name = x.Active ? x.Name : x.Name + " (removed)", rawName = x.Name, x.Active })
+        .Select(x => new { x.Id, name = x.Active ? x.Name : x.Name + " (removed)", rawName = x.Name, x.Active, x.TerminalId })
         .ToListAsync();
 
     var palletTypes = await db.PalletTypes.AsNoTracking()
@@ -944,6 +1056,7 @@ app.MapGet("/api/statistics/options", async (ClaimsPrincipal principal, AppDbCon
 
     return Results.Ok(new { transporters, vehicles, drivers, palletTypes });
 }).RequireAuthorization("InternalModule");
+
 
 app.MapGet("/api/statistics", async (
     DateOnly? from,
@@ -966,6 +1079,10 @@ app.MapGet("/api/statistics", async (
     var selectedVehicleIds = ParseIds(vehicleIds);
     var selectedDriverIds = ParseIds(driverIds);
     var terminalId = TerminalId(principal);
+    var isViewer = Role(principal) == Roles.Viewer;
+    var viewerTransporterIds = isViewer
+        ? await GetViewerTransporterIds(db, UserId(principal))
+        : [];
 
     var query = db.Receipts
         .AsNoTracking()
@@ -977,7 +1094,14 @@ app.MapGet("/api/statistics", async (
             r.BusinessDate >= from.Value &&
             r.BusinessDate <= to.Value);
 
-    query = query.Where(r => r.TerminalId == terminalId);
+    query = isViewer
+        ? (viewerTransporterIds.Count == 0
+            ? query.Where(_ => false)
+            : query.Where(r =>
+                r.Vehicle != null &&
+                r.Vehicle.TransporterId != null &&
+                viewerTransporterIds.Contains(r.Vehicle.TransporterId.Value)))
+        : query.Where(r => r.TerminalId == terminalId);
 
     if (selectedTransporterIds.Count > 0)
         query = query.Where(r => r.Vehicle != null && r.Vehicle.TransporterId != null &&
@@ -1091,6 +1215,10 @@ app.MapGet("/api/statistics/drivers", async (
         return Results.BadRequest(new { message = "To date cannot be before From date." });
 
     var terminalId = TerminalId(principal);
+    var isViewer = Role(principal) == Roles.Viewer;
+    var viewerTransporterIds = isViewer
+        ? await GetViewerTransporterIds(db, currentUserId)
+        : [];
     var selectedTransporterIds = ParseIds(transporterIds);
     var selectedVehicleIds = ParseIds(vehicleIds);
     var selectedDriverIds = ParseIds(driverIds);
@@ -1104,10 +1232,18 @@ app.MapGet("/api/statistics/drivers", async (
         .Include(r => r.Items).ThenInclude(i => i.PalletType)
         .Where(r =>
             r.Status == ReceiptStatus.Active &&
-            r.TerminalId == terminalId &&
             r.BusinessDate >= from.Value &&
             r.BusinessDate <= to.Value &&
             r.DriverSnapshot != "");
+
+    receiptQuery = isViewer
+        ? (viewerTransporterIds.Count == 0
+            ? receiptQuery.Where(_ => false)
+            : receiptQuery.Where(r =>
+                r.Vehicle != null &&
+                r.Vehicle.TransporterId != null &&
+                viewerTransporterIds.Contains(r.Vehicle.TransporterId.Value)))
+        : receiptQuery.Where(r => r.TerminalId == terminalId);
 
     if (selectedTransporterIds.Count > 0)
         receiptQuery = receiptQuery.Where(r => r.Vehicle != null && r.Vehicle.TransporterId != null &&
@@ -1280,6 +1416,10 @@ app.MapGet("/api/compliance", async (
     }
 
     var terminalId = TerminalId(principal);
+    var isViewer = Role(principal) == Roles.Viewer;
+    var viewerTransporterIds = isViewer
+        ? await GetViewerTransporterIds(db, currentUserId)
+        : [];
     var selectedTransporterIds = ParseIds(transporterIds);
     var selectedVehicleIds = ParseIds(vehicleIds);
     var selectedDriverIds = ParseIds(driverIds);
@@ -1287,7 +1427,15 @@ app.MapGet("/api/compliance", async (
     var vehicleQuery = db.Vehicles
         .AsNoTracking()
         .Include(x => x.Transporter)
-        .Where(x => x.Active && x.TerminalId == terminalId);
+        .Where(x => x.Active);
+
+    vehicleQuery = isViewer
+        ? (viewerTransporterIds.Count == 0
+            ? vehicleQuery.Where(_ => false)
+            : vehicleQuery.Where(x =>
+                x.TransporterId != null &&
+                viewerTransporterIds.Contains(x.TransporterId.Value)))
+        : vehicleQuery.Where(x => x.TerminalId == terminalId);
 
     if (selectedTransporterIds.Count > 0)
         vehicleQuery = vehicleQuery.Where(x => x.TransporterId != null && selectedTransporterIds.Contains(x.TransporterId.Value));
@@ -1312,7 +1460,6 @@ app.MapGet("/api/compliance", async (
         .AsNoTracking()
         .Where(x =>
             x.Status == ReceiptStatus.Active &&
-            x.TerminalId == terminalId &&
             x.VehicleId != null &&
             selectedVehicleIdSet.Contains(x.VehicleId.Value) &&
             x.BusinessDate >= from.Value &&
@@ -1417,14 +1564,26 @@ app.MapGet("/api/statistics/best-drivers", async (
 {
     var (from, to, normalizedPeriod) = ResolvePeriod(period);
     var terminalId = TerminalId(principal);
+    var isViewer = Role(principal) == Roles.Viewer;
+    var viewerTransporterIds = isViewer
+        ? await GetViewerTransporterIds(db, UserId(principal))
+        : [];
 
     var query = db.Receipts
         .AsNoTracking()
+        .Include(x => x.Vehicle)
         .Include(x => x.Items)
         .Where(x => x.Status == ReceiptStatus.Active &&
                     x.BusinessDate >= from && x.BusinessDate <= to);
 
-    query = query.Where(x => x.TerminalId == terminalId);
+    query = isViewer
+        ? (viewerTransporterIds.Count == 0
+            ? query.Where(_ => false)
+            : query.Where(x =>
+                x.Vehicle != null &&
+                x.Vehicle.TransporterId != null &&
+                viewerTransporterIds.Contains(x.Vehicle.TransporterId.Value)))
+        : query.Where(x => x.TerminalId == terminalId);
 
     var receipts = await query.ToListAsync();
     var leaderboard = BuildDriverLeaderboard(receipts, palletTypeId);
@@ -1566,7 +1725,18 @@ app.MapGet("/api/export", async (
         return Results.BadRequest(new { message = "To date cannot be before From date." });
 
     var terminalId = TerminalId(principal);
-    var terminalCode = principal.FindFirstValue("terminalCode") ?? "TERM";
+    var currentUserId = UserId(principal);
+    var isViewer = Role(principal) == Roles.Viewer;
+    var viewerTransporterIds = isViewer
+        ? await GetViewerTransporterIds(db, currentUserId)
+        : [];
+    var terminalCode = isViewer
+        ? (await GetViewerScopeLabel(db, await db.Users.Include(x => x.Terminal).SingleAsync(x => x.Id == currentUserId)))
+            .Replace(" + ", "-")
+            .Replace(" ", "")
+        : principal.FindFirstValue("terminalCode") ?? "TERM";
+    if (string.IsNullOrWhiteSpace(terminalCode) || terminalCode == "Notransporterscope")
+        terminalCode = "VIEWER";
     var exportType = (type ?? "receipts").Trim().ToLowerInvariant();
     var exportFormat = (format ?? "csv").Trim().ToLowerInvariant();
     var selectedTransporterIds = ParseIds(transporterIds);
@@ -1587,7 +1757,16 @@ app.MapGet("/api/export", async (
         .Include(x => x.Vehicle).ThenInclude(x => x!.Transporter)
         .Include(x => x.Driver)
         .Include(x => x.Items).ThenInclude(x => x.PalletType)
-        .Where(x => x.TerminalId == terminalId && x.BusinessDate >= from && x.BusinessDate <= to);
+        .Where(x => x.BusinessDate >= from && x.BusinessDate <= to);
+
+    receiptQuery = isViewer
+        ? (viewerTransporterIds.Count == 0
+            ? receiptQuery.Where(_ => false)
+            : receiptQuery.Where(x =>
+                x.Vehicle != null &&
+                x.Vehicle.TransporterId != null &&
+                viewerTransporterIds.Contains(x.Vehicle.TransporterId.Value)))
+        : receiptQuery.Where(x => x.TerminalId == terminalId);
 
     if (statusFilter == "ACTIVE") receiptQuery = receiptQuery.Where(x => x.Status == ReceiptStatus.Active);
     else if (statusFilter == "CANCELLED") receiptQuery = receiptQuery.Where(x => x.Status == ReceiptStatus.Cancelled);
@@ -1615,9 +1794,17 @@ app.MapGet("/api/export", async (
         .Include(x => x.Driver)
         .Include(x => x.Items).ThenInclude(x => x.PalletType)
         .Where(x => x.Status == ReceiptStatus.Active &&
-                    x.TerminalId == terminalId &&
                     x.BusinessDate >= from && x.BusinessDate <= to &&
                     x.DriverSnapshot != "");
+
+    driverStatsQuery = isViewer
+        ? (viewerTransporterIds.Count == 0
+            ? driverStatsQuery.Where(_ => false)
+            : driverStatsQuery.Where(x =>
+                x.Vehicle != null &&
+                x.Vehicle.TransporterId != null &&
+                viewerTransporterIds.Contains(x.Vehicle.TransporterId.Value)))
+        : driverStatsQuery.Where(x => x.TerminalId == terminalId);
 
     if (selectedTransporterIds.Count > 0)
         driverStatsQuery = driverStatsQuery.Where(x => x.Vehicle != null && x.Vehicle.TransporterId != null && selectedTransporterIds.Contains(x.Vehicle.TransporterId.Value));
@@ -1819,7 +2006,14 @@ app.MapGet("/api/export", async (
 
     if (effectiveTo >= from)
     {
-        var vehicleQuery = db.Vehicles.AsNoTracking().Include(x => x.Transporter).Where(x => x.Active && x.TerminalId == terminalId);
+        var vehicleQuery = db.Vehicles.AsNoTracking().Include(x => x.Transporter).Where(x => x.Active);
+        vehicleQuery = isViewer
+            ? (viewerTransporterIds.Count == 0
+                ? vehicleQuery.Where(_ => false)
+                : vehicleQuery.Where(x =>
+                    x.TransporterId != null &&
+                    viewerTransporterIds.Contains(x.TransporterId.Value)))
+            : vehicleQuery.Where(x => x.TerminalId == terminalId);
         if (selectedTransporterIds.Count > 0)
             vehicleQuery = vehicleQuery.Where(x => x.TransporterId != null && selectedTransporterIds.Contains(x.TransporterId.Value));
         if (selectedVehicleIds.Count > 0)
@@ -1830,7 +2024,7 @@ app.MapGet("/api/export", async (
         var holidays = await db.Holidays.AsNoTracking().Where(x => x.Date >= from && x.Date <= effectiveTo).ToListAsync();
         var holidayDates = holidays.Select(x => x.Date).ToHashSet();
         var complianceReceipts = await db.Receipts.AsNoTracking()
-            .Where(x => x.Status == ReceiptStatus.Active && x.TerminalId == terminalId && x.VehicleId != null && vehicleSet.Contains(x.VehicleId.Value) && x.BusinessDate >= from && x.BusinessDate <= effectiveTo)
+            .Where(x => x.Status == ReceiptStatus.Active && x.VehicleId != null && vehicleSet.Contains(x.VehicleId.Value) && x.BusinessDate >= from && x.BusinessDate <= effectiveTo)
             .Select(x => new { x.VehicleId, x.BusinessDate, x.Direction, x.DriverId, x.DriverSnapshot })
             .ToListAsync();
         var lookup = complianceReceipts.GroupBy(x => new { VehicleId = x.VehicleId!.Value, x.BusinessDate }).ToDictionary(
@@ -1937,7 +2131,7 @@ app.MapGet("/api/export", async (
     await Audit(db, principal, "EXPORT", $"Exported {exportType}/{exportFormat} for terminal {terminalCode} from {from:yyyy-MM-dd} to {to:yyyy-MM-dd}");
     var safeType = exportType == "complete" ? "CompleteReport" : selectedTable.Name.Replace(" ", "");
     return Results.File(bytes, contentType, $"PalletControl_{terminalCode}_{safeType}_{from:yyyy-MM-dd}_{to:yyyy-MM-dd}.{extension}");
-}).RequireAuthorization("InternalElevated");
+}).RequireAuthorization("InternalModule");
 
 
 // ---------------- LINEHAUL PALLET ACCOUNTING ----------------
@@ -3465,23 +3659,82 @@ app.MapGet("/api/admin/pallet-types", async (AppDbContext db) =>
 app.MapGet("/api/admin/users", async (ClaimsPrincipal principal, AppDbContext db) =>
 {
     var terminalId = TerminalId(principal);
+    var superAdmin = IsSuperAdmin(principal);
+
     var q = db.Users.AsNoTracking().Include(x => x.Terminal).AsQueryable();
-    if (!IsSuperAdmin(principal)) q = q.Where(x => x.TerminalId == terminalId && x.Role != Roles.SuperAdmin);
-    var terminals = IsSuperAdmin(principal)
+    if (!superAdmin)
+        q = q.Where(x => x.TerminalId == terminalId && x.Role != Roles.SuperAdmin);
+
+    var terminals = superAdmin
         ? await db.Terminals.AsNoTracking().Where(x => x.Active && x.IsOperatingTerminal).OrderBy(x => x.Code).ToListAsync()
         : await db.Terminals.AsNoTracking().Where(x => x.Id == terminalId).ToListAsync();
+
+    var userRows = await q.OrderBy(x => x.Username).Select(x => new
+    {
+        x.Id, x.Username, x.DisplayName, x.Role, x.Active, x.TerminalId, terminal = x.Terminal!.Code,
+        x.ShowMilestoneNotifications, x.ShowLeaderboardNotifications, x.ShowBalanceNotifications,
+        x.ShowDriverStatisticsTab, x.ShowDailyCheckTab,
+        x.HasInternalPalletAccounting, x.HasLinehaul, x.HasReceivedControl
+    }).ToListAsync();
+
+    var visibleUserIds = userRows.Select(x => x.Id).ToList();
+    var assignmentRows = await db.ViewerTransporterAssignments
+        .AsNoTracking()
+        .Where(x => visibleUserIds.Contains(x.UserId))
+        .Join(db.Transporters.AsNoTracking(), a => a.TransporterId, t => t.Id, (a, t) => new
+        {
+            a.UserId,
+            a.TransporterId,
+            t.TerminalId
+        })
+        .ToListAsync();
+
+    var viewerTransporterQuery = db.Transporters
+        .AsNoTracking()
+        .Where(x => x.Active);
+
+    if (!superAdmin)
+        viewerTransporterQuery = viewerTransporterQuery.Where(x => x.TerminalId == terminalId);
+
+    var viewerTransporters = await viewerTransporterQuery
+        .Join(db.Terminals.AsNoTracking(), t => t.TerminalId, terminal => terminal.Id,
+            (t, terminal) => new
+            {
+                t.Id,
+                t.Name,
+                t.TerminalId,
+                terminalCode = terminal.Code,
+                label = terminal.Code + " · " + t.Name
+            })
+        .OrderBy(x => x.terminalCode)
+        .ThenBy(x => x.Name)
+        .ToListAsync();
+
+    var users = userRows.Select(x => new
+    {
+        x.Id, x.Username, x.DisplayName, x.Role, x.Active, x.TerminalId, x.terminal,
+        x.ShowMilestoneNotifications, x.ShowLeaderboardNotifications, x.ShowBalanceNotifications,
+        x.ShowDriverStatisticsTab, x.ShowDailyCheckTab,
+        x.HasInternalPalletAccounting, x.HasLinehaul, x.HasReceivedControl,
+        viewerTransporterIds = assignmentRows
+            .Where(a => a.UserId == x.Id)
+            .Select(a => a.TransporterId)
+            .Distinct()
+            .OrderBy(id => id)
+            .ToList(),
+        viewerExternalTransporterCount = superAdmin
+            ? 0
+            : assignmentRows.Count(a => a.UserId == x.Id && a.TerminalId != terminalId)
+    }).ToList();
+
     return Results.Ok(new
     {
         terminals,
-        users = await q.OrderBy(x => x.Username).Select(x => new
-        {
-            x.Id, x.Username, x.DisplayName, x.Role, x.Active, x.TerminalId, terminal = x.Terminal!.Code,
-            x.ShowMilestoneNotifications, x.ShowLeaderboardNotifications, x.ShowBalanceNotifications,
-            x.ShowDriverStatisticsTab, x.ShowDailyCheckTab,
-            x.HasInternalPalletAccounting, x.HasLinehaul, x.HasReceivedControl
-        }).ToListAsync()
+        users,
+        viewerTransporters
     });
 }).RequireAuthorization(AdminOnly());
+
 
 app.MapGet("/api/admin/settings", async (AppDbContext db) =>
 {
@@ -3568,6 +3821,10 @@ app.MapDelete("/api/admin/transporters/{id:int}", async (
 
     var vehicles = await db.Vehicles.Where(x => x.TransporterId == id).ToListAsync();
     foreach (var vehicle in vehicles) vehicle.TransporterId = null;
+
+    var viewerAssignments = await db.ViewerTransporterAssignments.Where(x => x.TransporterId == id).ToListAsync();
+    if (viewerAssignments.Count > 0)
+        db.ViewerTransporterAssignments.RemoveRange(viewerAssignments);
 
     db.Transporters.Remove(row);
     await db.SaveChangesAsync();
@@ -3778,8 +4035,36 @@ app.MapPost("/api/admin/users", async (
     if (!await db.Terminals.AnyAsync(x => x.Id == req.TerminalId && x.IsOperatingTerminal && x.Active))
         return Results.BadRequest(new { message = "Operating terminal not found." });
     if (!IsSuperAdmin(principal) && req.Role == Roles.SuperAdmin) return Results.Forbid();
-    if (await db.Users.AnyAsync(x => x.Username == username)) return Results.BadRequest(new { message = "Username already exists." });
+    if (await db.Users.AnyAsync(x => x.Username == username))
+        return Results.BadRequest(new { message = "Username already exists." });
 
+    var viewerTransporterIds = (req.ViewerTransporterIds ?? [])
+        .Distinct()
+        .ToList();
+
+    if (req.Role == Roles.Viewer)
+    {
+        if (viewerTransporterIds.Count == 0)
+            return Results.BadRequest(new { message = "Viewer must be assigned to at least one transporter." });
+
+        var allowedTransporterQuery = db.Transporters
+            .AsNoTracking()
+            .Where(x => x.Active && viewerTransporterIds.Contains(x.Id));
+
+        // A terminal Admin can create a Viewer only for transporters in that Admin's terminal.
+        // SuperAdmin may link the same Viewer across SRD/ARE/KRS.
+        if (!IsSuperAdmin(principal))
+        {
+            var adminTerminalId = TerminalId(principal);
+            allowedTransporterQuery = allowedTransporterQuery.Where(x => x.TerminalId == adminTerminalId);
+        }
+
+        var validViewerTransporterIds = await allowedTransporterQuery.Select(x => x.Id).ToListAsync();
+        if (validViewerTransporterIds.Count != viewerTransporterIds.Count)
+            return Results.Forbid();
+    }
+
+    var isViewer = req.Role == Roles.Viewer;
     var row = new AppUser
     {
         Username = username,
@@ -3787,14 +4072,30 @@ app.MapPost("/api/admin/users", async (
         Role = req.Role,
         TerminalId = req.TerminalId,
         Active = true,
-        HasInternalPalletAccounting = req.HasInternalPalletAccounting,
-        HasLinehaul = req.HasLinehaul,
-        HasReceivedControl = req.HasReceivedControl,
-        ShowDriverStatisticsTab = req.ShowDriverStatisticsTab,
-        ShowDailyCheckTab = req.ShowDailyCheckTab
+
+        // Viewer is a reporting-only role. These values are enforced server-side rather
+        // than trusting checkboxes from the browser.
+        HasInternalPalletAccounting = isViewer || req.HasInternalPalletAccounting,
+        HasLinehaul = isViewer ? false : req.HasLinehaul,
+        HasReceivedControl = isViewer ? false : req.HasReceivedControl,
+        ShowDriverStatisticsTab = isViewer || req.ShowDriverStatisticsTab,
+        ShowDailyCheckTab = isViewer || req.ShowDailyCheckTab
     };
+
     row.PasswordHash = new PasswordHasher<AppUser>().HashPassword(row, req.Password);
-    db.Users.Add(row); await db.SaveChangesAsync();
+    db.Users.Add(row);
+    await db.SaveChangesAsync();
+
+    if (isViewer)
+    {
+        db.ViewerTransporterAssignments.AddRange(
+            viewerTransporterIds.Select(transporterId => new ViewerTransporterAssignment
+            {
+                UserId = row.Id,
+                TransporterId = transporterId
+            }));
+    }
+
     db.UserSettings.Add(new UserSettingsRecord
     {
         UserId = row.Id,
@@ -3803,10 +4104,13 @@ app.MapPost("/api/admin/users", async (
         ShowLeaderboardNotifications = row.ShowLeaderboardNotifications,
         ShowBalanceNotifications = row.ShowBalanceNotifications
     });
+
     await db.SaveChangesAsync();
-    await Audit(db, principal, "USER_CREATE", $"Created user {username} ({req.Role}) modules internal={row.HasInternalPalletAccounting}, linehaul={row.HasLinehaul}, received={row.HasReceivedControl}");
+    await Audit(db, principal, "USER_CREATE",
+        $"Created user {username} ({req.Role}) modules internal={row.HasInternalPalletAccounting}, linehaul={row.HasLinehaul}, received={row.HasReceivedControl}; viewerTransporters={string.Join(',', viewerTransporterIds)}");
     return Results.Ok();
 }).RequireAuthorization(AdminOnly());
+
 
 app.MapPut("/api/admin/users/{id:int}", async (
     int id,
@@ -3817,24 +4121,128 @@ app.MapPut("/api/admin/users/{id:int}", async (
     var row = await db.Users.FindAsync(id);
     if (row is null) return Results.NotFound();
     if (!ValidRole(req.Role)) return Results.BadRequest(new { message = "Invalid role." });
-    if (!CanManageTerminal(principal, row.TerminalId) || !CanManageTerminal(principal, req.TerminalId)) return Results.Forbid();
+    if (!CanManageTerminal(principal, row.TerminalId) || !CanManageTerminal(principal, req.TerminalId))
+        return Results.Forbid();
     if (!await db.Terminals.AnyAsync(x => x.Id == req.TerminalId && x.IsOperatingTerminal && x.Active))
         return Results.BadRequest(new { message = "Operating terminal not found." });
-    if (!IsSuperAdmin(principal) && (row.Role == Roles.SuperAdmin || req.Role == Roles.SuperAdmin)) return Results.Forbid();
+    if (!IsSuperAdmin(principal) && (row.Role == Roles.SuperAdmin || req.Role == Roles.SuperAdmin))
+        return Results.Forbid();
 
+    var existingAssignments = await db.ViewerTransporterAssignments
+        .Where(x => x.UserId == row.Id)
+        .ToListAsync();
+
+    var existingAssignmentTransporterIds = existingAssignments.Select(x => x.TransporterId).ToList();
+    var existingAssignmentTerminals = existingAssignmentTransporterIds.Count == 0
+        ? new Dictionary<int, int>()
+        : await db.Transporters
+            .AsNoTracking()
+            .Where(x => existingAssignmentTransporterIds.Contains(x.Id))
+            .ToDictionaryAsync(x => x.Id, x => x.TerminalId);
+
+    var adminTerminalId = TerminalId(principal);
+    var hasExternalViewerScope = !IsSuperAdmin(principal) &&
+        existingAssignments.Any(a =>
+            existingAssignmentTerminals.TryGetValue(a.TransporterId, out var ownerTerminalId) &&
+            ownerTerminalId != adminTerminalId);
+
+    // Once SuperAdmin has linked a Viewer across terminals, a terminal Admin may still
+    // edit that account's own-terminal assignment, but cannot remove the Viewer role
+    // and thereby destroy the cross-terminal scope.
+    if (hasExternalViewerScope && row.Role == Roles.Viewer && req.Role != Roles.Viewer)
+        return Results.Forbid();
+
+    var requestedViewerTransporterIds = (req.ViewerTransporterIds ?? [])
+        .Distinct()
+        .ToList();
+
+    if (req.Role == Roles.Viewer)
+    {
+        if (IsSuperAdmin(principal))
+        {
+            if (requestedViewerTransporterIds.Count == 0)
+                return Results.BadRequest(new { message = "Viewer must be assigned to at least one transporter." });
+
+            var validIds = await db.Transporters
+                .AsNoTracking()
+                .Where(x => x.Active && requestedViewerTransporterIds.Contains(x.Id))
+                .Select(x => x.Id)
+                .ToListAsync();
+
+            if (validIds.Count != requestedViewerTransporterIds.Count)
+                return Results.BadRequest(new { message = "One or more Viewer transporters are invalid or inactive." });
+
+            db.ViewerTransporterAssignments.RemoveRange(existingAssignments);
+            db.ViewerTransporterAssignments.AddRange(
+                requestedViewerTransporterIds.Select(transporterId => new ViewerTransporterAssignment
+                {
+                    UserId = row.Id,
+                    TransporterId = transporterId
+                }));
+        }
+        else
+        {
+            // Terminal Admin may replace only the assignments owned by their terminal.
+            // Any existing cross-terminal assignments are preserved untouched.
+            var requestedOwnIds = await db.Transporters
+                .AsNoTracking()
+                .Where(x =>
+                    x.Active &&
+                    x.TerminalId == adminTerminalId &&
+                    requestedViewerTransporterIds.Contains(x.Id))
+                .Select(x => x.Id)
+                .Distinct()
+                .ToListAsync();
+
+            var ownExisting = existingAssignments
+                .Where(a =>
+                    existingAssignmentTerminals.TryGetValue(a.TransporterId, out var ownerTerminalId) &&
+                    ownerTerminalId == adminTerminalId)
+                .ToList();
+
+            var externalExisting = existingAssignments
+                .Where(a =>
+                    existingAssignmentTerminals.TryGetValue(a.TransporterId, out var ownerTerminalId) &&
+                    ownerTerminalId != adminTerminalId)
+                .ToList();
+
+            if (requestedOwnIds.Count == 0 && externalExisting.Count == 0)
+                return Results.BadRequest(new { message = "Viewer must be assigned to at least one transporter." });
+
+            db.ViewerTransporterAssignments.RemoveRange(ownExisting);
+            var existingIds = externalExisting.Select(x => x.TransporterId).ToHashSet();
+            db.ViewerTransporterAssignments.AddRange(
+                requestedOwnIds
+                    .Where(transporterId => !existingIds.Contains(transporterId))
+                    .Select(transporterId => new ViewerTransporterAssignment
+                    {
+                        UserId = row.Id,
+                        TransporterId = transporterId
+                    }));
+        }
+    }
+    else if (existingAssignments.Count > 0)
+    {
+        db.ViewerTransporterAssignments.RemoveRange(existingAssignments);
+    }
+
+    var isViewer = req.Role == Roles.Viewer;
     row.DisplayName = req.DisplayName.Trim();
     row.Role = req.Role;
     row.TerminalId = req.TerminalId;
     row.Active = req.Active;
-    row.HasInternalPalletAccounting = req.HasInternalPalletAccounting;
-    row.HasLinehaul = req.HasLinehaul;
-    row.HasReceivedControl = req.HasReceivedControl;
-    row.ShowDriverStatisticsTab = req.ShowDriverStatisticsTab;
-    row.ShowDailyCheckTab = req.ShowDailyCheckTab;
+    row.HasInternalPalletAccounting = isViewer || req.HasInternalPalletAccounting;
+    row.HasLinehaul = isViewer ? false : req.HasLinehaul;
+    row.HasReceivedControl = isViewer ? false : req.HasReceivedControl;
+    row.ShowDriverStatisticsTab = isViewer || req.ShowDriverStatisticsTab;
+    row.ShowDailyCheckTab = isViewer || req.ShowDailyCheckTab;
+
     await db.SaveChangesAsync();
-    await Audit(db, principal, "USER_UPDATE", $"Updated user {row.Username}");
+    await Audit(db, principal, "USER_UPDATE",
+        $"Updated user {row.Username}; role={row.Role}; viewerTransporters={string.Join(',', requestedViewerTransporterIds)}");
     return Results.Ok();
 }).RequireAuthorization(AdminOnly());
+
 
 app.MapPut("/api/admin/users/{id:int}/tab-access", async (
     int id,
@@ -3847,8 +4255,8 @@ app.MapPut("/api/admin/users/{id:int}/tab-access", async (
     if (!CanManageTerminal(principal, row.TerminalId)) return Results.Forbid();
     if (!IsSuperAdmin(principal) && row.Role == Roles.SuperAdmin) return Results.Forbid();
 
-    row.ShowDriverStatisticsTab = req.ShowDriverStatisticsTab;
-    row.ShowDailyCheckTab = req.ShowDailyCheckTab;
+    row.ShowDriverStatisticsTab = row.Role == Roles.Viewer ? true : req.ShowDriverStatisticsTab;
+    row.ShowDailyCheckTab = row.Role == Roles.Viewer ? true : req.ShowDailyCheckTab;
     await db.SaveChangesAsync();
     await Audit(db, principal, "USER_TAB_ACCESS",
         $"Updated tab access for {row.Username}: driverStats={row.ShowDriverStatisticsTab}, dailyCheck={row.ShowDailyCheckTab}");
@@ -3934,12 +4342,37 @@ static int TerminalId(ClaimsPrincipal principal) =>
 static string Role(ClaimsPrincipal principal) =>
     principal.FindFirstValue(ClaimTypes.Role) ?? Roles.User;
 
-static bool ValidRole(string role) => role is Roles.SuperAdmin or Roles.Admin or Roles.Superuser or Roles.User;
+static bool ValidRole(string role) => role is Roles.SuperAdmin or Roles.Admin or Roles.Superuser or Roles.Viewer or Roles.User;
 
 static bool IsSuperAdmin(ClaimsPrincipal principal) => Role(principal) == Roles.SuperAdmin;
 static bool IsTerminalAdmin(ClaimsPrincipal principal) => Role(principal) is Roles.Admin or Roles.LegacyTerminalAdmin;
 static bool CanManageTerminal(ClaimsPrincipal principal, int terminalId) => IsSuperAdmin(principal) || (IsTerminalAdmin(principal) && TerminalId(principal) == terminalId);
 static int ResolveAdminTerminal(ClaimsPrincipal principal, int? requestedTerminalId) => IsSuperAdmin(principal) ? (requestedTerminalId ?? TerminalId(principal)) : TerminalId(principal);
+
+static async Task<List<int>> GetViewerTransporterIds(AppDbContext db, int userId) =>
+    await db.ViewerTransporterAssignments
+        .AsNoTracking()
+        .Where(x => x.UserId == userId)
+        .Select(x => x.TransporterId)
+        .Distinct()
+        .ToListAsync();
+
+static async Task<string> GetViewerScopeLabel(AppDbContext db, AppUser user)
+{
+    if (user.Role != Roles.Viewer)
+        return user.Terminal?.Code ?? "";
+
+    var terminalCodes = await db.ViewerTransporterAssignments
+        .AsNoTracking()
+        .Where(x => x.UserId == user.Id)
+        .Join(db.Transporters.AsNoTracking(), a => a.TransporterId, t => t.Id, (a, t) => t)
+        .Join(db.Terminals.AsNoTracking(), t => t.TerminalId, terminal => terminal.Id, (t, terminal) => terminal.Code)
+        .Distinct()
+        .OrderBy(x => x)
+        .ToListAsync();
+
+    return terminalCodes.Count == 0 ? "No transporter scope" : string.Join(" + ", terminalCodes);
+}
 
 static string NormalizeTheme(string? theme) => (theme ?? "normal").Trim().ToLowerInvariant() switch
 {
@@ -4123,6 +4556,26 @@ static void EnsureCompatibilitySchema(AppDbContext db)
         {
             using var cmd = connection.CreateCommand();
             cmd.CommandText = "ALTER TABLE \"Users\" ADD COLUMN \"HasReceivedControl\" INTEGER NOT NULL DEFAULT 0;";
+            cmd.ExecuteNonQuery();
+        }
+        // Viewer access is many-to-many because one Viewer may see transporter data
+        // from more than one operating terminal. The table is safe to create on every start.
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = """
+                CREATE TABLE IF NOT EXISTS "ViewerTransporterAssignments" (
+                    "UserId" INTEGER NOT NULL,
+                    "TransporterId" INTEGER NOT NULL,
+                    PRIMARY KEY ("UserId", "TransporterId"),
+                    FOREIGN KEY ("UserId") REFERENCES "Users" ("Id") ON DELETE CASCADE,
+                    FOREIGN KEY ("TransporterId") REFERENCES "Transporters" ("Id") ON DELETE CASCADE
+                );
+                """;
+            cmd.ExecuteNonQuery();
+        }
+        using (var cmd = connection.CreateCommand())
+        {
+            cmd.CommandText = "CREATE INDEX IF NOT EXISTS \"IX_ViewerTransporterAssignments_TransporterId\" ON \"ViewerTransporterAssignments\" (\"TransporterId\");";
             cmd.ExecuteNonQuery();
         }
         // Before v5.8.7, Admin meant the old global administrator and TerminalAdmin
@@ -5124,6 +5577,7 @@ static object ToReceiptDto(PalletReceipt r) => new
     vehicle = r.VehicleSnapshot,
     driver = r.DriverSnapshot,
     transporter = r.TransporterSnapshot,
+    terminal = r.Terminal?.Code ?? "",
     r.CancelledAtUtc,
     r.CancelReason,
     wasReversed = r.Actions.Any(a => a.Action == "CANCELLATION_REVERSED"),
@@ -5497,6 +5951,7 @@ public static class Roles
     public const string Admin = "Admin";
     public const string LegacyTerminalAdmin = "TerminalAdmin";
     public const string Superuser = "Superuser";
+    public const string Viewer = "Viewer";
     public const string User = "User";
 }
 
@@ -5522,6 +5977,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     public DbSet<AppSettings> Settings => Set<AppSettings>();
     public DbSet<TerminalSettings> TerminalSettings => Set<TerminalSettings>();
     public DbSet<UserSettingsRecord> UserSettings => Set<UserSettingsRecord>();
+    public DbSet<ViewerTransporterAssignment> ViewerTransporterAssignments => Set<ViewerTransporterAssignment>();
     public DbSet<Holiday> Holidays => Set<Holiday>();
     public DbSet<LinehaulReceipt> LinehaulReceipts => Set<LinehaulReceipt>();
     public DbSet<LinehaulCommentOption> LinehaulCommentOptions => Set<LinehaulCommentOption>();
@@ -5542,6 +5998,9 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
         b.Entity<UserSettingsRecord>().ToTable("UserSettings");
         b.Entity<UserSettingsRecord>().HasIndex(x => x.UserId).IsUnique();
         b.Entity<UserSettingsRecord>().HasOne(x => x.User).WithOne().HasForeignKey<UserSettingsRecord>(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<ViewerTransporterAssignment>().HasKey(x => new { x.UserId, x.TransporterId });
+        b.Entity<ViewerTransporterAssignment>().HasOne(x => x.User).WithMany().HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
+        b.Entity<ViewerTransporterAssignment>().HasOne(x => x.Transporter).WithMany().HasForeignKey(x => x.TransporterId).OnDelete(DeleteBehavior.Cascade);
         b.Entity<LinehaulReceipt>().HasIndex(x => x.ReceiptNumber).IsUnique();
         b.Entity<LinehaulReceipt>().HasIndex(x => x.PalletReceiptNumber);
         b.Entity<LinehaulReceipt>().HasIndex(x => new { x.FromTerminalId, x.ToTerminalId, x.BusinessDate });
@@ -5631,6 +6090,15 @@ public class AppUser
     public bool HasReceivedControl { get; set; } = false;
 
     [JsonIgnore] public Terminal? Terminal { get; set; }
+}
+
+public class ViewerTransporterAssignment
+{
+    public int UserId { get; set; }
+    public int TransporterId { get; set; }
+
+    [JsonIgnore] public AppUser? User { get; set; }
+    [JsonIgnore] public Transporter? Transporter { get; set; }
 }
 
 public class Terminal
@@ -6026,13 +6494,14 @@ public record ReceiptValidation(string? Error, Vehicle? Vehicle, Driver? Driver,
 }
 
 public record LoginRequest(string Username, string Password);
-public record LoginResponse(string Token, string Username, string DisplayName, string Role, int TerminalId, string TerminalCode, bool ShowDriverStatisticsTab, bool ShowDailyCheckTab, bool HasInternalPalletAccounting, bool HasLinehaul, bool HasReceivedControl, string Theme);
+public record LoginResponse(string Token, string Username, string DisplayName, string Role, int TerminalId, string TerminalCode, bool ShowDriverStatisticsTab, bool ShowDailyCheckTab, bool HasInternalPalletAccounting, bool HasLinehaul, bool HasReceivedControl, string Theme, string ViewerScopeLabel);
 public record QuickDriverRequest(string Name);
 public record ReceiptItemRequest(int PalletTypeId, int Quantity);
 public record CreateReceiptRequest(string IdempotencyKey, int VehicleId, int DriverId, string Direction, List<ReceiptItemRequest> Items, bool ConfirmWarnings = false, DateOnly? BusinessDate = null);
 public record CancelRequest(string Reason);
 public record ReverseCancellationRequest(string? Reason);
 public record UserPreferenceRequest(bool ShowMilestoneNotifications, bool ShowLeaderboardNotifications, bool ShowBalanceNotifications, string Theme);
+public record SelfPasswordRequest(string CurrentPassword, string NewPassword);
 
 public record AdminTransporterRequest(string Name, int? TerminalId = null);
 public record AdminVehicleRequest(string VehicleId, int TerminalId, int TransporterId);
@@ -6042,8 +6511,8 @@ public record AdminHolidayRequest(DateOnly Date, string? Name);
 public record AdminDriverRequest(string Name, int TerminalId);
 public record AdminPalletTypeRequest(string Name, bool UserSelectable);
 public record AdminPalletTypeUpdate(bool Active, bool UserSelectable);
-public record AdminUserRequest(string Username, string DisplayName, string Password, string Role, int TerminalId, bool HasInternalPalletAccounting, bool HasLinehaul, bool HasReceivedControl, bool ShowDriverStatisticsTab = true, bool ShowDailyCheckTab = true);
-public record AdminUserUpdateRequest(string DisplayName, string Role, int TerminalId, bool Active, bool HasInternalPalletAccounting, bool HasLinehaul, bool HasReceivedControl, bool ShowDriverStatisticsTab = true, bool ShowDailyCheckTab = true);
+public record AdminUserRequest(string Username, string DisplayName, string Password, string Role, int TerminalId, bool HasInternalPalletAccounting, bool HasLinehaul, bool HasReceivedControl, bool ShowDriverStatisticsTab = true, bool ShowDailyCheckTab = true, List<int>? ViewerTransporterIds = null);
+public record AdminUserUpdateRequest(string DisplayName, string Role, int TerminalId, bool Active, bool HasInternalPalletAccounting, bool HasLinehaul, bool HasReceivedControl, bool ShowDriverStatisticsTab = true, bool ShowDailyCheckTab = true, List<int>? ViewerTransporterIds = null);
 public record AdminPasswordRequest(string Password);
 public record AdminTabAccessRequest(bool ShowDriverStatisticsTab, bool ShowDailyCheckTab);
 public record AdminActiveRequest(bool Active);

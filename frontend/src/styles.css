@@ -2022,3 +2022,63 @@ html body .buildFooter {
         text-align: right;
     }
 }
+
+/* =========================================================
+   v5.8.11 - Viewer scope, receipt range and self password
+   ========================================================= */
+.passwordChangeCard { max-width: 900px; }
+.passwordChangeGrid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(180px, 1fr));
+    gap: 12px;
+    align-items: end;
+}
+.passwordChangeGrid label { min-width: 0; }
+
+.receiptRangeControls .receiptDateActions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding-bottom: 1px;
+}
+
+.viewerScopePicker {
+    grid-column: 1 / -1;
+    width: 100%;
+    border: 1px solid var(--border, #d7dce3);
+    border-radius: 10px;
+    padding: 12px;
+    background: var(--card, #fff);
+}
+.viewerScopeHead {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: flex-start;
+    margin-bottom: 10px;
+}
+.viewerScopeHead p { margin: 4px 0 0; }
+.viewerScopeOptions {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 8px;
+}
+.viewerScopeOption {
+    display: flex;
+    gap: 9px;
+    align-items: center;
+    min-width: 0;
+    padding: 9px 10px;
+    border: 1px solid var(--border, #d7dce3);
+    border-radius: 8px;
+    cursor: pointer;
+}
+.viewerScopeOption input { width: auto; flex: 0 0 auto; }
+.viewerScopeOption span { display: flex; flex-direction: column; min-width: 0; }
+.viewerScopeOption b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.viewerScopeOption small { opacity: .7; }
+
+@media (max-width: 800px) {
+    .passwordChangeGrid { grid-template-columns: 1fr; }
+    .viewerScopeHead { flex-direction: column; }
+}

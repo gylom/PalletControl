@@ -3,7 +3,7 @@ import { createRoot } from 'react-dom/client'
 import './styles.css'
 
 const API = '/api'
-const BUILD_VERSION = '5.8.7'
+const BUILD_VERSION = '5.8.11'
 const BUILD_CREDIT = 'Developed by Gytis Lukosevicius'
 
 const THEME_OPTIONS = [
@@ -139,10 +139,16 @@ async function downloadApiFile(path, fallbackName) {
 }
 
 function firstAllowedTab(me) {
+  if (me?.role === 'Viewer' && me?.hasInternalPalletAccounting) return 'stats'
   if (me?.hasInternalPalletAccounting) return 'register'
   if (me?.hasLinehaul) return 'linehaulRegister'
   if (me?.hasReceivedControl) return 'receivedRegister'
   return 'settings'
+}
+
+function accountScopeLabel(me) {
+  if (me?.role === 'Viewer') return me?.viewerScopeLabel || 'Assigned transporters'
+  return me?.terminalCode || ''
 }
 
 function App() {
@@ -261,31 +267,38 @@ function Shell({ me, logout }) {
   const [tab, setTab] = useState(() => firstAllowedTab(me))
   const isSuperAdmin = me.role === 'SuperAdmin'
   const isTerminalAdmin = me.role === 'Admin' || me.role === 'TerminalAdmin'
+  const isViewer = me.role === 'Viewer'
   const adminAccess = isSuperAdmin || isTerminalAdmin
   const elevated = adminAccess || me.role === 'Superuser'
+  const canExportInternal = elevated || isViewer
   const hasInternal = me.hasInternalPalletAccounting === true
-  const hasLinehaul = me.hasLinehaul === true
-  const hasReceivedControl = me.hasReceivedControl === true
+  const hasLinehaul = !isViewer && me.hasLinehaul === true
+  const hasReceivedControl = !isViewer && me.hasReceivedControl === true
   const showDriverStatisticsTab = me.showDriverStatisticsTab !== false
   const showDailyCheckTab = me.showDailyCheckTab !== false
-  const terminalKey = `${me.terminalId}-${me.terminalCode}`
+  const scopeLabel = accountScopeLabel(me)
+  const terminalKey = `${me.terminalId}-${me.terminalCode}-${me.viewerScopeLabel || ''}`
 
   useEffect(() => {
     const internalTabs = ['register', 'stats', 'driverStats', 'dailyCheck', 'receipts', 'warnings', 'export']
     const linehaulTabs = ['linehaulRegister', 'linehaulReceipts', 'linehaulStats', 'linehaulExport', 'linehaulImport']
     const receivedTabs = ['receivedRegister', 'receivedStats', 'receivedWarnings', 'receivedExport', 'receivedImport']
-    if (internalTabs.includes(tab) && !hasInternal) setTab(firstAllowedTab(me))
-    if (linehaulTabs.includes(tab) && !hasLinehaul) setTab(firstAllowedTab(me))
-    if (receivedTabs.includes(tab) && !hasReceivedControl) setTab(firstAllowedTab(me))
-    if (tab === 'admin' && !isSuperAdmin) setTab(firstAllowedTab(me))
-    if ((tab === 'warnings' || tab === 'export') && !elevated) setTab('register')
-    if (tab === 'driverStats' && !showDriverStatisticsTab) setTab('register')
-    if (tab === 'dailyCheck' && !showDailyCheckTab) setTab('register')
-  }, [tab, me, hasInternal, hasLinehaul, hasReceivedControl, adminAccess, elevated, showDriverStatisticsTab, showDailyCheckTab])
+    const fallback = firstAllowedTab(me)
+    if (internalTabs.includes(tab) && !hasInternal) setTab(fallback)
+    if (linehaulTabs.includes(tab) && !hasLinehaul) setTab(fallback)
+    if (receivedTabs.includes(tab) && !hasReceivedControl) setTab(fallback)
+    if (tab === 'admin' && !isSuperAdmin) setTab(fallback)
+    if (tab === 'register' && isViewer) setTab('stats')
+    if (tab === 'warnings' && !elevated) setTab(fallback)
+    if (tab === 'export' && !canExportInternal) setTab(fallback)
+    if (tab === 'settings' && isViewer) setTab('stats')
+    if (tab === 'driverStats' && !showDriverStatisticsTab) setTab(fallback)
+    if (tab === 'dailyCheck' && !showDailyCheckTab) setTab(fallback)
+  }, [tab, me, hasInternal, hasLinehaul, hasReceivedControl, isSuperAdmin, isViewer, elevated, canExportInternal, showDriverStatisticsTab, showDailyCheckTab])
 
   return <div>
     <header>
-      <div className="headerBrand"><b>📦 Pallet Control</b><span className="terminal">{me.terminalCode}</span></div>
+      <div className="headerBrand"><b>📦 Pallet Control</b><span className="terminal">{scopeLabel}</span></div>
       <div className="userline">{me.displayName} · {me.role}<button className="linkbtn" onClick={logout}>Log out</button></div>
     </header>
 
@@ -293,13 +306,13 @@ function Shell({ me, logout }) {
       {hasInternal && <div className="navGroup navInternal">
         <span className="navGroupTitle">InternPalleregnskap</span>
         <div className="navGroupButtons">
-          <NavButton id="register" tab={tab} setTab={setTab}>Register</NavButton>
+          {!isViewer && <NavButton id="register" tab={tab} setTab={setTab}>Register</NavButton>}
           <NavButton id="stats" tab={tab} setTab={setTab}>Statistics</NavButton>
           {showDriverStatisticsTab && <NavButton id="driverStats" tab={tab} setTab={setTab}>Statistics Driver</NavButton>}
           {showDailyCheckTab && <NavButton id="dailyCheck" tab={tab} setTab={setTab}>Daily Check</NavButton>}
           <NavButton id="receipts" tab={tab} setTab={setTab}>Receipts</NavButton>
           {elevated && <NavButton id="warnings" tab={tab} setTab={setTab}>Warnings</NavButton>}
-          {elevated && <NavButton id="export" tab={tab} setTab={setTab}>Export</NavButton>}
+          {canExportInternal && <NavButton id="export" tab={tab} setTab={setTab}>Export</NavButton>}
         </div>
       </div>}
 
@@ -325,25 +338,25 @@ function Shell({ me, logout }) {
         </div>
       </div>}
 
-      <div className="navGroup navUtility">
+      {!isViewer && <div className="navGroup navUtility">
         <span className="navGroupTitle">Account</span>
         <div className="navGroupButtons">
           <NavButton id="settings" tab={tab} setTab={setTab}>Settings</NavButton>
           {isSuperAdmin && <NavButton id="admin" tab={tab} setTab={setTab}>Admin</NavButton>}
         </div>
-      </div>
+      </div>}
     </nav>
 
     <div className="healthBarWrap"><HealthCheck /></div>
 
     <main>
-      {tab === 'register' && hasInternal && <Register key={`register-${terminalKey}`} me={me} />}
+      {tab === 'register' && hasInternal && !isViewer && <Register key={`register-${terminalKey}`} me={me} />}
       {tab === 'stats' && hasInternal && <Stats key={`stats-${terminalKey}`} me={me} />}
       {tab === 'driverStats' && hasInternal && showDriverStatisticsTab && <DriverStats key={`driver-stats-${terminalKey}`} me={me} />}
       {tab === 'dailyCheck' && hasInternal && showDailyCheckTab && <DailyVehicleCheck key={`daily-check-${terminalKey}`} me={me} />}
       {tab === 'receipts' && hasInternal && <Receipts key={`receipts-${terminalKey}`} me={me} />}
       {tab === 'warnings' && hasInternal && elevated && <Warnings key={`warnings-${terminalKey}`} me={me} />}
-      {tab === 'export' && hasInternal && elevated && <Export key={`export-${terminalKey}`} me={me} />}
+      {tab === 'export' && hasInternal && canExportInternal && <Export key={`export-${terminalKey}`} me={me} />}
 
       {tab === 'linehaulRegister' && hasLinehaul && <LinehaulRegister key={`lh-reg-${terminalKey}`} me={me} />}
       {tab === 'linehaulReceipts' && hasLinehaul && <LinehaulReceipts key={`lh-rec-${terminalKey}`} me={me} />}
@@ -357,7 +370,7 @@ function Shell({ me, logout }) {
       {tab === 'receivedExport' && hasReceivedControl && <ReceivedControlExport key={`rc-exp-${terminalKey}`} me={me} />}
       {tab === 'receivedImport' && hasReceivedControl && adminAccess && <ReceivedControlImport key={`rc-imp-${terminalKey}`} me={me} />}
 
-      {tab === 'settings' && <UserSettings me={me} />}
+      {tab === 'settings' && !isViewer && <UserSettings me={me} />}
       {tab === 'admin' && isSuperAdmin && <Admin me={me} />}
     </main>
   </div>
@@ -794,7 +807,7 @@ function Stats({ me }) {
   }, [options.vehicles, transporterIds])
 
   return <section>
-    <div className="pageTitle"><div><h1>Statistics · {me.terminalCode}</h1><p>Only pallet movements belonging to terminal {me.terminalCode} are shown.</p></div>
+    <div className="pageTitle"><div><h1>Statistics · {accountScopeLabel(me)}</h1><p>{me.role === 'Viewer' ? `Only pallet movements for your assigned transporter(s) are shown: ${accountScopeLabel(me)}.` : `Only pallet movements belonging to terminal ${me.terminalCode} are shown.`}</p></div>
       <button className="trophy" onClick={toggleBest}>🏆 Best Performing Driver</button>
     </div>
     {error && <div className="error">{error}</div>}
@@ -842,7 +855,7 @@ function Stats({ me }) {
         <label>Pallet type<select value={palletTypeId} onChange={e => setPalletTypeId(e.target.value)}>
           <option value="">All pallet types</option>{options.palletTypes.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
         </select></label>
-        <MultiSelect label="Transporter" options={options.transporters} selected={transporterIds} setSelected={ids => { setTransporterIds(ids); if (ids.length) { const allowed = new Set(options.vehicles.filter(v => ids.map(Number).includes(Number(v.transporterId))).map(v => Number(v.id))); setVehicleIds(old => old.filter(id => allowed.has(Number(id)))) } }} labelKey="name" />
+        <MultiSelect label="Transporter" options={options.transporters} selected={transporterIds} setSelected={ids => { setTransporterIds(ids); if (ids.length) { const allowed = new Set(options.vehicles.filter(v => ids.map(Number).includes(Number(v.transporterId))).map(v => Number(v.id))); setVehicleIds(old => old.filter(id => allowed.has(Number(id)))) } }} labelKey={me.role === 'Viewer' ? 'label' : 'name'} />
         <MultiSelect label="Vehicle" options={visibleVehicles.map(v => ({ ...v, name: `${v.vehicleId} — ${v.transporter}` }))} selected={vehicleIds} setSelected={setVehicleIds} labelKey="name" />
         <MultiSelect label="Driver name" options={options.drivers} selected={driverIds} setSelected={setDriverIds} labelKey="name" />
         <label>Sort<select value={sortBy} onChange={e => setSortBy(e.target.value)}>
@@ -931,8 +944,8 @@ function DriverStats({ me }) {
   return <section>
     <div className="pageTitle">
       <div>
-        <h1>Statistics Driver · {me.terminalCode}</h1>
-        <p>Full driver statistics for terminal {me.terminalCode}. Adjusted mode deducts the configured amount for every unmatched IN receipt. Cancelled receipts are ignored.</p>
+        <h1>Statistics Driver · {accountScopeLabel(me)}</h1>
+        <p>{me.role === 'Viewer' ? `Driver statistics are restricted to your assigned transporter(s): ${accountScopeLabel(me)}. ` : `Full driver statistics for terminal ${me.terminalCode}. `}Adjusted mode deducts the configured amount for every unmatched IN receipt. Cancelled receipts are ignored.</p>
       </div>
     </div>
 
@@ -968,7 +981,7 @@ function DriverStats({ me }) {
             const allowed = new Set(options.vehicles.filter(v => ids.map(Number).includes(Number(v.transporterId))).map(v => Number(v.id)))
             setVehicleIds(old => old.filter(id => allowed.has(Number(id))))
           }
-        }} labelKey="name" />
+        }} labelKey={me.role === 'Viewer' ? 'label' : 'name'} />
         <MultiSelect label="Vehicle" options={visibleVehicles.map(v => ({ ...v, name: `${v.vehicleId} — ${v.transporter}` }))} selected={vehicleIds} setSelected={setVehicleIds} labelKey="name" />
         <MultiSelect label="Driver name" options={options.drivers} selected={driverIds} setSelected={setDriverIds} labelKey="name" />
         <label>Sort<select value={sortBy} onChange={e => setSortBy(e.target.value)}>
@@ -1084,7 +1097,7 @@ function DailyVehicleCheck({ me }) {
   return <section>
     <div className="pageTitle">
       <div>
-        <h1>Daily vehicle receipt check · {me.terminalCode}</h1>
+        <h1>Daily vehicle receipt check · {accountScopeLabel(me)}</h1>
         <p>Checks whether each scheduled vehicle has at least one IN and one OUT receipt on its expected operating days. Holidays and unscheduled days are excluded from the requirement, but receipts can still be submitted on those days.</p>
       </div>
     </div>
@@ -1203,9 +1216,11 @@ function MultiSelect({
 function StatCard({ label, value, cls = '' }) { return <div className="statCard"><span>{label}</span><strong className={cls}>{value}</strong></div> }
 
 function Receipts({ me }) {
-  const elevated = ['SuperAdmin', 'TerminalAdmin', 'Admin', 'Superuser'].includes(me.role)
-  const [date, setDate] = useState(dateInput())
-  const [limit, setLimit] = useState('25')
+  const canManage = ['SuperAdmin', 'TerminalAdmin', 'Admin', 'Superuser'].includes(me.role)
+  const canFilter = canManage || me.role === 'Viewer'
+  const [from, setFrom] = useState('')
+  const [to, setTo] = useState('')
+  const [limit, setLimit] = useState('10')
   const [sort, setSort] = useState('desc')
   const [statusFilter, setStatusFilter] = useState('all')
   const [search, setSearch] = useState('')
@@ -1213,17 +1228,26 @@ function Receipts({ me }) {
   const [error, setError] = useState('')
   const [detail, setDetail] = useState(null)
 
-  async function load(nextLimit = limit, nextSort = sort, nextDate = date, nextStatus = statusFilter, nextSearch = search) {
+  async function load(next = {}) {
+    const values = {
+      from: next.from ?? from,
+      to: next.to ?? to,
+      limit: next.limit ?? limit,
+      sort: next.sort ?? sort,
+      status: next.status ?? statusFilter,
+      search: next.search ?? search
+    }
     const p = new URLSearchParams()
 
-    if (elevated) {
-      p.set('date', nextDate)
-      p.set('sort', nextSort)
-      p.set('limit', nextLimit === 'all' ? '0' : nextLimit)
-      p.set('status', nextStatus)
-      if (nextSearch.trim()) p.set('search', nextSearch.trim())
+    if (canFilter) {
+      if (values.from) p.set('from', values.from)
+      if (values.to) p.set('to', values.to)
+      p.set('sort', values.sort)
+      p.set('limit', values.limit === 'all' ? '0' : values.limit)
+      p.set('status', values.status)
+      if (values.search.trim()) p.set('search', values.search.trim())
     } else {
-      p.set('limit', '25')
+      p.set('limit', '10')
       p.set('sort', 'desc')
     }
 
@@ -1233,26 +1257,59 @@ function Receipts({ me }) {
 
   useEffect(() => { load().catch(e => setError(e.message)) }, [])
 
-  async function changeDate(value) { setDate(value); try { await load(limit, sort, value, statusFilter, search) } catch (e) { setError(e.message) } }
-  async function changeLimit(value) { setLimit(value); try { await load(value, sort, date, statusFilter, search) } catch (e) { setError(e.message) } }
-  async function changeSort(value) { setSort(value); try { await load(limit, value, date, statusFilter, search) } catch (e) { setError(e.message) } }
-  async function changeStatus(value) { setStatusFilter(value); try { await load(limit, sort, date, value, search) } catch (e) { setError(e.message) } }
+  async function apply(next) {
+    setError('')
+    try { await load(next) }
+    catch (e) { setError(e.message) }
+  }
+
+  async function changeFrom(value) {
+    setFrom(value)
+    if (value && to && value > to) {
+      setTo(value)
+      await apply({ from: value, to: value })
+      return
+    }
+    await apply({ from: value })
+  }
+
+  async function changeTo(value) {
+    setTo(value)
+    if (value && from && value < from) {
+      setFrom(value)
+      await apply({ from: value, to: value })
+      return
+    }
+    await apply({ to: value })
+  }
+
+  async function clearDates() {
+    setFrom(''); setTo('')
+    await apply({ from: '', to: '' })
+  }
+
+  async function todayOnly() {
+    const today = dateInput()
+    setFrom(today); setTo(today)
+    await apply({ from: today, to: today })
+  }
+
+  async function changeLimit(value) { setLimit(value); await apply({ limit: value }) }
+  async function changeSort(value) { setSort(value); await apply({ sort: value }) }
+  async function changeStatus(value) { setStatusFilter(value); await apply({ status: value }) }
 
   async function submitSearch(e) {
     e.preventDefault()
-    setError('')
-    try { await load(limit, sort, date, statusFilter, search) }
-    catch (e) { setError(e.message) }
+    await apply({ search })
   }
 
   async function clearSearch() {
     setSearch('')
-    setError('')
-    try { await load(limit, sort, date, statusFilter, '') }
-    catch (e) { setError(e.message) }
+    await apply({ search: '' })
   }
 
   async function cancel(r) {
+    if (!canManage) return
     const reason = window.prompt(`Why cancel ${r.receiptNumber}?`)
     if (!reason?.trim()) return
     try { await api(`/receipts/${r.id}/cancel`, { method: 'POST', body: JSON.stringify({ reason }) }); await load(); setDetail(null) }
@@ -1260,23 +1317,34 @@ function Receipts({ me }) {
   }
 
   async function reverse(r) {
+    if (!canManage) return
     const reason = window.prompt(`Reason for reversing cancellation of ${r.receiptNumber}?`, 'Cancellation reversed')
     if (reason === null) return
     try { await api(`/receipts/${r.id}/reverse-cancellation`, { method: 'POST', body: JSON.stringify({ reason }) }); await load(); setDetail(null) }
     catch (e) { setError(e.message) }
   }
 
+  const scope = accountScopeLabel(me)
+  const filterDescription = me.role === 'Viewer'
+      ? `Only receipts for your assigned transporter(s) are shown: ${scope}. Latest 10 are preloaded.`
+      : `Latest 10 receipts for ${me.terminalCode} are preloaded. Use From/To to load a date range.`
+
   return <section>
-    <div className="pageTitle"><div><h1>Receipts · {me.terminalCode}</h1><p>{elevated ? `Only ${me.terminalCode} receipts. Default 25. Filter active, cancelled or previously reversed receipts for the selected date.` : `Latest 25 receipts for ${me.terminalCode}.`}</p></div></div>
+    <div className="pageTitle"><div><h1>Receipts · {scope}</h1><p>{canFilter ? filterDescription : `Latest 10 receipts for ${me.terminalCode}.`}</p></div></div>
     {error && <div className="error">{error}</div>}
 
-    {elevated && <div className="card receiptControls">
-      <label>Date<input type="date" value={date} onChange={e => changeDate(e.target.value)} /></label>
+    {canFilter && <div className="card receiptControls receiptRangeControls">
+      <label>From<input type="date" value={from} onChange={e => changeFrom(e.target.value)} /></label>
+      <label>To<input type="date" value={to} onChange={e => changeTo(e.target.value)} /></label>
+      <div className="receiptDateActions">
+        <button type="button" onClick={todayOnly}>Today</button>
+        {(from || to) && <button type="button" className="smallLink" onClick={clearDates}>Clear dates</button>}
+      </div>
       <label>Time order<select value={sort} onChange={e => changeSort(e.target.value)}><option value="desc">Newest first</option><option value="asc">Oldest first</option></select></label>
       <div className="receiptStatusFilters"><span>Status:</span>{[
         ['all', 'All'], ['active', 'Active'], ['cancelled', 'Cancelled'], ['reversed', 'Reversed']
       ].map(([value, label]) => <button key={value} className={statusFilter === value ? 'active' : ''} onClick={() => changeStatus(value)}>{label}</button>)}</div>
-      <div className="limitButtons"><span>Show:</span>{['25', '50', 'all'].map(v => <button key={v} className={limit === v ? 'active' : ''} onClick={() => changeLimit(v)}>{v === 'all' ? 'All' : v}</button>)}</div>
+      <div className="limitButtons"><span>Show:</span>{['10', '25', '50', 'all'].map(v => <button key={v} className={limit === v ? 'active' : ''} onClick={() => changeLimit(v)}>{v === 'all' ? 'All' : v}</button>)}</div>
       <form className="receiptSearch" onSubmit={submitSearch}>
         <label><span>Search receipts</span><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Receipt, vehicle, driver, transporter, pallet…" /></label>
         <button type="submit">Search</button>
@@ -1285,9 +1353,9 @@ function Receipts({ me }) {
     </div>}
 
     <div className="receiptList">
-      {rows.length === 0 && <Empty text={elevated ? (search ? 'No receipts match your search and filters.' : 'No receipts match these filters.') : 'No receipts yet.'} />}
+      {rows.length === 0 && <Empty text={canFilter ? (search ? 'No receipts match your search and filters.' : 'No receipts match these filters.') : 'No receipts yet.'} />}
       {rows.map(r => <div className={`receiptCard ${r.status === 'CANCELLED' ? 'cancelled' : ''}`} key={r.id}>
-        <div className="receiptTop"><div><b>{r.receiptNumber}</b><span className={`badge ${r.status === 'CANCELLED' ? 'red' : 'green'}`}>{r.status}</span>{r.wasReversed && <span className="badge blue">REVERSED</span>}</div><strong className="clock">🕒 {formatTimestamp(r.submittedAtUtc)}</strong></div>
+        <div className="receiptTop"><div><b>{r.receiptNumber}</b><span className={`badge ${r.status === 'CANCELLED' ? 'red' : 'green'}`}>{r.status}</span>{r.wasReversed && <span className="badge blue">REVERSED</span>}{me.role === 'Viewer' && r.terminal && <span className="badge">{r.terminal}</span>}</div><strong className="clock">🕒 {formatTimestamp(r.submittedAtUtc)}</strong></div>
         <div className="receiptInfo">
           <span><small>Transporter</small>{r.transporter}</span>
           <span><small>Vehicle</small><b>{r.vehicle}</b></span>
@@ -1297,17 +1365,17 @@ function Receipts({ me }) {
         </div>
         <div className="receiptActions">
           {(r.status === 'CANCELLED' || r.wasReversed) && <button className="infoBtn" onClick={() => setDetail(r)}>ⓘ Receipt history</button>}
-          {elevated && r.status === 'ACTIVE' && <button className="dangerGhost" onClick={() => cancel(r)}>Cancel</button>}
-          {elevated && r.status === 'CANCELLED' && <button onClick={() => reverse(r)}>↶ Reverse cancellation</button>}
+          {canManage && r.status === 'ACTIVE' && <button className="dangerGhost" onClick={() => cancel(r)}>Cancel</button>}
+          {canManage && r.status === 'CANCELLED' && <button onClick={() => reverse(r)}>↶ Reverse cancellation</button>}
         </div>
       </div>)}
     </div>
 
     {detail && <Modal title={`Receipt history · ${detail.receiptNumber}`} close={() => setDetail(null)}>
-      <div className="detailGrid"><span><small>Status</small><b>{detail.status}</b></span><span><small>Receipt date</small>{detail.businessDate}</span><span><small>Current reason</small>{detail.cancelReason || '—'}</span><span><small>Cancelled at</small>{formatTimestamp(detail.cancelledAtUtc) || '—'}</span></div>
+      <div className="detailGrid"><span><small>Status</small><b>{detail.status}</b></span><span><small>Receipt date</small>{detail.businessDate}</span>{detail.terminal && <span><small>Terminal</small>{detail.terminal}</span>}<span><small>Current reason</small>{detail.cancelReason || '—'}</span><span><small>Cancelled at</small>{formatTimestamp(detail.cancelledAtUtc) || '—'}</span></div>
       <h3>Audit history</h3>
       {detail.actions?.length ? detail.actions.map(a => <div className="historyRow" key={a.id}><b>{a.action.replaceAll('_', ' ')}</b><span>{a.user}</span><span>{formatTimestamp(a.createdAtUtc)}</span><p>{a.reason}</p></div>) : <Empty text="No receipt history." />}
-      {elevated && detail.status === 'CANCELLED' && <button className="primary" onClick={() => reverse(detail)}>Reverse cancellation</button>}
+      {canManage && detail.status === 'CANCELLED' && <button className="primary" onClick={() => reverse(detail)}>Reverse cancellation</button>}
     </Modal>}
   </section>
 }
@@ -1693,7 +1761,12 @@ function UserSettings({ me }) {
   const [error, setError] = useState('')
   const [newDriver, setNewDriver] = useState('')
   const [addingDriver, setAddingDriver] = useState(false)
+  const [currentPassword, setCurrentPassword] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [confirmPassword, setConfirmPassword] = useState('')
+  const [changingPassword, setChangingPassword] = useState(false)
   const isTerminalAdmin = me.role === 'Admin' || me.role === 'TerminalAdmin'
+  const canChangeOwnPassword = me.role === 'User' || me.role === 'Superuser'
 
   useEffect(() => {
     api('/me/settings').then(result => {
@@ -1748,6 +1821,27 @@ function UserSettings({ me }) {
     }
   }
 
+  async function changeOwnPassword(e) {
+    e.preventDefault()
+    setMessage(''); setError('')
+    if (!currentPassword) { setError('Enter your current password.'); return }
+    if (newPassword.length < 6) { setError('New password must be at least 6 characters.'); return }
+    if (newPassword !== confirmPassword) { setError('The new passwords do not match.'); return }
+    setChangingPassword(true)
+    try {
+      await api('/me/password', {
+        method: 'PUT',
+        body: JSON.stringify({ currentPassword, newPassword })
+      })
+      setCurrentPassword(''); setNewPassword(''); setConfirmPassword('')
+      setMessage('Password changed.')
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setChangingPassword(false)
+    }
+  }
+
   const standardThemes = THEME_OPTIONS.filter(t => t.group === 'standard')
   const specialThemes = THEME_OPTIONS.filter(t => t.group === 'special')
 
@@ -1766,6 +1860,17 @@ function UserSettings({ me }) {
         {specialThemes.map(t => <button type="button" key={t.id} className={`themeChoice ${s.theme === t.id ? 'selected' : ''} themePreview-${t.id}`} onClick={() => chooseTheme(t.id)}><span className="themePreviewIcon">{t.id === 'terminal' ? '🏭' : '🕵️'}</span><span><b>{t.name}</b><small>{t.description}</small></span>{s.theme === t.id && <span className="themeSelectedMark">✓</span>}</button>)}
       </div>
     </div>
+
+    {canChangeOwnPassword && <form className="card settingsCard passwordChangeCard" onSubmit={changeOwnPassword}>
+      <h2>Change password</h2>
+      <p className="muted">Change the password for your own PalletControl account. Your current password is required.</p>
+      <div className="passwordChangeGrid">
+        <label>Current password<input type="password" autoComplete="current-password" value={currentPassword} onChange={e => setCurrentPassword(e.target.value)} /></label>
+        <label>New password<input type="password" autoComplete="new-password" value={newPassword} onChange={e => setNewPassword(e.target.value)} /></label>
+        <label>Confirm new password<input type="password" autoComplete="new-password" value={confirmPassword} onChange={e => setConfirmPassword(e.target.value)} /></label>
+      </div>
+      <button type="submit" className="primary" disabled={changingPassword || !currentPassword || !newPassword || !confirmPassword}>{changingPassword ? 'Changing…' : 'Change password'}</button>
+    </form>}
 
     <div className="card settingsCard">
       <h2>Notifications</h2>
@@ -1872,7 +1977,7 @@ function Export({ me }) {
       const disposition = res.headers.get('content-disposition') || ''
       const match = disposition.match(/filename\*?=(?:UTF-8''|\")?([^\";]+)/i)
       const fallbackType = type === 'complete' ? 'CompleteReport' : type
-      const filename = match ? decodeURIComponent(match[1].replace(/\"/g, '')) : `PalletControl_${me.terminalCode}_${fallbackType}_${from}_${to}.${format}`
+      const filename = match ? decodeURIComponent(match[1].replace(/\"/g, '')) : `PalletControl_${me.role === 'Viewer' ? accountScopeLabel(me).replaceAll(' + ', '-').replaceAll(' ', '_') : me.terminalCode}_${fallbackType}_${from}_${to}.${format}`
       const a = document.createElement('a')
       a.href = url
       a.download = filename
@@ -1886,7 +1991,7 @@ function Export({ me }) {
   }
 
   return <section>
-    <div className="pageTitle"><div><h1>Export · {me.terminalCode}</h1><p>Exports are restricted to terminal {me.terminalCode}. Choose a detailed CSV, a summary, a daily-check report, or a complete Excel workbook.</p></div></div>
+    <div className="pageTitle"><div><h1>Export · {accountScopeLabel(me)}</h1><p>{me.role === 'Viewer' ? `Exports are restricted to your assigned transporter(s): ${accountScopeLabel(me)}.` : `Exports are restricted to terminal ${me.terminalCode}.`} Choose a detailed CSV, a summary, a daily-check report, or a complete Excel workbook.</p></div></div>
     {error && <div className="error">{error}</div>}
 
     <div className="card statsFilterCard">
@@ -1925,7 +2030,7 @@ function Export({ me }) {
             const allowed = new Set(options.vehicles.filter(v => ids.map(Number).includes(Number(v.transporterId))).map(v => Number(v.id)))
             setVehicleIds(old => old.filter(id => allowed.has(Number(id))))
           }
-        }} labelKey="name" />
+        }} labelKey={me.role === 'Viewer' ? 'label' : 'name'} />
         <MultiSelect label="Vehicle" options={visibleVehicles.map(v => ({ ...v, name: `${v.vehicleId} — ${v.transporter}` }))} selected={vehicleIds} setSelected={setVehicleIds} labelKey="name" />
         <MultiSelect label="Driver name" options={options.drivers} selected={driverIds} setSelected={setDriverIds} labelKey="name" />
         <label>Direction<select value={direction} onChange={e => setDirection(e.target.value)}><option value="all">All</option><option value="IN">IN only</option><option value="OUT">OUT only</option></select></label>
@@ -1950,7 +2055,7 @@ function Admin({ me, embedded = false }) {
   const [terminalForm,setTerminalForm]=useState({code:'',name:'',aliases:''})
   const [vehicleForm,setVehicleForm]=useState({vehicleId:'',terminalId:String(me.terminalId),transporterId:''})
   const [driverForm,setDriverForm]=useState({name:'',terminalId:String(me.terminalId)})
-  const [userForm,setUserForm]=useState({username:'',displayName:'',password:'',role:'User',terminalId:String(me.terminalId),hasInternalPalletAccounting:true,hasLinehaul:false,hasReceivedControl:false,showDriverStatisticsTab:true,showDailyCheckTab:true})
+  const [userForm,setUserForm]=useState({username:'',displayName:'',password:'',role:'User',terminalId:String(me.terminalId),hasInternalPalletAccounting:true,hasLinehaul:false,hasReceivedControl:false,showDriverStatisticsTab:true,showDailyCheckTab:true,viewerTransporterIds:[]})
   const [holidayForm,setHolidayForm]=useState({date:dateInput(),name:''})
 
   const categories=[
@@ -2008,7 +2113,7 @@ function Admin({ me, embedded = false }) {
     setCategory(id)
   }
   const activeTransporters=data?.transporters?.filter(t=>t.active && (!t.terminalId || Number(t.terminalId)===Number(vehicleForm.terminalId)))||[]
-  const roleOptions=superAdmin?['User','Superuser','Admin','SuperAdmin']:['User','Superuser','Admin']
+  const roleOptions=superAdmin?['User','Viewer','Superuser','Admin','SuperAdmin']:['User','Viewer','Superuser','Admin']
 
   function closeCategory(){activeCategoryRef.current='';adminLoadSequence.current+=1;setData(null);setLoadedCategory('');setLoading(false);setError('');setMessage('');setCategory('')}
 
@@ -2024,7 +2129,32 @@ function Admin({ me, embedded = false }) {
       {category==='holidays'&&<AdminSection title="Global holidays / non-working days" subtitle="These remain global and can only be changed by SuperAdmin."><div className="inlineForm three"><input type="date" value={holidayForm.date} onChange={e=>setHolidayForm({...holidayForm,date:e.target.value})}/><input placeholder="Name" value={holidayForm.name} onChange={e=>setHolidayForm({...holidayForm,name:e.target.value})}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/holidays',{method:'POST',body:JSON.stringify(holidayForm)});setHolidayForm({date:dateInput(),name:''})},'Holiday added.')}>Add</button></div><div className="adminRows">{data.holidays.map(h=><div className="adminRow" key={h.id}><b>{formatDate(h.date)}</b><span>{h.name}</span><button className="dangerGhost" onClick={()=>action(()=>api(`/admin/holidays/${h.id}`,{method:'DELETE'}),'Holiday removed.')}>Delete</button></div>)}</div></AdminSection>}
       {category==='vehicles'&&<AdminSection title={`Vehicles · ${data.terminals?.[0]?.code||me.terminalCode}`} subtitle={superAdmin?'SuperAdmin can assign vehicles to any operating terminal. Admin only sees and changes their own terminal.':'Only vehicles belonging to your terminal are shown.'}><div className="inlineForm three"><input placeholder="Vehicle ID" value={vehicleForm.vehicleId} onChange={e=>setVehicleForm({...vehicleForm,vehicleId:e.target.value.toUpperCase()})}/><select value={vehicleForm.terminalId} onChange={e=>setVehicleForm({...vehicleForm,terminalId:e.target.value,transporterId:''})}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select><select value={vehicleForm.transporterId} onChange={e=>setVehicleForm({...vehicleForm,transporterId:e.target.value})}><option value="">Choose transporter</option>{activeTransporters.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select><button className="primary" onClick={()=>action(async()=>{await api('/admin/vehicles',{method:'POST',body:JSON.stringify({vehicleId:vehicleForm.vehicleId,terminalId:Number(vehicleForm.terminalId),transporterId:Number(vehicleForm.transporterId)})});setVehicleForm({...vehicleForm,vehicleId:''})},'Vehicle added.')}>Add vehicle</button></div><div className="adminRows">{data.vehicles.map(v=><VehicleAdminRow key={v.id} row={v} transporters={data.transporters.filter(t=>!t.terminalId||Number(t.terminalId)===Number(v.terminalId))} saveTransporter={transporterId=>action(()=>api(`/admin/vehicles/${v.id}/transporter`,{method:'PUT',body:JSON.stringify({transporterId})}),'Transporter changed.')} saveSchedule={days=>action(()=>api(`/admin/vehicles/${v.id}/schedule`,{method:'PUT',body:JSON.stringify({days})}),'Operating days saved.')} remove={()=>{if(window.confirm(`Delete ${v.vehicleId}? Historical receipts keep snapshots.`))action(()=>api(`/admin/vehicles/${v.id}`,{method:'DELETE'}),'Vehicle deleted.')}}/>)}</div></AdminSection>}
       {category==='drivers'&&<AdminSection title="Driver names" subtitle="Remove only hides a name from future registration; historical statistics remain."><div className="inlineForm"><input placeholder="Driver name" value={driverForm.name} onChange={e=>setDriverForm({...driverForm,name:e.target.value})}/><select value={driverForm.terminalId} onChange={e=>setDriverForm({...driverForm,terminalId:e.target.value})}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select><button className="primary" onClick={()=>action(async()=>{await api('/admin/drivers',{method:'POST',body:JSON.stringify({name:driverForm.name,terminalId:Number(driverForm.terminalId)})});setDriverForm({...driverForm,name:''})},'Driver added/restored.')}>Add driver</button></div><div className="adminRows">{data.drivers.map(d=><div className="adminRow driverAdmin" key={d.id}><b>{d.name}</b><span>{d.terminal}</span><span>{d.active?'Active':'Removed'}</span>{d.active?<button className="dangerGhost" onClick={()=>{if(window.confirm(`Remove ${d.name} from future selection? Historical receipts stay.`))action(()=>api(`/admin/drivers/${d.id}`,{method:'DELETE'}),'Driver removed.')}}>Remove</button>:<button onClick={()=>action(()=>api(`/admin/drivers/${d.id}/active`,{method:'PUT',body:JSON.stringify({active:true})}),'Driver restored.')}>Restore</button>}</div>)}</div></AdminSection>}
-      {category==='users'&&<AdminSection title="Users & module access" subtitle="Security role controls administration; module access controls which pallet-accounting tab groups the account can use."><div className="userCreateCard"><div className="inlineForm userAdd"><input placeholder="Username" value={userForm.username} onChange={e=>setUserForm({...userForm,username:e.target.value})}/><input placeholder="Display name" value={userForm.displayName} onChange={e=>setUserForm({...userForm,displayName:e.target.value})}/><input type="password" placeholder="Password" value={userForm.password} onChange={e=>setUserForm({...userForm,password:e.target.value})}/><select value={userForm.role} onChange={e=>setUserForm({...userForm,role:e.target.value})}>{roleOptions.map(r=><option key={r}>{r}</option>)}</select><select value={userForm.terminalId} onChange={e=>setUserForm({...userForm,terminalId:e.target.value})}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select></div><ModuleChecks value={userForm} setValue={setUserForm}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/users',{method:'POST',body:JSON.stringify({...userForm,terminalId:Number(userForm.terminalId)})});setUserForm({...userForm,username:'',displayName:'',password:''})},'User created.')}>Create user</button></div><div className="adminRows">{data.users.map(u=><UserAdminRow key={u.id} row={u} terminals={data.terminals} roles={roleOptions} save={next=>action(()=>api(`/admin/users/${u.id}`,{method:'PUT',body:JSON.stringify(next)}),'User updated.')} resetPassword={()=>{const password=window.prompt(`New password for ${u.username}:`);if(password)action(()=>api(`/admin/users/${u.id}/password`,{method:'POST',body:JSON.stringify({password})}),'Password changed.')}}/>)}</div></AdminSection>}
+      {category==='users'&&<AdminSection title="Users & module access" subtitle={superAdmin ? 'SuperAdmin can assign a Viewer to one or more transporters across SRD, ARE and KRS. Other roles keep normal terminal/module access.' : 'Admin can manage users in this terminal. Viewer assignments outside this terminal are protected and can only be changed by SuperAdmin.'}>
+        <div className="userCreateCard">
+          <div className="inlineForm userAdd">
+            <input placeholder="Username" value={userForm.username} onChange={e=>setUserForm({...userForm,username:e.target.value})}/>
+            <input placeholder="Display name" value={userForm.displayName} onChange={e=>setUserForm({...userForm,displayName:e.target.value})}/>
+            <input type="password" placeholder="Password" value={userForm.password} onChange={e=>setUserForm({...userForm,password:e.target.value})}/>
+            <select value={userForm.role} onChange={e=>{
+              const role=e.target.value
+              setUserForm({...userForm,role,
+                ...(role==='Viewer'?{hasInternalPalletAccounting:true,hasLinehaul:false,hasReceivedControl:false,showDriverStatisticsTab:true,showDailyCheckTab:true}:{}),
+                viewerTransporterIds: role==='Viewer' ? userForm.viewerTransporterIds : []
+              })
+            }}>{roleOptions.map(r=><option key={r}>{r}</option>)}</select>
+            <select value={userForm.terminalId} onChange={e=>setUserForm({...userForm,terminalId:e.target.value})}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select>
+          </div>
+          {userForm.role==='Viewer'
+              ? <ViewerTransporterPicker transporters={data.viewerTransporters||[]} selected={userForm.viewerTransporterIds||[]} setSelected={viewerTransporterIds=>setUserForm({...userForm,viewerTransporterIds})} superAdmin={superAdmin}/>
+              : <ModuleChecks value={userForm} setValue={setUserForm}/>
+          }
+          <button className="primary" onClick={()=>action(async()=>{
+            await api('/admin/users',{method:'POST',body:JSON.stringify({...userForm,terminalId:Number(userForm.terminalId)})})
+            setUserForm({...userForm,username:'',displayName:'',password:'',role:'User',viewerTransporterIds:[],hasInternalPalletAccounting:true,hasLinehaul:false,hasReceivedControl:false,showDriverStatisticsTab:true,showDailyCheckTab:true})
+          },'User created.')}>Create user</button>
+        </div>
+        <div className="adminRows">{data.users.map(u=><UserAdminRow key={u.id} row={u} terminals={data.terminals} roles={roleOptions} viewerTransporters={data.viewerTransporters||[]} superAdmin={superAdmin} save={next=>action(()=>api(`/admin/users/${u.id}`,{method:'PUT',body:JSON.stringify(next)}),'User updated.')} resetPassword={()=>{const password=window.prompt(`New password for ${u.username}:`);if(password)action(()=>api(`/admin/users/${u.id}/password`,{method:'POST',body:JSON.stringify({password})}),'Password changed.')}}/>)}</div>
+      </AdminSection>}
       {category==='terminalSettings'&&<AdminSettingsScope title="Terminal settings" data={data} targetTerminalId={targetTerminalId} setTargetTerminalId={setTargetTerminalId} showTerminalSelect={superAdmin} save={next=>action(()=>api(`/admin/terminal-settings?terminalId=${targetTerminalId}`,{method:'PUT',body:JSON.stringify(next)}),'Terminal settings saved.')}/>}
       {category==='globalSettings'&&<AdminOperationalSettings title="Global defaults" subtitle="SuperAdmin only. These values are copied when a new terminal gets its own settings; existing terminal settings remain independent." settings={data} save={next=>action(()=>api('/admin/settings',{method:'PUT',body:JSON.stringify(next)}),'Global defaults saved.')}/>}
       {category==='linehaulComments'&&<AdminSection title={`Linehaul selectable comments · ${data.terminalCode}`} subtitle="These texts belong to the selected user terminal and appear regardless of which From/To terminal is chosen on Linehaul registration.">{superAdmin&&<label className="adminTerminalPicker">Terminal<select value={targetTerminalId} onChange={e=>setTargetTerminalId(e.target.value)}>{data.terminals.map(t=><option key={t.id} value={t.id}>{t.code} — {t.name}</option>)}</select></label>}<div className="inlineForm"><input placeholder="Selectable comment" value={linehaulComment} onChange={e=>setLinehaulComment(e.target.value)}/><button className="primary" onClick={()=>action(async()=>{await api('/admin/linehaul-comments',{method:'POST',body:JSON.stringify({terminalId:Number(targetTerminalId),text:linehaulComment})});setLinehaulComment('')},'Linehaul comment added.')}>Add comment</button></div><div className="adminRows">{data.comments.map(c=><div className="adminRow" key={c.id}><b>{c.text}</b><span>{c.active?'Active':'Inactive'}</span><button onClick={()=>action(()=>api(`/admin/linehaul-comments/${c.id}/active`,{method:'PUT',body:JSON.stringify({active:!c.active})}),c.active?'Comment disabled.':'Comment enabled.')}>{c.active?'Disable':'Enable'}</button></div>)}</div></AdminSection>}
@@ -2096,10 +2226,77 @@ function PalletAdminRow({ row, save }) {
   return <div className="adminRow"><b>{row.name}</b><label className="miniCheck"><input type="checkbox" checked={active} onChange={e => setActive(e.target.checked)} /> Active</label><label className="miniCheck"><input type="checkbox" checked={selectable} onChange={e => setSelectable(e.target.checked)} /> User selectable</label><button onClick={() => save({ active, userSelectable: selectable })}>Save</button></div>
 }
 
-function UserAdminRow({ row, terminals, roles, save, resetPassword }) {
-  const [v,setV]=useState({displayName:row.displayName,role:row.role,terminalId:String(row.terminalId),active:row.active,hasInternalPalletAccounting:row.hasInternalPalletAccounting!==false,hasLinehaul:!!row.hasLinehaul,hasReceivedControl:!!row.hasReceivedControl,showDriverStatisticsTab:row.showDriverStatisticsTab!==false,showDailyCheckTab:row.showDailyCheckTab!==false})
-  useEffect(()=>setV({displayName:row.displayName,role:row.role,terminalId:String(row.terminalId),active:row.active,hasInternalPalletAccounting:row.hasInternalPalletAccounting!==false,hasLinehaul:!!row.hasLinehaul,hasReceivedControl:!!row.hasReceivedControl,showDriverStatisticsTab:row.showDriverStatisticsTab!==false,showDailyCheckTab:row.showDailyCheckTab!==false}),[row])
-  return <div className="adminRow userAdmin userAdminExpanded"><div className="userIdentity"><b>{row.username}</b><small>{row.terminal}</small></div><input value={v.displayName} onChange={e=>setV({...v,displayName:e.target.value})}/><select value={v.role} onChange={e=>setV({...v,role:e.target.value})}>{roles.map(r=><option key={r}>{r}</option>)}</select><select value={v.terminalId} onChange={e=>setV({...v,terminalId:e.target.value})}>{terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select><label className="miniCheck"><input type="checkbox" checked={v.active} onChange={e=>setV({...v,active:e.target.checked})}/> Active</label><ModuleChecks value={v} setValue={setV}/>{v.hasInternalPalletAccounting&&<div className="moduleChecks subAccess"><label className="miniCheck"><input type="checkbox" checked={v.showDriverStatisticsTab} onChange={e=>setV({...v,showDriverStatisticsTab:e.target.checked})}/> Driver statistics</label><label className="miniCheck"><input type="checkbox" checked={v.showDailyCheckTab} onChange={e=>setV({...v,showDailyCheckTab:e.target.checked})}/> Daily Check</label></div>}<div className="userAdminActions"><button onClick={()=>save({...v,terminalId:Number(v.terminalId)})}>Save</button><button onClick={resetPassword}>Password</button></div></div>
+function ViewerTransporterPicker({ transporters, selected, setSelected, externalCount = 0, superAdmin = false }) {
+  const selectedIds = (selected || []).map(Number)
+  const visibleIds = new Set((transporters || []).map(t => Number(t.id)))
+  const hiddenSelected = selectedIds.filter(id => !visibleIds.has(id))
+
+  function toggle(id, checked) {
+    const idNumber = Number(id)
+    const visibleSelected = selectedIds.filter(x => visibleIds.has(x) && x !== idNumber)
+    const nextVisible = checked ? [...visibleSelected, idNumber] : visibleSelected
+    setSelected([...hiddenSelected, ...nextVisible])
+  }
+
+  return <div className="viewerScopePicker">
+    <div className="viewerScopeHead">
+      <div><b>Viewer transporter access</b><p className="muted small">{superAdmin ? 'Select one or more transporters. You may combine transporters from different terminals on the same Viewer account.' : 'Select transporters from your terminal. Existing links to other terminals are protected and can only be changed by SuperAdmin.'}</p></div>
+      {externalCount > 0 && <span className="badge blue">{externalCount} cross-terminal link{externalCount === 1 ? '' : 's'} protected</span>}
+    </div>
+    <div className="viewerScopeOptions">
+      {(transporters || []).map(t => <label className="viewerScopeOption" key={t.id}>
+        <input type="checkbox" checked={selectedIds.includes(Number(t.id))} onChange={e => toggle(t.id, e.target.checked)} />
+        <span><b>{t.label || t.name}</b>{t.terminalCode && <small>{t.terminalCode}</small>}</span>
+      </label>)}
+      {(transporters || []).length === 0 && <span className="muted">No active transporters available.</span>}
+    </div>
+  </div>
+}
+
+function UserAdminRow({ row, terminals, roles, viewerTransporters, superAdmin, save, resetPassword }) {
+  const makeValue = source => ({
+    displayName: source.displayName,
+    role: source.role,
+    terminalId: String(source.terminalId),
+    active: source.active,
+    hasInternalPalletAccounting: source.hasInternalPalletAccounting !== false,
+    hasLinehaul: !!source.hasLinehaul,
+    hasReceivedControl: !!source.hasReceivedControl,
+    showDriverStatisticsTab: source.showDriverStatisticsTab !== false,
+    showDailyCheckTab: source.showDailyCheckTab !== false,
+    viewerTransporterIds: source.viewerTransporterIds || []
+  })
+  const [v,setV]=useState(()=>makeValue(row))
+  useEffect(()=>setV(makeValue(row)),[row])
+
+  function changeRole(role) {
+    setV(current => ({
+      ...current,
+      role,
+      ...(role === 'Viewer' ? {
+        hasInternalPalletAccounting: true,
+        hasLinehaul: false,
+        hasReceivedControl: false,
+        showDriverStatisticsTab: true,
+        showDailyCheckTab: true
+      } : { viewerTransporterIds: [] })
+    }))
+  }
+
+  return <div className="adminRow userAdmin userAdminExpanded">
+    <div className="userIdentity"><b>{row.username}</b><small>{row.terminal}</small></div>
+    <input value={v.displayName} onChange={e=>setV({...v,displayName:e.target.value})}/>
+    <select value={v.role} onChange={e=>changeRole(e.target.value)}>{roles.map(r=><option key={r}>{r}</option>)}</select>
+    <select value={v.terminalId} onChange={e=>setV({...v,terminalId:e.target.value})}>{terminals.map(t=><option key={t.id} value={t.id}>{t.code}</option>)}</select>
+    <label className="miniCheck"><input type="checkbox" checked={v.active} onChange={e=>setV({...v,active:e.target.checked})}/> Active</label>
+    {v.role === 'Viewer'
+        ? <ViewerTransporterPicker transporters={viewerTransporters} selected={v.viewerTransporterIds} setSelected={viewerTransporterIds=>setV({...v,viewerTransporterIds})} externalCount={row.viewerExternalTransporterCount||0} superAdmin={superAdmin}/>
+        : <>
+          <ModuleChecks value={v} setValue={setV}/>
+          {v.hasInternalPalletAccounting&&<div className="moduleChecks subAccess"><label className="miniCheck"><input type="checkbox" checked={v.showDriverStatisticsTab} onChange={e=>setV({...v,showDriverStatisticsTab:e.target.checked})}/> Driver statistics</label><label className="miniCheck"><input type="checkbox" checked={v.showDailyCheckTab} onChange={e=>setV({...v,showDailyCheckTab:e.target.checked})}/> Daily Check</label></div>}
+        </>}
+    <div className="userAdminActions"><button onClick={()=>save({...v,terminalId:Number(v.terminalId)})}>Save</button><button onClick={resetPassword}>Password</button></div>
+  </div>
 }
 
 function AdminWarningSettings({ settings, save }) {

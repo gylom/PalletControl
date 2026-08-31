@@ -22,7 +22,13 @@ function Assert-Administrator {
 
 function New-RandomSecret([int]$bytes = 64) {
     $buffer = New-Object byte[] $bytes
-    [Security.Cryptography.RandomNumberGenerator]::Fill($buffer)
+    $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+    try {
+        $rng.GetBytes($buffer)
+    }
+    finally {
+        $rng.Dispose()
+    }
     [Convert]::ToBase64String($buffer)
 }
 

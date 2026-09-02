@@ -56,9 +56,24 @@ function signed(v) {
 
 function formatTimestamp(iso) {
   if (!iso) return '—'
-  return new Date(iso).toLocaleString('nb-NO', {
-    day: '2-digit', month: '2-digit', year: 'numeric',
-    hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+
+  const value = String(iso)
+  const utcValue = /(?:Z|[+-]\d{2}:\d{2})$/i.test(value)
+    ? value
+    : `${value}Z`
+
+  const timestamp = new Date(utcValue)
+  if (Number.isNaN(timestamp.getTime())) return '—'
+
+  return timestamp.toLocaleString('nb-NO', {
+    timeZone: 'Europe/Oslo',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
   })
 }
 

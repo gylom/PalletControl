@@ -41,7 +41,7 @@ public static class SecurityConfiguration
 
         var jwtIssuer = config["Jwt:Issuer"] ?? "PalletControl";
         var jwtAudience = config["Jwt:Audience"] ?? "PalletControl";
-        var jwtLifetimeMinutes = Math.Clamp(config.GetValue<int?>("Jwt:LifetimeMinutes") ?? 720, 15, 1440);
+        var jwtLifetimeMinutes = Math.Clamp(config.GetValue<int?>("Jwt:LifetimeMinutes") ?? 21600, 15, 21600);
         var maxRequestBodyMb = Math.Clamp(config.GetValue<int?>("Security:MaxRequestBodyMb") ?? 20, 1, 100);
         var apiRequestsPerMinute = Math.Clamp(config.GetValue<int?>("Security:ApiRequestsPerMinute") ?? 600, 60, 10000);
         var loginRequestsPerMinute = Math.Clamp(config.GetValue<int?>("Security:LoginRequestsPerMinute") ?? 10, 3, 100);

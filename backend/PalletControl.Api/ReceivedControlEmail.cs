@@ -1,5 +1,4 @@
-using System.Net.Mail;
-using System.Text;
+using Microsoft.AspNetCore.DataProtection;
 using Microsoft.EntityFrameworkCore;
 
 public class ReceivedControlEmail
@@ -7,6 +6,7 @@ public class ReceivedControlEmail
     public int Id { get; set; }
     public int EntryId { get; set; }
     public string Recipient { get; set; } = "";
+    public string Cc { get; set; } = "";
     public string Subject { get; set; } = "";
     public string Body { get; set; } = "";
     public DateTime NextAttemptUtc { get; set; }
@@ -17,42 +17,43 @@ public class ReceivedControlEmail
 
 public static class ReceivedControlEmailQueue
 {
-    public static void EnsureSchema(AppDbContext db) => db.Database.ExecuteSqlRaw("""
-        CREATE TABLE IF NOT EXISTS "ReceivedControlEmails" (
-          "Id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
-          "EntryId" INTEGER NOT NULL,
-          "Recipient" TEXT NOT NULL, "Subject" TEXT NOT NULL, "Body" TEXT NOT NULL,
-          "NextAttemptUtc" TEXT NOT NULL, "SentAtUtc" TEXT NULL,
-          "Attempts" INTEGER NOT NULL DEFAULT 0, "LastError" TEXT NOT NULL DEFAULT ''
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS "IX_ReceivedControlEmails_EntryId"
-          ON "ReceivedControlEmails" ("EntryId");
-        """);
+    public static void EnsureSchema(AppDbContext db)
+    {
+        db.Database.ExecuteSqlRaw("""
+            CREATE TABLE IF NOT EXISTS "ReceivedControlEmails" (
+              "Id" INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+              "EntryId" INTEGER NOT NULL,
+              "Recipient" TEXT NOT NULL, "Cc" TEXT NOT NULL DEFAULT '',
+              "Subject" TEXT NOT NULL, "Body" TEXT NOT NULL,
+              "NextAttemptUtc" TEXT NOT NULL, "SentAtUtc" TEXT NULL,
+              "Attempts" INTEGER NOT NULL DEFAULT 0, "LastError" TEXT NOT NULL DEFAULT ''
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS "IX_ReceivedControlEmails_EntryId"
+              ON "ReceivedControlEmails" ("EntryId");
+            """);
+        EmailAdminStore.EnsureSchema(db);
+    }
 
-    // Called only for newly registered red discrepancies, never historical imports.
+    // Called only for newly registered shortages; never historical imports.
     public static async Task Enqueue(AppDbContext db, IConfiguration config, ReceivedControlEntry entry)
     {
-        if (!config.GetValue<bool>("ReceivedControlEmail:Enabled") ||
-            entry.Result != ReceivedControlStatus.ReceiptHigher) return;
+        if (entry.Result != ReceivedControlStatus.ReceiptHigher) return;
+        var smtp = EmailAdminStore.GetSmtp(db, config).Public;
+        if (!smtp.Enabled) return;
         var terminal = await db.Terminals.AsNoTracking().SingleAsync(t => t.Id == entry.TerminalId);
-        var recipient = config[$"ReceivedControlEmail:Recipients:{terminal.Code.ToUpperInvariant()}"];
-        if (string.IsNullOrWhiteSpace(recipient))
-            throw new InvalidOperationException($"Missing email recipient for {terminal.Code}.");
-        _ = new MailAddress(recipient);
+        var settings = EmailAdminStore.GetTerminal(db, config, entry.TerminalId, terminal.Code);
+        if (!settings.Enabled) return;
+        EmailAdminStore.ValidateAddresses(settings.To, allowEmpty: false);
+        EmailAdminStore.ValidateAddresses(settings.Cc, allowEmpty: true);
         var user = await db.Users.AsNoTracking().Where(u => u.Id == entry.SubmittedByUserId)
             .Select(u => u.DisplayName).SingleAsync();
-        var shortage = entry.ReceiptPalletCount!.Value - entry.ActualPalletCount;
         db.ReceivedControlEmails.Add(new ReceivedControlEmail
         {
-            EntryId = entry.Id, Recipient = recipient,
-            Subject = $"[PalletControl · {terminal.Code}] Palleavvik – {shortage} paller mangler",
-            Body = $"Det er registrert et avvik i mottattkontrollen.\n\n" +
-                $"Kontrollnummer: {entry.ControlNumber}\nTerminal: {terminal.Code}\n" +
-                $"Fra terminal: {entry.FromTerminalSnapshot}\nDato: {entry.BusinessDate:dd.MM.yyyy}\n" +
-                $"Container/tralle: {entry.UnitReference}\nAntall på kvittering: {entry.ReceiptPalletCount}\n" +
-                $"Faktisk mottatt: {entry.ActualPalletCount}\nMangler: {shortage}\n" +
-                $"Registrert av: {user}\nKommentar: {entry.Comment}\n\n" +
-                "Åpne Mottattkontroll i PalletControl: http://paller.transportservice.no\n",
+            EntryId = entry.Id,
+            Recipient = settings.To,
+            Cc = settings.Cc,
+            Subject = EmailAdminStore.Render(settings.Subject, entry, terminal.Code, user),
+            Body = EmailAdminStore.Render(settings.Body, entry, terminal.Code, user),
             NextAttemptUtc = DateTime.UtcNow
         });
     }
@@ -60,16 +61,14 @@ public static class ReceivedControlEmailQueue
 
 public sealed class ReceivedControlEmailWorker(
     IServiceScopeFactory scopes, IConfiguration config,
+    IDataProtectionProvider protection,
     ILogger<ReceivedControlEmailWorker> logger) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         while (!stoppingToken.IsCancellationRequested)
         {
-            try
-            {
-                if (config.GetValue<bool>("ReceivedControlEmail:Enabled")) await SendNext(stoppingToken);
-            }
+            try { await SendNext(stoppingToken); }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
             catch (Exception ex) { logger.LogError(ex, "Mottattkontroll email queue failed; will retry."); }
             try { await Task.Delay(TimeSpan.FromSeconds(10), stoppingToken); }
@@ -81,12 +80,14 @@ public sealed class ReceivedControlEmailWorker(
     {
         using var scope = scopes.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        var smtpSettings = EmailAdminStore.GetSmtp(db, config);
+        if (!smtpSettings.Public.Enabled) return;
         var now = DateTime.UtcNow;
         var email = await db.ReceivedControlEmails.AsNoTracking()
             .Where(e => e.SentAtUtc == null && e.NextAttemptUtc <= now)
             .OrderBy(e => e.Id).FirstOrDefaultAsync(token);
         if (email == null) return;
-        // Atomic lease protects against overlapping IIS workers. A crash releases it after 5 minutes.
+        // Lease protects against overlapping IIS workers. A crash releases it after five minutes.
         var claimed = await db.ReceivedControlEmails
             .Where(e => e.Id == email.Id && e.SentAtUtc == null && e.NextAttemptUtc <= now)
             .ExecuteUpdateAsync(s => s.SetProperty(e => e.NextAttemptUtc, now.AddMinutes(5))
@@ -104,16 +105,9 @@ public sealed class ReceivedControlEmailWorker(
         }
         try
         {
-            using var message = new MailMessage(
-                config["ReceivedControlEmail:From"]!, email.Recipient, email.Subject, email.Body);
-            message.SubjectEncoding = Encoding.UTF8;
-            message.BodyEncoding = Encoding.UTF8;
-            using var smtp = new SmtpClient(config["ReceivedControlEmail:Host"],
-                config.GetValue<int>("ReceivedControlEmail:Port", 25))
-            { EnableSsl = true, UseDefaultCredentials = false, Credentials = null };
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
-            timeout.CancelAfter(TimeSpan.FromSeconds(30));
-            await smtp.SendMailAsync(message, timeout.Token);
+            await EmailAdminStore.SendAsync(smtpSettings.Public, smtpSettings.EncryptedPassword,
+                protection.CreateProtector("PalletControl.Email.SmtpSecret.v1"),
+                email.Recipient, email.Cc, email.Subject, email.Body, token);
             await db.ReceivedControlEmails.Where(e => e.Id == email.Id).ExecuteUpdateAsync(s =>
                 s.SetProperty(e => e.SentAtUtc, DateTime.UtcNow)
                  .SetProperty(e => e.LastError, ""), token);

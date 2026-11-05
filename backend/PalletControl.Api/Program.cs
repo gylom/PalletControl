@@ -17,6 +17,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 const string BuildVersion = "5.9.1";
 builder.Services.AddPalletDatabase(builder.Configuration, builder.Environment);
+builder.Services.AddHostedService<ReceivedControlEmailWorker>();
 builder.AddPalletSecurity();
 builder.AddPalletObservability(BuildVersion);
 
@@ -41,6 +42,7 @@ using (var scope = app.Services.CreateScope())
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
     db.Database.EnsureCreated();
     EnsureCompatibilitySchema(db);
+    ReceivedControlEmailQueue.EnsureSchema(db);
     Seed(db, app.Configuration);
     MigrateLegacyLinehaulLocations(db);
     MigrateLegacyTransporters(db);
@@ -2601,7 +2603,8 @@ app.MapGet("/api/received-control/setup", async (ClaimsPrincipal principal, AppD
 app.MapPost("/api/received-control/entries", async (
     CreateReceivedControlRequest req,
     ClaimsPrincipal principal,
-    AppDbContext db) =>
+    AppDbContext db,
+    IConfiguration configuration) =>
 {
     var terminalId = TerminalId(principal);
     var reference = (req.UnitReference ?? "").Trim();
@@ -2639,6 +2642,7 @@ app.MapPost("/api/received-control/entries", async (
         SubmittedByUserId = UserId(principal),
         Status = ReceiptStatus.Active
     };
+    await using var transaction = await db.Database.BeginTransactionAsync();
     db.ReceivedControlEntries.Add(row);
     await db.SaveChangesAsync();
 
@@ -2652,8 +2656,10 @@ app.MapPost("/api/received-control/entries", async (
             Message = $"From {fromTerminal.Code}{(string.IsNullOrWhiteSpace(reference) ? "" : $" · {reference}")}: pallet receipt says {receiptQty.Value}, but {req.ActualPalletCount} pallets were actually received. Shortage: {difference}.",
             CreatedAtUtc = now
         });
+        await ReceivedControlEmailQueue.Enqueue(db, configuration, row);
         await db.SaveChangesAsync();
     }
+    await transaction.CommitAsync();
     await Audit(db, principal, "RECEIVED_CONTROL_CREATE", $"{row.ControlNumber}: from {fromTerminal.Code}, {reference}, {status}");
     return Results.Ok(ToReceivedControlDto(row));
 }).RequireAuthorization("ReceivedControlModule");

@@ -2642,7 +2642,6 @@ app.MapPost("/api/received-control/entries", async (
         SubmittedByUserId = UserId(principal),
         Status = ReceiptStatus.Active
     };
-    await using var transaction = await db.Database.BeginTransactionAsync();
     db.ReceivedControlEntries.Add(row);
     await db.SaveChangesAsync();
 
@@ -2656,11 +2655,20 @@ app.MapPost("/api/received-control/entries", async (
             Message = $"From {fromTerminal.Code}{(string.IsNullOrWhiteSpace(reference) ? "" : $" · {reference}")}: pallet receipt says {receiptQty.Value}, but {req.ActualPalletCount} pallets were actually received. Shortage: {difference}.",
             CreatedAtUtc = now
         });
+        await db.SaveChangesAsync();
+    }
+    await Audit(db, principal, "RECEIVED_CONTROL_CREATE", $"{row.ControlNumber}: from {fromTerminal.Code}, {reference}, {status}");
+    try
+    {
         await ReceivedControlEmailQueue.Enqueue(db, configuration, row);
         await db.SaveChangesAsync();
     }
-    await transaction.CommitAsync();
-    await Audit(db, principal, "RECEIVED_CONTROL_CREATE", $"{row.ControlNumber}: from {fromTerminal.Code}, {reference}, {status}");
+    catch (Exception ex)
+    {
+        app.Logger.LogError(ex,
+            "Optional Mottattkontroll email could not be queued for entry {EntryId}. The receipt was already saved.",
+            row.Id);
+    }
     return Results.Ok(ToReceivedControlDto(row));
 }).RequireAuthorization("ReceivedControlModule");
 

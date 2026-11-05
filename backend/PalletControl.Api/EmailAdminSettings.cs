@@ -17,13 +17,12 @@ public sealed record EmailTestRequest(string To, string? Cc);
 
 public static class EmailAdminStore
 {
-    public const string DefaultSubject = "[PalletControl · {Terminal}] Palleavvik – {Shortage} paller mangler";
+    public const string DefaultSubject = "[PalletControl \u00B7 {Terminal}] Palleavvik \u2013 {Shortage} paller mangler";
     public const string DefaultBody = "Det er registrert et avvik i mottattkontrollen.\n\n" +
         "Kontrollnummer: {ControlNumber}\nTerminal: {Terminal}\nFra terminal: {FromTerminal}\n" +
-        "Dato: {Date}\nContainer/tralle: {UnitReference}\nAntall på kvittering: {ReceiptPalletCount}\n" +
+        "Dato: {Date}\nContainer/tralle: {UnitReference}\nAntall p\u00E5 kvittering: {ReceiptPalletCount}\n" +
         "Faktisk mottatt: {ActualPalletCount}\nMangler: {Shortage}\nRegistrert av: {RegisteredBy}\n" +
-        "Kommentar: {Comment}\n\nÅpne Mottattkontroll i PalletControl: http://paller.transportservice.no";
-
+        "Kommentar: {Comment}\n\n\u00C5pne Mottattkontroll i PalletControl: http://paller.transportservice.no";
     private static SqliteConnection Open(AppDbContext db)
     {
         var connection = new SqliteConnection(db.Database.GetDbConnection().ConnectionString);

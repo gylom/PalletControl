@@ -2603,8 +2603,7 @@ app.MapGet("/api/received-control/setup", async (ClaimsPrincipal principal, AppD
 app.MapPost("/api/received-control/entries", async (
     CreateReceivedControlRequest req,
     ClaimsPrincipal principal,
-    AppDbContext db,
-    IConfiguration configuration) =>
+    AppDbContext db) =>
 {
     var terminalId = TerminalId(principal);
     var reference = (req.UnitReference ?? "").Trim();
@@ -2658,17 +2657,8 @@ app.MapPost("/api/received-control/entries", async (
         await db.SaveChangesAsync();
     }
     await Audit(db, principal, "RECEIVED_CONTROL_CREATE", $"{row.ControlNumber}: from {fromTerminal.Code}, {reference}, {status}");
-    try
-    {
-        await ReceivedControlEmailQueue.Enqueue(db, configuration, row);
-        await db.SaveChangesAsync();
-    }
-    catch (Exception ex)
-    {
-        app.Logger.LogError(ex,
-            "Optional Mottattkontroll email could not be queued for entry {EntryId}. The receipt was already saved.",
-            row.Id);
-    }
+    // Email jobs are discovered durably by the background worker. No SMTP/configuration
+    // operations are allowed to block the core pallet receipt registration.
     return Results.Ok(ToReceivedControlDto(row));
 }).RequireAuthorization("ReceivedControlModule");
 

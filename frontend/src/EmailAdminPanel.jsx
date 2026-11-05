@@ -35,7 +35,7 @@ export default function EmailAdminPanel({ api, data, superAdmin, targetTerminalI
   const sChange = (field, value) => setSmtp(v => ({...v,[field]:value}))
 
   return <div className="card" style={{padding:20,maxWidth:1100}}>
-    <h2>Email notifications Â· {data.terminalCode}</h2>
+    <h2>Email notifications · {data.terminalCode}</h2>
     <p className="muted">Email is triggered when the number on the pallet receipt exceeds the pallets actually received. Each terminal has its own recipients and message.</p>
     {notice && <div className="success">{notice}</div>}
     {error && <div className="error">{error}</div>}
@@ -62,15 +62,15 @@ export default function EmailAdminPanel({ api, data, superAdmin, targetTerminalI
     })}>Save {data.terminalCode} email settings</button>
 
     {superAdmin && <div style={{marginTop:30,paddingTop:18,borderTop:'1px solid #ddd'}}>
-      <h3>Global SMTP configuration Â· SuperAdmin only</h3>
-      {smtpLoading ? <p>Loading SMTP settingsâ€¦</p> : <>
+      <h3>Global SMTP configuration · SuperAdmin only</h3>
+      {smtpLoading ? <p>Loading SMTP settings…</p> : <>
         <label style={{display:'block',marginBottom:12}}><input type="checkbox" checked={smtp.enabled} onChange={e=>sChange('enabled',e.target.checked)}/> Enable SMTP sending globally</label>
         <div style={{display:'grid',gap:12,gridTemplateColumns:'repeat(auto-fit,minmax(240px,1fr))'}}>
           <label>SMTP host<input style={{width:'100%'}} value={smtp.host} onChange={e=>sChange('host',e.target.value)} placeholder="smtp.example.com"/></label>
           <label>Port<input style={{width:'100%'}} type="number" min="1" max="65535" value={smtp.port} onChange={e=>sChange('port',Number(e.target.value))}/></label>
           <label>From address<input style={{width:'100%'}} value={smtp.from} onChange={e=>sChange('from',e.target.value)} placeholder="Sender address"/></label>
           <label>SMTP username (blank for relay)<input style={{width:'100%'}} autoComplete="off" value={smtp.username} onChange={e=>sChange('username',e.target.value)}/></label>
-          <label>SMTP password {smtp.hasPassword?'(saved â€” leave blank to keep)':'(none saved)'}
+          <label>SMTP password {smtp.hasPassword?'(saved — leave blank to keep)':'(none saved)'}
             <input style={{width:'100%'}} type="password" autoComplete="new-password" value={smtp.password} onChange={e=>sChange('password',e.target.value)} placeholder="Leave blank to preserve existing"/>
           </label>
         </div>

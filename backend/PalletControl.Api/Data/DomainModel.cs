@@ -41,6 +41,7 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     public DbSet<LinehaulCommentOption> LinehaulCommentOptions => Set<LinehaulCommentOption>();
     public DbSet<ReceivedControlEntry> ReceivedControlEntries => Set<ReceivedControlEntry>();
     public DbSet<ReceivedControlEmail> ReceivedControlEmails => Set<ReceivedControlEmail>();
+    public DbSet<EmailDeliveryEvent> EmailDeliveryEvents => Set<EmailDeliveryEvent>();
     public DbSet<ReceivedControlWarning> ReceivedControlWarnings => Set<ReceivedControlWarning>();
 
     protected override void OnModelCreating(ModelBuilder b)

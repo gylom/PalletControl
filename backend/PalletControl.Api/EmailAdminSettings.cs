@@ -22,7 +22,7 @@ public static class EmailAdminStore
         "Kontrollnummer: {ControlNumber}\nTerminal: {Terminal}\nFra terminal: {FromTerminal}\n" +
         "Dato: {Date}\nContainer/tralle: {UnitReference}\nAntall p\u00E5 kvittering: {ReceiptPalletCount}\n" +
         "Faktisk mottatt: {ActualPalletCount}\nMangler: {Shortage}\nRegistrert av: {RegisteredBy}\n" +
-        "Kommentar: {Comment}\n\n\u00C5pne Mottattkontroll i PalletControl: http://paller.transportservice.no";
+        "Kommentar: {Comment}\n\nRegistreringen er tilgjengelig i Mottattkontroll i PalletControl.";
     private static SqliteConnection Open(AppDbContext db)
     {
         var connection = new SqliteConnection(db.Database.GetDbConnection().ConnectionString);
@@ -167,6 +167,14 @@ public static class EmailAdminStore
         cmd.ExecuteNonQuery();
     }
 
+    public static string SafeError(Exception error)
+    {
+        // Do not expose credentials or excessively long SMTP server responses in Admin logs.
+        var text = error.GetBaseException().Message;
+        text = Regex.Replace(text, @"(?i)(password|passwd|token|authorization|secret)\s*[:=]\s*\S+", "$1=[redacted]");
+        return text.Length > 500 ? text[..500] : text;
+    }
+
     public static void ValidateAddresses(string addresses, bool allowEmpty, bool single = false)
     {
         var parts = addresses.Split(new[] { ';', ',', '\n' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -228,12 +236,6 @@ public static class EmailAdminEndpoints
 {
     private static bool Super(ClaimsPrincipal user) => user.IsInRole("SuperAdmin");
     private static bool Admin(ClaimsPrincipal user) => Super(user) || user.IsInRole("Admin") || user.IsInRole("TerminalAdmin");
-    private static bool AuthorizedTerminal(ClaimsPrincipal user, int terminalId)
-    {
-        if (Super(user)) return true;
-        // Require a database-backed current terminal association, checked in each handler.
-        return Admin(user);
-    }
     private static async Task<bool> Allowed(AppDbContext db, ClaimsPrincipal user, int terminalId)
     {
         if (!Admin(user)) return false;
@@ -246,6 +248,70 @@ public static class EmailAdminEndpoints
 
     public static void MapEmailAdminEndpoints(this WebApplication app)
     {
+        // Delivery log is limited to the requested operating terminal. A normal Admin
+        // cannot view notifications belonging to other terminals.
+        app.MapGet("/api/admin/email-log", async (int terminalId, ClaimsPrincipal user, AppDbContext db) =>
+        {
+            if (!await Allowed(db, user, terminalId)) return Results.Forbid();
+            var messages = await db.ReceivedControlEmails.AsNoTracking()
+                .Join(db.ReceivedControlEntries.AsNoTracking(),
+                    email => email.EntryId, entry => entry.Id,
+                    (email, entry) => new { email, entry })
+                .Where(x => x.entry.TerminalId == terminalId)
+                .OrderByDescending(x => x.email.Id).Take(150)
+                .Select(x => new
+                {
+                    x.email.Id, x.email.EntryId, x.entry.ControlNumber,
+                    x.email.Status, x.email.Attempts, x.email.Recipient, x.email.Cc,
+                    x.email.Subject, x.email.CreatedAtUtc, x.email.LastAttemptUtc,
+                    x.email.NextAttemptUtc, x.email.SentAtUtc, x.email.LastError
+                }).ToListAsync();
+            var isSuperAdmin = Super(user);
+            var recent = await db.EmailDeliveryEvents.AsNoTracking()
+                .Where(x => x.TerminalId == terminalId || (isSuperAdmin && x.TerminalId == null && x.Kind == "TEST"))
+                .OrderByDescending(x => x.Id).Take(200)
+                .Select(x => new
+                {
+                    x.Id, x.EmailId, x.Kind, x.Outcome, x.Recipient, x.Cc,
+                    x.Detail, x.CreatedAtUtc
+                }).ToListAsync();
+            return Results.Ok(new { messages, recent });
+        }).RequireAuthorization();
+
+        app.MapPost("/api/admin/email-log/{id:int}/retry", async (
+            int id, ClaimsPrincipal user, AppDbContext db) =>
+        {
+            var email = await db.ReceivedControlEmails.FirstOrDefaultAsync(x => x.Id == id);
+            if (email is null) return Results.NotFound();
+            var entry = await db.ReceivedControlEntries.AsNoTracking().FirstOrDefaultAsync(x => x.Id == email.EntryId);
+            if (entry is null) return Results.NotFound();
+            if (!await Allowed(db, user, entry.TerminalId)) return Results.Forbid();
+            if (email.Status != "FAILED" && email.Status != "RETRYING")
+                return Results.BadRequest(new { message = "Only failed or retry-scheduled emails can be retried." });
+            // Do not retry an email if the source receipt was cancelled.
+            if (entry.Status != ReceiptStatus.Active || entry.Result != ReceivedControlStatus.ReceiptHigher)
+                return Results.BadRequest(new { message = "The source receipt is no longer active." });
+            email.Status = "PENDING";
+            // Regenerate message and recipients using the currently saved terminal settings.
+            email.Recipient = "";
+            email.Cc = "";
+            email.Subject = "";
+            email.Body = "";
+            email.Attempts = 0;
+            email.NextAttemptUtc = DateTime.UtcNow;
+            email.LastError = "";
+            db.EmailDeliveryEvents.Add(new EmailDeliveryEvent
+            {
+                EmailId = email.Id, TerminalId = entry.TerminalId,
+                Kind = "NOTIFICATION", Outcome = "MANUAL_RETRY",
+                Recipient = email.Recipient, Cc = email.Cc,
+                Detail = "Requeued manually by an authorized administrator.",
+                CreatedAtUtc = DateTime.UtcNow
+            });
+            await db.SaveChangesAsync();
+            return Results.Ok(new { message = "Email queued for another attempt." });
+        }).RequireAuthorization();
+
         app.MapGet("/api/admin/email-settings", async (int terminalId, ClaimsPrincipal user, AppDbContext db, IConfiguration cfg) =>
         {
             if (!await Allowed(db, user, terminalId)) return Results.Forbid();
@@ -284,6 +350,8 @@ public static class EmailAdminEndpoints
             IConfiguration config, IDataProtectionProvider keys, CancellationToken token) =>
         {
             if (!Super(user)) return Results.Forbid();
+            string outcome = "FAILED";
+            string detail = "";
             try
             {
                 EmailAdminStore.ValidateAddresses(input.To, allowEmpty: false);
@@ -292,10 +360,24 @@ public static class EmailAdminEndpoints
                 await EmailAdminStore.SendAsync(smtp.Public, smtp.EncryptedPassword,
                     keys.CreateProtector("PalletControl.Email.SmtpSecret.v1"), input.To, input.Cc ?? "",
                     "PalletControl SMTP test", "This is a test message from PalletControl.", token);
-                return Results.Ok(new { message = "SMTP server accepted the test email." });
+                outcome = "SENT";
+                detail = "Accepted by SMTP server (mailbox delivery not confirmed).";
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
-            catch (Exception ex) { return Results.BadRequest(new { message = $"SMTP test failed: {ex.Message}" }); }
+            catch (Exception ex) { detail = EmailAdminStore.SafeError(ex); }
+            try
+            {
+                db.EmailDeliveryEvents.Add(new EmailDeliveryEvent
+                {
+                    Kind = "TEST", Outcome = outcome, Detail = detail,
+                    Recipient = input.To, Cc = input.Cc ?? "", CreatedAtUtc = DateTime.UtcNow
+                });
+                await db.SaveChangesAsync(token);
+            }
+            catch (Exception) { /* Delivery result must not be overwritten by a log-write failure. */ }
+            return outcome == "SENT"
+                ? Results.Ok(new { message = "SMTP server accepted the test email (not a delivery confirmation)." })
+                : Results.BadRequest(new { message = $"SMTP test failed: {detail}" });
         }).RequireAuthorization();
     }
 }

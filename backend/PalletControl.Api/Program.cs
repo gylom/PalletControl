@@ -4303,6 +4303,7 @@ app.Logger.LogInformation("PalletControl {Version}: SuperAdmin system endpoint m
 if (hasFrontendBuild)
     app.MapFallbackToFile("index.html");
 
+app.MapEmailAdminEndpoints();
 app.Run();
 
 // ---------------- HELPERS ----------------

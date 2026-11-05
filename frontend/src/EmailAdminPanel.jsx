@@ -35,7 +35,7 @@ export default function EmailAdminPanel({ api, data, superAdmin, targetTerminalI
   const sChange = (field, value) => setSmtp(v => ({...v,[field]:value}))
 
   return <div className="card" style={{padding:20,maxWidth:1100}}>
-    <h2>Email notifications · {data.terminalCode}</h2>
+    <h2>Email notifications Â· {data.terminalCode}</h2>
     <p className="muted">Email is triggered when the number on the pallet receipt exceeds the pallets actually received. Each terminal has its own recipients and message.</p>
     {notice && <div className="success">{notice}</div>}
     {error && <div className="error">{error}</div>}
@@ -44,10 +44,10 @@ export default function EmailAdminPanel({ api, data, superAdmin, targetTerminalI
     <label style={{display:'block',marginBottom:14}}><input type="checkbox" checked={terminal.enabled} onChange={e=>tChange('enabled',e.target.checked)}/> Enable alerts for {data.terminalCode}</label>
     <div style={{display:'grid',gap:12,gridTemplateColumns:'repeat(auto-fit,minmax(250px,1fr))'}}>
       <label>To addresses (separate with semicolons)
-        <input style={{width:'100%'}} value={terminal.to} onChange={e=>tChange('to',e.target.value)} placeholder="recipient@example.com"/>
+        <input style={{width:'100%'}} value={terminal.to} onChange={e=>tChange('to',e.target.value)} placeholder="Recipient address"/>
       </label>
       <label>CC addresses (optional)
-        <input style={{width:'100%'}} value={terminal.cc} onChange={e=>tChange('cc',e.target.value)} placeholder="manager@example.com"/>
+        <input style={{width:'100%'}} value={terminal.cc} onChange={e=>tChange('cc',e.target.value)} placeholder="CC address"/>
       </label>
     </div>
     <label style={{display:'block',marginTop:12}}>Email subject
@@ -62,15 +62,15 @@ export default function EmailAdminPanel({ api, data, superAdmin, targetTerminalI
     })}>Save {data.terminalCode} email settings</button>
 
     {superAdmin && <div style={{marginTop:30,paddingTop:18,borderTop:'1px solid #ddd'}}>
-      <h3>Global SMTP configuration · SuperAdmin only</h3>
-      {smtpLoading ? <p>Loading SMTP settings…</p> : <>
+      <h3>Global SMTP configuration Â· SuperAdmin only</h3>
+      {smtpLoading ? <p>Loading SMTP settingsâ€¦</p> : <>
         <label style={{display:'block',marginBottom:12}}><input type="checkbox" checked={smtp.enabled} onChange={e=>sChange('enabled',e.target.checked)}/> Enable SMTP sending globally</label>
         <div style={{display:'grid',gap:12,gridTemplateColumns:'repeat(auto-fit,minmax(240px,1fr))'}}>
           <label>SMTP host<input style={{width:'100%'}} value={smtp.host} onChange={e=>sChange('host',e.target.value)} placeholder="smtp.example.com"/></label>
           <label>Port<input style={{width:'100%'}} type="number" min="1" max="65535" value={smtp.port} onChange={e=>sChange('port',Number(e.target.value))}/></label>
-          <label>From address<input style={{width:'100%'}} value={smtp.from} onChange={e=>sChange('from',e.target.value)} placeholder="palletcontrol@example.com"/></label>
+          <label>From address<input style={{width:'100%'}} value={smtp.from} onChange={e=>sChange('from',e.target.value)} placeholder="Sender address"/></label>
           <label>SMTP username (blank for relay)<input style={{width:'100%'}} autoComplete="off" value={smtp.username} onChange={e=>sChange('username',e.target.value)}/></label>
-          <label>SMTP password {smtp.hasPassword?'(saved — leave blank to keep)':'(none saved)'}
+          <label>SMTP password {smtp.hasPassword?'(saved â€” leave blank to keep)':'(none saved)'}
             <input style={{width:'100%'}} type="password" autoComplete="new-password" value={smtp.password} onChange={e=>sChange('password',e.target.value)} placeholder="Leave blank to preserve existing"/>
           </label>
         </div>
@@ -82,7 +82,7 @@ export default function EmailAdminPanel({ api, data, superAdmin, targetTerminalI
         })}>Save SMTP configuration</button></div>
         <h3 style={{marginTop:25}}>Send test email</h3>
         <div style={{display:'grid',gap:12,gridTemplateColumns:'repeat(auto-fit,minmax(240px,1fr))'}}>
-          <label>Test recipient<input style={{width:'100%'}} value={toTest} onChange={e=>setToTest(e.target.value)} placeholder="me@example.com"/></label>
+          <label>Test recipient<input style={{width:'100%'}} value={toTest} onChange={e=>setToTest(e.target.value)} placeholder="Test recipient"/></label>
           <label>Test CC (optional)<input style={{width:'100%'}} value={ccTest} onChange={e=>setCcTest(e.target.value)}/></label>
         </div>
         <div style={{marginTop:14}}><button disabled={!!busy || !toTest.trim()} onClick={()=>run('Test email',()=>api('/admin/smtp-test',{method:'POST',body:JSON.stringify({to:toTest,cc:ccTest})}))}>Send test email</button></div>

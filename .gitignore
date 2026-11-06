@@ -29,3 +29,8 @@ appsettings.Production.local.json
 *.p12
 *.key
 *.pem
+
+# Additional local secrets
+.env.*
+!.env.example
+appsettings.Development.local.json

@@ -40,10 +40,13 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
     public DbSet<LinehaulReceipt> LinehaulReceipts => Set<LinehaulReceipt>();
     public DbSet<LinehaulCommentOption> LinehaulCommentOptions => Set<LinehaulCommentOption>();
     public DbSet<ReceivedControlEntry> ReceivedControlEntries => Set<ReceivedControlEntry>();
+    public DbSet<ReceivedControlEmail> ReceivedControlEmails => Set<ReceivedControlEmail>();
+    public DbSet<EmailDeliveryEvent> EmailDeliveryEvents => Set<EmailDeliveryEvent>();
     public DbSet<ReceivedControlWarning> ReceivedControlWarnings => Set<ReceivedControlWarning>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
+        b.Entity<ReceivedControlEmail>().HasIndex(e => e.EntryId).IsUnique();
         b.Entity<AppUser>().HasIndex(x => x.Username).IsUnique();
         b.Entity<Vehicle>().HasIndex(x => x.VehicleId).IsUnique();
         b.Entity<Transporter>().HasIndex(x => new { x.TerminalId, x.Name }).IsUnique();

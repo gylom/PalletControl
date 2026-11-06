@@ -17,6 +17,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 const string BuildVersion = "5.9.1";
 builder.Services.AddPalletDatabase(builder.Configuration, builder.Environment);
+builder.Services.AddHostedService<ReceivedControlEmailWorker>();
 builder.AddPalletSecurity();
 builder.AddPalletObservability(BuildVersion);
 
@@ -41,6 +42,7 @@ using (var scope = app.Services.CreateScope())
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
     db.Database.EnsureCreated();
     EnsureCompatibilitySchema(db);
+    ReceivedControlEmailQueue.EnsureSchema(db);
     Seed(db, app.Configuration);
     MigrateLegacyLinehaulLocations(db);
     MigrateLegacyTransporters(db);
@@ -2655,6 +2657,8 @@ app.MapPost("/api/received-control/entries", async (
         await db.SaveChangesAsync();
     }
     await Audit(db, principal, "RECEIVED_CONTROL_CREATE", $"{row.ControlNumber}: from {fromTerminal.Code}, {reference}, {status}");
+    // Email jobs are discovered durably by the background worker. No SMTP/configuration
+    // operations are allowed to block the core pallet receipt registration.
     return Results.Ok(ToReceivedControlDto(row));
 }).RequireAuthorization("ReceivedControlModule");
 
@@ -4297,6 +4301,7 @@ app.Logger.LogInformation("PalletControl {Version}: SuperAdmin system endpoint m
 if (hasFrontendBuild)
     app.MapFallbackToFile("index.html");
 
+app.MapEmailAdminEndpoints();
 app.Run();
 
 // ---------------- HELPERS ----------------
